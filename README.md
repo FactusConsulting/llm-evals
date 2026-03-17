@@ -1,20 +1,25 @@
 # LLM Knowledge Evaluation Suite
 
-Domain-specific test suites for evaluating LLM model competency in infrastructure and development topics.
+Domain-specific test suites for evaluating LLM model competency in infrastructure, development, and architecture topics.
 
 ## What's Here
 
 | File | Topics | Questions | Max Score |
 |------|--------|-----------|-----------|
 | `infrastructure.md` | Networking, Linux, Kubernetes, Dev, OpenTofu, Ansible | 54 | 108 |
+| `architecture.md` | App Arch, On-Prem, Cloud, OT | 48 | 96 |
 | `development.md` | Go, Rust, .NET, Python, JS/TS, Bash, PowerShell | 66 | 132 |
-| **Total** | | **120** | **240** |
+| **Total** | | **168** | **336** |
+
+## Reference Answers
+
+The `results/architect/` directory contains answers from the architect agent, which can serve as a reference baseline for evaluating other models.
 
 ## How to Use
 
 ### 1. Test a Model
 
-Open either file, select a question, and paste it into the model you're testing.
+Open any test suite file, select a question, and paste it into the model you're testing.
 
 ### 2. Rate the Answer
 
