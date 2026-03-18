@@ -5,7 +5,7 @@
 
 ---
 
-## Section 1: Application Architecture (12 questions)
+## Section 1: Application Architecture (20 questions)
 
 ### AA1 — Easy
 What is the difference between a monolith and a microservices architecture? Name 3 concrete problems that microservices introduce that monoliths don't have.
@@ -46,9 +46,33 @@ What is the 12-Factor App methodology? Name at least 6 factors and explain why t
 ### AA12 — Hard
 Compare event-driven architecture using an event broker (Kafka) vs request-driven architecture using REST/gRPC. Cover: coupling, scalability, debugging complexity, ordering guarantees, and failure handling. When would you choose each?
 
+### AA13 — Easy
+What is a load balancer? Explain the difference between Layer 4 and Layer 7 load balancing. Give one use case where Layer 7 is required.
+
+### AA14 — Easy
+What is a message queue? Explain the difference between a message queue (e.g., RabbitMQ) and a log-based message broker (e.g., Kafka). When would you pick one over the other?
+
+### AA15 — Easy
+What is a container and how does it differ from a virtual machine? Why are containers popular for deploying microservices?
+
+### AA16 — Easy
+Explain the difference between stateless and stateful services. Why are stateless services easier to scale horizontally? Give an example of each.
+
+### AA17 — Easy
+What is an ORM (Object-Relational Mapper)? Name two popular ORMs in different languages. What are the trade-offs of using an ORM vs writing raw SQL?
+
+### AA18 — Medium
+Explain the Bulkhead pattern. How does it relate to resource isolation in a microservices architecture? Give a concrete example of how you would implement bulkheads using thread pools or separate deployment groups.
+
+### AA19 — Hard
+You are designing a real-time collaborative editing system (like Google Docs). Compare Operational Transformation (OT) and CRDTs (Conflict-free Replicated Data Types) as conflict resolution strategies. Cover: consistency guarantees, latency, complexity, and offline support. Which would you choose for a system that must support offline editing and why?
+
+### AA20 — Hard
+Explain the challenges of distributed tracing across a polyglot microservices ecosystem. Cover: context propagation (W3C Trace Context, B3), sampling strategies (head-based vs tail-based), trace storage and querying (Jaeger, Tempo), and how tracing interacts with asynchronous messaging. How do you ensure trace continuity when a request passes through Kafka?
+
 ---
 
-## Section 2: On-Premise Infrastructure Architecture (12 questions)
+## Section 2: On-Premise Infrastructure Architecture (20 questions)
 
 ### OP1 — Easy
 Explain the difference between a hypervisor Type 1 (bare-metal) and Type 2 (hosted). Give 2 examples of each.
@@ -86,9 +110,33 @@ Explain the difference between LVM, LVM-Thin, and ZFS. When would you use each? 
 ### OP12 — Hard
 You have a 3-node Proxmox cluster with Ceph storage and need to survive a complete site failure. Design a stretch cluster or DR strategy. Cover: Ceph CRUSH rules, monitor placement, network latency requirements, and the split-brain problem. Why is 2-site Ceph generally a bad idea without a tiebreaker?
 
+### OP13 — Easy
+What is DHCP and how does the DORA process work? What happens when a DHCP server is unavailable and a Windows client's lease expires?
+
+### OP14 — Easy
+Explain the difference between a managed switch and an unmanaged switch. What features does a managed switch provide that are important in an enterprise environment?
+
+### OP15 — Easy
+What is NTP and why is accurate time synchronization critical in an on-premise environment? What can go wrong when clocks drift between servers in a cluster?
+
+### OP16 — Easy
+What is the difference between a physical server, a virtual machine, and a container? When would you run a workload directly on bare metal instead of virtualizing it?
+
+### OP17 — Easy
+Explain the difference between a UPS (Uninterruptible Power Supply) and a generator in a data center context. Why do you need both? What is the role of an ATS (Automatic Transfer Switch)?
+
+### OP18 — Medium
+Explain the difference between active-passive and active-active clustering for high availability. You have a pair of Linux servers running a PostgreSQL database — describe how you would implement HA using Pacemaker/Corosync, covering fencing (STONITH), virtual IPs, and failover behavior.
+
+### OP19 — Hard
+You are designing the backup and recovery strategy for a 50-server on-premise environment. Cover: the 3-2-1 rule, RPO/RTO requirements, backup types (full/incremental/differential), deduplication, tape vs disk vs cloud offsite, immutable backups for ransomware protection, and how you test restores. What is the difference between backup and disaster recovery?
+
+### OP20 — Hard
+Explain how 802.1X (port-based network access control) works in an enterprise wired network. Cover: the supplicant, authenticator, and authentication server roles; EAP methods (EAP-TLS vs PEAP); RADIUS; dynamic VLAN assignment; and what happens to a device that fails authentication. How does MAB (MAC Authentication Bypass) work for devices that don't support 802.1X?
+
 ---
 
-## Section 3: Cloud Infrastructure Architecture (12 questions)
+## Section 3: Cloud Infrastructure Architecture (20 questions)
 
 ### CL1 — Easy
 What is the difference between IaaS, PaaS, and SaaS? Give one example of each from any cloud provider.
@@ -126,9 +174,33 @@ Explain the differences between cloud object storage (S3/Blob), block storage (E
 ### CL12 — Hard
 Design a zero-trust network architecture for a Kubernetes cluster running in the cloud. Cover: network policies, service mesh with mTLS, pod identity, admission controllers (OPA/Kyverno), image signing and verification, runtime security (Falco), and secrets management. How does this differ from a traditional perimeter-based security model?
 
+### CL13 — Easy
+What is a CDN (Content Delivery Network)? How does it work? Name two cloud-native CDN services and explain when you would use a CDN vs serving content directly from your origin server.
+
+### CL14 — Easy
+What are availability zones and regions in a cloud provider? Why should you deploy resources across multiple availability zones? What is the difference between zonal and regional resources?
+
+### CL15 — Easy
+What is a managed database service (e.g., RDS, Cloud SQL, Azure SQL)? What operational tasks does the cloud provider handle compared to running a database on a VM yourself?
+
+### CL16 — Easy
+Explain the difference between cloud identity services (IAM users, groups, roles, and policies). What is the principle of least privilege and how do you apply it in a cloud environment?
+
+### CL17 — Easy
+What is serverless computing? Compare AWS Lambda / Azure Functions / Google Cloud Functions. What are cold starts and why do they matter? When is serverless a poor fit?
+
+### CL18 — Medium
+Explain the different Kubernetes ingress options: Ingress resource, Gateway API, cloud load balancer annotations, and service mesh ingress gateways. How does TLS termination work at each layer? When would you use Gateway API over the traditional Ingress resource?
+
+### CL19 — Hard
+You need to design a cost optimization strategy for a cloud environment spending $80,000/month. Cover: reserved instances vs savings plans vs spot/preemptible instances, right-sizing, storage tiering (S3 Intelligent-Tiering, Archive), idle resource detection, FinOps practices, and showback/chargeback models. What tools and processes would you implement to maintain cost visibility across teams?
+
+### CL20 — Hard
+Explain how you would design a multi-cloud strategy for an organization that needs to avoid vendor lock-in while running workloads on both AWS and Azure. Cover: abstraction layers, Kubernetes as a common runtime, Terraform for IaC portability, networking between clouds (VPN/interconnect), identity federation, and the real-world trade-offs of multi-cloud vs the theoretical benefits. When is multi-cloud justified and when is it unnecessary complexity?
+
 ---
 
-## Section 4: OT Infrastructure Architecture (12 questions)
+## Section 4: OT Infrastructure Architecture (20 questions)
 
 ### OT1 — Easy
 What is the Purdue Model (ISA-95)? Name and describe at least 4 of the levels (0-5).
@@ -171,6 +243,30 @@ Explain how remote access to OT environments should be architected. Cover: jump 
 ### OT12 — Hard
 You are the OT security architect for a water treatment facility. A nation-state threat actor has compromised a vendor's VPN appliance and has access to your Level 3 network. Design your detection and response plan. Cover: network monitoring (IDS/anomaly detection), asset inventory, incident response steps, coordination with the control room, and how you ensure safe operations while isolating the threat. What is the role of the plant operator during a cyber incident?
 
+### OT13 — Easy
+What is a HMI (Human-Machine Interface) and what role does it play in an industrial control system? How does an HMI differ from an engineering workstation?
+
+### OT14 — Easy
+What is a historian in the OT context? Why is it important for process data? Explain the difference between a plant historian (Level 3) and an enterprise historian (Level 4).
+
+### OT15 — Easy
+What is ladder logic and what kind of device executes it? Why is ladder logic still dominant in industrial automation despite being decades old?
+
+### OT16 — Easy
+Explain what an RTU (Remote Terminal Unit) is and how it differs from a PLC. In what types of environments would you typically deploy RTUs instead of PLCs?
+
+### OT17 — Easy
+What is the difference between analog signals (4-20mA, 0-10V) and digital signals in industrial I/O? Why is 4-20mA preferred over 0-20mA for process instrumentation?
+
+### OT18 — Medium
+Explain the concept of OT asset inventory and why it is the foundation of an OT security program. What tools and techniques (passive network monitoring, active scanning) can be used to discover assets? Why is active scanning dangerous in OT networks?
+
+### OT19 — Hard
+Explain the MITRE ATT&CK for ICS framework. Name at least 5 tactics from the framework and give an example technique for each. How does this framework differ from the enterprise ATT&CK matrix, and how would you use it to assess your OT environment's defensive gaps?
+
+### OT20 — Hard
+You are designing a converged IT/OT SOC (Security Operations Center) for a company with 3 manufacturing sites. Cover: log collection from OT assets (without impacting real-time operations), SIEM integration, OT-specific detection rules, alert triage workflows, staffing (IT analysts vs OT engineers), and the challenge of false positives in OT environments. How do you handle an alert that indicates unauthorized firmware changes on a PLC?
+
 ---
 
 ## Scoring Guide
@@ -185,8 +281,8 @@ You are the OT security architect for a water treatment facility. A nation-state
 
 | Section                    | Questions | Max Score |
 |----------------------------|-----------|-----------|
-| Application Architecture   | 12        | 24        |
-| On-Premise Infrastructure  | 12        | 24        |
-| Cloud Infrastructure       | 12        | 24        |
-| OT Infrastructure          | 12        | 24        |
-| **Total**                  | **48**    | **96**    |
+| Application Architecture   | 20        | 40        |
+| On-Premise Infrastructure  | 20        | 40        |
+| Cloud Infrastructure       | 20        | 40        |
+| OT Infrastructure          | 20        | 40        |
+| **Total**                  | **80**    | **160**   |

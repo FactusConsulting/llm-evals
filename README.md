@@ -6,10 +6,11 @@ Domain-specific test suites for evaluating LLM model competency in infrastructur
 
 | File | Topics | Questions | Max Score |
 |------|--------|-----------|-----------|
-| `infrastructure.md` | Networking, Linux, Kubernetes, Dev, OpenTofu, Ansible | 54 | 108 |
-| `architecture.md` | App Arch, On-Prem, Cloud, OT | 48 | 96 |
-| `development.md` | Go, Rust, .NET, Python, JS/TS, Bash, PowerShell | 66 | 132 |
-| **Total** | | **168** | **336** |
+| `infrastructure.md` | Networking, Linux, Kubernetes, Dev, OpenTofu, Ansible | 120 | 240 |
+| `development.md` | Go, Rust, .NET, Python, JS/TS, Bash, PowerShell | 140 | 280 |
+| `architecture.md` | Application, On-Prem, Cloud, OT Architecture | 80 | 160 |
+| `scenarios.md` | Cross-domain scenarios (3 parts each) | 10 | 60 |
+| **Total** | | **350** | **740** |
 
 ## Reference Answers
 
