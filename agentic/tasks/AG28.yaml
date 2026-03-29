@@ -1,0 +1,158 @@
+id: AG28
+tier: 3
+title: "Fix a race condition in Go"
+difficulty: hard
+time_limit: 600
+max_steps: 50
+min_steps: 6
+
+goal: |
+  The Go program at /tmp/ageval/raceapp/ has a data race caused by concurrent map
+  access without synchronization. Run it with `go run -race .` to confirm the race.
+  Fix the race condition using sync.Mutex (or sync.RWMutex). Verify the fix by
+  running `go test -race ./...` -- all tests must pass with no race detected.
+
+setup: |
+  rm -rf /tmp/ageval/raceapp
+  mkdir -p /tmp/ageval/raceapp
+  cd /tmp/ageval/raceapp && go mod init ageval/raceapp 2>/dev/null || true
+  cat > /tmp/ageval/raceapp/counter.go << 'GOEOF'
+  package main
+
+  import (
+  	"fmt"
+  	"sync"
+  )
+
+  type HitCounter struct {
+  	counts map[string]int
+  }
+
+  func NewHitCounter() *HitCounter {
+  	return &HitCounter{
+  		counts: make(map[string]int),
+  	}
+  }
+
+  func (h *HitCounter) Record(page string) {
+  	h.counts[page]++
+  }
+
+  func (h *HitCounter) Get(page string) int {
+  	return h.counts[page]
+  }
+
+  func (h *HitCounter) Total() int {
+  	total := 0
+  	for _, v := range h.counts {
+  		total += v
+  	}
+  	return total
+  }
+
+  func main() {
+  	counter := NewHitCounter()
+  	var wg sync.WaitGroup
+
+  	pages := []string{"/home", "/about", "/contact", "/api/users", "/api/orders"}
+
+  	for _, page := range pages {
+  		for i := 0; i < 100; i++ {
+  			wg.Add(1)
+  			go func(p string) {
+  				defer wg.Done()
+  				counter.Record(p)
+  			}(page)
+  		}
+  	}
+
+  	wg.Wait()
+  	fmt.Printf("Total hits: %d\n", counter.Total())
+  }
+  GOEOF
+  cat > /tmp/ageval/raceapp/counter_test.go << 'GOEOF'
+  package main
+
+  import (
+  	"sync"
+  	"testing"
+  )
+
+  func TestConcurrentRecord(t *testing.T) {
+  	counter := NewHitCounter()
+  	var wg sync.WaitGroup
+
+  	for i := 0; i < 100; i++ {
+  		wg.Add(1)
+  		go func() {
+  			defer wg.Done()
+  			counter.Record("/test")
+  		}()
+  	}
+
+  	wg.Wait()
+
+  	if got := counter.Get("/test"); got != 100 {
+  		t.Errorf("Expected 100 hits, got %d", got)
+  	}
+  }
+
+  func TestConcurrentReadWrite(t *testing.T) {
+  	counter := NewHitCounter()
+  	var wg sync.WaitGroup
+
+  	// Writers
+  	for i := 0; i < 50; i++ {
+  		wg.Add(1)
+  		go func() {
+  			defer wg.Done()
+  			counter.Record("/page")
+  		}()
+  	}
+
+  	// Readers
+  	for i := 0; i < 50; i++ {
+  		wg.Add(1)
+  		go func() {
+  			defer wg.Done()
+  			_ = counter.Get("/page")
+  		}()
+  	}
+
+  	wg.Wait()
+
+  	if got := counter.Get("/page"); got != 50 {
+  		t.Errorf("Expected 50 hits, got %d", got)
+  	}
+  }
+
+  func TestTotal(t *testing.T) {
+  	counter := NewHitCounter()
+  	var wg sync.WaitGroup
+
+  	pages := []string{"/a", "/b", "/c"}
+  	for _, page := range pages {
+  		for i := 0; i < 10; i++ {
+  			wg.Add(1)
+  			go func(p string) {
+  				defer wg.Done()
+  				counter.Record(p)
+  			}(page)
+  		}
+  	}
+
+  	wg.Wait()
+
+  	if got := counter.Total(); got != 30 {
+  		t.Errorf("Expected 30 total, got %d", got)
+  	}
+  }
+  GOEOF
+
+verify: |
+  cd /tmp/ageval/raceapp && \
+  go test -race -count=1 ./... 2>&1 | grep -q "^ok" && \
+  ! go test -race -count=1 ./... 2>&1 | grep -qi "DATA RACE"
+
+tools:
+  - exec
