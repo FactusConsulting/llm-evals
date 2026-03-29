@@ -1,17 +1,37 @@
 # Model Evaluation Summary
 
-Last updated: 2026-03-21
+Last updated: 2026-03-29
 
 ## Overall Scores
 
-| Model | Config | KV Cache | RAM | Infra | Dev | Arch | Scenarios | Total | % | Evaluator |
-|-------|--------|----------|-----|-------|-----|------|-----------|-------|---|-----------|
-| Qwen3.5-35B-A3B Q5_K_M | 1×262144 | q8_0 | 8GB | 225.8/240 | 255.4/280 | 153.2/160 | 48.6/60 | 683/740 | 92.3% | opus |
-| Qwen3.5-35B-A3B Q5_K_M | 2×131072 | q8_0 | 8GB | 227.4/240 | 260.6/280 | 152.6/160 | 48.0/60 | 688.6/740 | 93.1% | opus |
-| Qwen3.5-35B-A3B Q5_K_M | 2×60000 | q8_0 | 24GB | 228/240 | 267/280 | 148/160 | 42/60 | 685/740 | 92.6% | opus |
-| Qwen3.5-35B-A3B Q5_K_M | **2×60000** | **q4_0** | **24GB** | **226/240** | **274/280** | **146/160** | **45/60** | **691/740** | **93.4%** | opus |
-| Qwen3.5-35B-A3B Q5_K_M | 2×262144 | q4_0 | 24GB | 224/240 | 256/280 | 146/160 | 42/60 | 668/740 | 90.3% | opus |
-| Qwen3.5-35B-A3B Q5_K_M | 3×131072 | q4_0 | 24GB | 211/240 | 258/280 | 143/160 | 46/60 | 658/740 | 88.9% | opus |
+| Model | Config | KV Cache | Hardware | Infra | Dev | Arch | Scenarios | Total | % | Evaluator |
+|-------|--------|----------|----------|-------|-----|------|-----------|-------|---|-----------|
+| **Qwen3.5-27B Opus Distilled Q4_K_M** | **1×131072** | **q4_0** | **2×5060Ti** | **240/240** | **—** | **—** | **—** | **240/240** | **100%** | **opus** |
+| **Qwen3.5-9B Q8_0** | **2×131072** | **q4_0** | **2×5060Ti** | **228/240** | **268/280** | **159/160** | **53/60** | **708/740** | **95.7%** | **opus** |
+| Qwen3.5-35B-A3B Q5_K_M | 1×262144 | q8_0 | 2×5060Ti | 225.8/240 | 255.4/280 | 153.2/160 | 48.6/60 | 683/740 | 92.3% | opus |
+| Qwen3.5-35B-A3B Q5_K_M | 2×131072 | q8_0 | 2×5060Ti | 227.4/240 | 260.6/280 | 152.6/160 | 48.0/60 | 688.6/740 | 93.1% | opus |
+| Qwen3.5-35B-A3B Q5_K_M | **2×60000** | **q4_0** | **2×5060Ti** | **226/240** | **274/280** | **146/160** | **45/60** | **691/740** | **93.4%** | opus |
+| Qwen3.5-35B-A3B Q5_K_M | 2×262144 | q4_0 | 2×5060Ti | 224/240 | 256/280 | 146/160 | 42/60 | 668/740 | 90.3% | opus |
+| Qwen3.5-35B-A3B Q5_K_M | 3×131072 | q4_0 | 2×5060Ti | 211/240 | 258/280 | 143/160 | 46/60 | 658/740 | 88.9% | opus |
+
+## New Models (2026-03-29)
+
+### Qwen3.5-9B Q8_0 — 708/740 (95.7%)
+
+Dense 9B model running on ai-infer2 with 2 parallel slots at 131k context each. Outperforms the 35B-A3B MoE (3B active parameters) by 2.6 percentage points despite being much smaller.
+
+**Strengths:** Architecture + On-Prem (99.4%), Development (95.7%), Infrastructure (95.0%)
+**Weaknesses:** Scenarios (88.3%) — loses points on broken code syntax (SQL, HCL, kubectl)
+**Speed:** ~32-37 tok/s, fast enough for agentic workloads
+**Parallel:** Two agents ran simultaneously with no quality degradation
+
+### Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled Q4_K_M — 240/240 (100%) partial
+
+Claude Opus reasoning-distilled variant running on ai-infer1. Only 3 of 9 chunks produced usable answers (rest had degenerate thinking output). On the chunks that worked, it scored perfect — correcting every error the 9B made.
+
+**Quality delta vs 9B (3 shared chunks):** +12 points (240 vs 228)
+**Known issue:** Thinking mode produces degenerate output (repeating digits) on ~50% of API calls
+**Note:** Quality is the highest of any tested model when it works
 
 ## KV Cache Quantization Comparison (2-slot, matched conditions)
 
