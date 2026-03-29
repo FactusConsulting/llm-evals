@@ -71,15 +71,28 @@ def load_task(task_id: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _shell(command: str, timeout: int = 30, ssh_target: str = None) -> subprocess.CompletedProcess:
+    """Run a shell command locally or via SSH."""
+    if ssh_target:
+        # Escape single quotes in command for SSH
+        escaped = command.replace("'", "'\\''")
+        cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+               ssh_target, f"bash -c '{escaped}'"]
+    else:
+        cmd = ["bash", "-c", command]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+# Module-level SSH target (set by --exec-host)
+_ssh_target = None
+
+
 def run_setup(task: dict) -> bool:
     """Run the task's setup script."""
     setup = task.get("setup", "")
     if not setup:
         return True
-    result = subprocess.run(
-        ["bash", "-c", setup],
-        capture_output=True, text=True, timeout=30
-    )
+    result = _shell(setup, timeout=30, ssh_target=_ssh_target)
     if result.returncode != 0:
         print(f"Setup failed: {result.stderr}", file=sys.stderr)
         return False
@@ -91,20 +104,14 @@ def run_verify(task: dict) -> bool:
     verify = task.get("verify", "")
     if not verify:
         return True
-    result = subprocess.run(
-        ["bash", "-c", verify],
-        capture_output=True, text=True, timeout=10
-    )
+    result = _shell(verify, timeout=10, ssh_target=_ssh_target)
     return result.returncode == 0
 
 
 def exec_command(command: str, timeout: int = 30) -> str:
     """Execute a shell command and return output."""
     try:
-        result = subprocess.run(
-            ["bash", "-c", command],
-            capture_output=True, text=True, timeout=timeout
-        )
+        result = _shell(command, timeout=timeout, ssh_target=_ssh_target)
         output = result.stdout
         if result.stderr:
             output += f"\nSTDERR: {result.stderr}"
@@ -112,7 +119,7 @@ def exec_command(command: str, timeout: int = 30) -> str:
             output += f"\n(exit code: {result.returncode})"
         return output.strip() or "(no output)"
     except subprocess.TimeoutExpired:
-        return "ERROR: Command timed out after {timeout}s"
+        return f"ERROR: Command timed out after {timeout}s"
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -316,11 +323,16 @@ def main():
     parser.add_argument("--task", help="Single task ID (e.g., AG1)")
     parser.add_argument("--tier", type=int, help="Run all tasks in a tier (1, 2, or 3)")
     parser.add_argument("--all", action="store_true", help="Run all tasks")
+    parser.add_argument("--exec-host", help="SSH target for running commands (e.g., ubuntu@192.168.2.171). If not set, runs locally.")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show step-by-step output")
     parser.add_argument("--output", "-o", help="Output JSON file (default: results/<model>/<task>.json)")
     args = parser.parse_args()
 
     api_key = args.api_key or os.environ.get("LLAMA_API_KEY", "")
+
+    # Set global SSH target for exec commands
+    global _ssh_target
+    _ssh_target = args.exec_host
 
     # Collect tasks to run
     tasks = []
