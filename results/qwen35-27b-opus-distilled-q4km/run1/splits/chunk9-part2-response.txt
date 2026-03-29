@@ -1,0 +1,412 @@
+# SC4 — Hard — Migrating a Stateful Monolith to Kubernetes
+
+## Part A: Top 5 Technical Blockers
+
+### Blocker 1: In-Memory Session Storage with Sticky Sessions
+**Problem:** The application stores user sessions in local JVM memory, relying on F5's sticky session configuration. In Kubernetes:
+- Pods are ephemeral and can be terminated/rescheduled at any time
+- Session affinity is less reliable and doesn't survive pod restarts
+- Scaling becomes problematic as sessions are tied to specific pods
+
+**Solution:** Externalize session storage to a distributed cache like Redis or Memcached. Deploy Redis as a StatefulSet with persistence or use a managed service (AWS ElastiCache, Azure Cache for Redis). Update the application to use a session provider that stores sessions externally (Spring Session with Redis, or custom implementation).
+
+### Blocker 2: Local NFS Mount for File Storage
+**Problem:** The `/data/uploads` NFS mount is tied to specific bare-metal servers. Kubernetes pods running on different nodes cannot access this path, and the mount isn't portable across the cluster.
+
+**Solution:** Use Kubernetes Persistent Volumes with the NFS CSI driver (`nfs.csi.k8s.io`) to mount the NFS share dynamically to any pod. Alternatively, migrate to object storage (AWS S3, Azure Blob) using the application's file upload API, which provides better scalability and durability.
+
+### Blocker 3: Oracle Database Dependency
+**Problem:** The on-prem Oracle 19c database creates several issues:
+- Licensing complexity for containerized deployments
+- Network connectivity from cloud Kubernetes to on-prem
+- No native Kubernetes operator for Oracle 19c
+- Potential performance issues with cross-network latency
+
+**Solution:** Keep Oracle on-prem initially with secure connectivity via the existing VPN or a new Direct Connect link. Use database connection pooling (HikariCP) with connection validation. Long-term, consider migrating to Oracle Cloud Infrastructure (OCI) Database or using Oracle on RDS if licensing permits.
+
+### Blocker 4: IBM MQ Mainframe Integration
+**Problem:** IBM MQ requires specific network configuration, port access, and potentially client libraries that aren't easily containerized. The mainframe communication pattern may not be designed for the dynamic nature of Kubernetes.
+
+**Solution:** Keep IBM MQ on-prem and expose it securely through the service mesh (Istio) with mTLS. Use the IBM MQ container image for the client side if available, or mount the necessary libraries. Implement a retry mechanism with exponential backoff for MQ operations. Consider using a message queue abstraction layer (like Spring AMQP) to allow future migration to cloud-native messaging (Kafka, RabbitMQ).
+
+### Blocker 5: Stateful Application Architecture
+**Problem:** The monolith was designed for fixed infrastructure with assumptions about:
+- Fixed number of instances (8 servers)
+- Predictable scaling patterns
+- Local state persistence
+- Synchronous communication patterns
+
+**Solution:** Implement a gradual refactoring approach:
+- Add caching layers (Redis) for frequently accessed data
+- Implement circuit breakers (Resilience4j) for external dependencies
+- Add health checks and readiness probes
+- Consider breaking out independent services over time using the Strangler Fig pattern
+
+---
+
+## Part B: OpenTofu Module for Persistent Storage
+
+```hcl
+# modules/k8s-storage/main.tf
+
+locals {
+  nfs_server = var.nfs_server_address
+  nfs_path   = var.nfs_export_path
+  storage_capacity = var.storage_capacity
+}
+
+# StorageClass for NFS-backed CSI driver
+resource "kubernetes_storage_class" "nfs_storage_class" {
+  metadata {
+    name = "${var.environment}-nfs-sc"
+    annotations = {
+      "storageclass.kubernetes.io/is-default-class" = var.is_default ? "true" : "false"
+    }
+  }
+
+  storage_provisioner = "nfs.csi.k8s.io"
+
+  mount_options = [
+    "vers=4.1",
+    "rsize=1048576",
+    "wsize=1048576",
+    "timeo=14",
+    "retrans=2"
+  ]
+
+  reclaim_policy = "Retain"
+  volume_binding_mode = "Immediate"
+
+  parameters = {
+    server = local.nfs_server
+    path   = local.nfs_path
+  }
+
+  dynamic "allow_volume_expansion" {
+    for_each = var.allow_volume_expansion ? [1] : []
+    content {
+      value = "true"
+    }
+  }
+}
+
+# PersistentVolume (for static provisioning)
+resource "kubernetes_persistent_volume" "nfs_pv" {
+  count = var.create_pv ? 1 : 0
+
+  metadata {
+    name = "${var.environment}-nfs-pv"
+    labels = {
+      app = var.app_name
+      env = var.environment
+    }
+  }
+
+  capacity = {
+    storage = local.storage_capacity
+  }
+
+  access_modes = ["ReadWriteMany"]
+
+  persistent_volume_source {
+    nfs {
+      server = local.nfs_server
+      path   = local.nfs_path
+      read_only = false
+    }
+  }
+
+  storage_class_name = kubernetes_storage_class.nfs_storage_class.metadata[0].name
+
+  dynamic "node_affinity" {
+    for_each = var.node_selector ? [1] : []
+    content {
+      required {
+        node_selector_term {
+          match_expressions {
+            key      = each.value.key
+            operator = "In"
+            values   = each.value.values
+          }
+        }
+      }
+    }
+  }
+}
+
+# PersistentVolumeClaim
+resource "kubernetes_persistent_volume_claim" "nfs_pvc" {
+  metadata {
+    name = "${var.environment}-nfs-pvc"
+    namespace = var.namespace
+    labels = {
+      app = var.app_name
+      env = var.environment
+    }
+  }
+
+  spec {
+    access_modes = ["ReadWriteMany"]
+    resources {
+      requests = {
+        storage = local.storage_capacity
+      }
+    }
+
+    storage_class_name = kubernetes_storage_class.nfs_storage_class.metadata[0].name
+
+    dynamic "volume_name" {
+      for_each = var.create_pv ? [kubernetes_persistent_volume.nfs_pv[0].metadata[0].name] : []
+      content {
+        value = volume_name.value
+      }
+    }
+  }
+
+  depends_on = [kubernetes_storage_class.nfs_storage_class]
+}
+
+# Output values
+output "storage_class_name" {
+  value = kubernetes_storage_class.nfs_storage_class.metadata[0].name
+  description = "Name of the created StorageClass"
+}
+
+output "pvc_name" {
+  value = kubernetes_persistent_volume_claim.nfs_pvc.metadata[0].name
+  description = "Name of the created PersistentVolumeClaim"
+}
+
+output "pvc_namespace" {
+  value = kubernetes_persistent_volume_claim.nfs_pvc.metadata[0].namespace
+  description = "Namespace of the created PersistentVolumeClaim"
+}
+```
+
+```hcl
+# modules/k8s-storage/variables.tf
+
+variable "environment" {
+  type        = string
+  description = "Environment name (e.g., production, staging)"
+  default     = "production"
+}
+
+variable "app_name" {
+  type        = string
+  description = "Application name for labeling"
+  default     = "legacy-monolith"
+}
+
+variable "namespace" {
+  type        = string
+  description = "Kubernetes namespace"
+  default     = "default"
+}
+
+variable "nfs_server_address" {
+  type        = string
+  description = "NFS server IP address or hostname"
+}
+
+variable "nfs_export_path" {
+  type        = string
+  description = "NFS export path"
+}
+
+variable "storage_capacity" {
+  type        = string
+  description = "Storage capacity (e.g., '100Gi', '1Ti')"
+  default     = "100Gi"
+}
+
+variable "is_default" {
+  type        = bool
+  description = "Whether this StorageClass should be the default"
+  default     = false
+}
+
+variable "allow_volume_expansion" {
+  type        = bool
+  description = "Whether to allow volume expansion"
+  default     = true
+}
+
+variable "create_pv" {
+  type        = bool
+  description = "Whether to create a static PersistentVolume"
+  default     = false
+}
+
+variable "node_selector" {
+  type        = map(list(string))
+  description = "Node selector for PV affinity"
+  default     = {}
+}
+```
+
+```hcl
+# modules/k8s-storage/outputs.tf
+# (Already included in main.tf above)
+```
+
+### Why ReadWriteMany Access Mode is Necessary
+
+**ReadWriteMany (RWX)** is required because:
+
+1. **Multiple Pod Access:** The uploaded files need to be accessible by multiple application pods simultaneously. In a Kubernetes deployment with multiple replicas, any pod might need to read or write to the same file.
+
+2. **Session Independence:** Unlike ReadWriteOnce (RWO) which allows only one node to mount the volume at a time, RWX allows the NFS share to be mounted on multiple nodes concurrently.
+
+3. **Load Balancing:** With sticky sessions disabled (recommended for Kubernetes), requests can go to any pod. All pods must have access to the same file storage.
+
+4. **NFS Native Support:** NFS naturally supports multiple clients mounting the same export simultaneously, making it ideal for RWX scenarios.
+
+---
+
+## Part C: Phased Migration Plan Using Strangler Fig Pattern
+
+### Phase 1: Infrastructure Foundation and Parallel Run (Weeks 1-8)
+
+**What Moves:**
+- Kubernetes cluster provisioning (EKS/AKS/GKE)
+- Ingress controller (NGINX or Traefik) with TLS termination
+- Redis cluster for session externalization
+- Service mesh (Istio) for mTLS and observability
+- CI/CD pipeline for Kubernetes deployments
+- Monitoring stack (Prometheus, Grafana, Jaeger)
+
+**Traffic Splitting:**
+- F5 continues to route 100% of traffic to legacy servers
+- New Kubernetes Ingress configured but not receiving production traffic
+- Use F5 iRules or a new API Gateway to enable canary routing later
+
+**IBM MQ Integration:**
+- Keep IBM MQ on-prem
+- Configure Istio VirtualService to route MQ traffic through the existing VPN
+- Implement mTLS between Kubernetes pods and IBM MQ
+
+**Zero-Downtime Strategy:**
+- No production traffic touches Kubernetes yet
+- Run smoke tests against Kubernetes deployment using synthetic traffic
+
+**Rollback Procedure:**
+- Simply don't route traffic to Kubernetes
+- Legacy system remains untouched
+
+**Go/No-Go Metrics:**
+| Metric | Target | Tool |
+|--------|--------|------|
+| Pod startup time | < 30 seconds | Kubernetes events |
+| Health check success | 100% | Readiness probes |
+| End-to-end latency (synthetic) | < 2 seconds p99 | JMeter/k6 |
+| Error rate (synthetic) | 0% | Prometheus |
+| Memory/CPU utilization | < 70% | Prometheus |
+
+---
+
+### Phase 2: Canary Deployment and Session Migration (Weeks 9-16)
+
+**What Moves:**
+- Externalized session storage (Redis)
+- 5% of production traffic routed to Kubernetes
+- Database connection pooling configured
+- File upload functionality tested with real traffic
+
+**Traffic Splitting:**
+```
+F5 BIG-IP Configuration:
+├── 95% → Legacy Servers (Pool: LEGACY_POOL)
+└── 5%  → Kubernetes Ingress (Pool: K8S_POOL)
+```
+
+Or using Istio VirtualService for finer control:
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: legacy-app-routing
+spec:
+  hosts:
+  - legacy-app.company.com
+  http:
+  - route:
+    - destination:
+        host: legacy-app.legacy.svc.cluster.local
+      weight: 95
+    - destination:
+        host: legacy-app.k8s.svc.cluster.local
+      weight: 5
+```
+
+**IBM MQ Integration:**
+- Same as Phase 1
+- Add retry logic with exponential backoff in Kubernetes deployment
+
+**Zero-Downtime Strategy:**
+- Session data now stored in Redis, accessible by both legacy and Kubernetes
+- Users can seamlessly move between legacy and Kubernetes instances
+- Database transactions remain consistent
+
+**Rollback Procedure:**
+1. Set Kubernetes weight to 0% in F5/Istio
+2. Wait for active sessions to drain (max session timeout)
+3. Scale Kubernetes deployment to 0 replicas
+4. Investigate issues offline
+
+**Go/No-Go Metrics:**
+| Metric | Target | Tool |
+|--------|--------|------|
+| Error rate (production) | < 0.1% | Prometheus/Sentry |
+| Latency p99 | < 2.5 seconds | Grafana |
+| Session consistency | 100% | Application logs |
+| File upload success | 100% | Application logs |
+| MQ message success | > 99.9% | IBM MQ metrics |
+
+---
+
+### Phase 3: Progressive Migration and Cutover (Weeks 17-24)
+
+**What Moves:**
+- Progressive traffic shift: 5% → 25% → 50% → 75% → 100%
+- Legacy servers placed in maintenance mode
+- Final cutover and legacy decommissioning
+
+**Traffic Splitting Schedule:**
+| Week | Kubernetes | Legacy |
+|------|------------|--------|
+| 17 | 25% | 75% |
+| 18 | 50% | 50% |
+| 19 | 75% | 25% |
+| 20 | 100% | 0% (standby) |
+| 21-24 | 100% | Decommission |
+
+**IBM MQ Integration:**
+- Consider migrating to cloud-native messaging (Kafka/RabbitMQ) during this phase
+- Or continue using IBM MQ with improved connectivity
+
+**Zero-Downtime Strategy:**
+- Blue-green deployment capability established
+- Database migrations done incrementally with backward compatibility
+- Feature flags for gradual functionality enablement
+
+**Rollback Procedure:**
+1. Immediate: Revert traffic weight in F5/Istio
+2. Short-term: Scale up legacy servers if needed
+3. Long-term: Investigate root cause, fix, re-test
+
+**Go/No-Go Metrics:**
+| Metric | Target | Tool |
+|--------|--------|------|
+| Error rate | < 0.01% | Prometheus/Sentry |
+| Latency p99 | < 2 seconds | Grafana |
+| Throughput | ≥ 3,000 concurrent users | Application metrics |
+| Resource utilization | < 80% | Prometheus |
+| Business transactions | 100% success | Business monitoring |
+
+### Visual Migration Timeline
+
+```
+Week:    1---4---8---12--16--20--24
+         │    │    │    │    │    │
+Phase 1: │════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════

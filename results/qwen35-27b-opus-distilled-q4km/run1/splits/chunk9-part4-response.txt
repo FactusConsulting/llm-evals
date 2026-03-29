@@ -1,0 +1,825 @@
+# SC10 — Multi-Cluster Disaster Recovery Platform
+
+## SC10-Part A: Kubernetes Multi-Cluster Architecture Design
+
+### Architecture Comparison
+
+| Aspect | Active-Passive (Velero) | Active-Active (Service Mesh) |
+|--------|------------------------|------------------------------|
+| **RPO Capability** | ❌ Cannot meet 15 min | ✅ Can meet 15 min |
+| **RTO Capability** | ❌ Cannot meet 1 hour | ✅ Can meet 1 hour |
+| **Complexity** | Low | High |
+| **Cost** | Lower | Higher (2x compute) |
+| **Data Consistency** | Point-in-time | Near real-time |
+
+### RPO/RTO Calculations
+
+**Active-Passive with Velero:**
+- **RPO**: Velero backups typically run hourly → **FAILS 15 min requirement**
+- **RTO**: Restore 200TB at 10 Gbps:
+  ```
+  200 TB × 8 bits/byte = 1,600,000 Gb
+  1,600,000 Gb ÷ 10 Gbps = 160,000 seconds = 44.4 hours
+  ```
+  **FAILS 1 hour requirement**
+
+**Active-Active with Service Mesh:**
+- **RPO**: Real-time replication → **MEETS 15 min requirement**
+- **RTO**: Failover in seconds/minutes → **MEETS 1 hour requirement**
+
+### Stateful Component Replication Strategies
+
+| Component | Replication Strategy | RPO | Notes |
+|-----------|---------------------|-----|-------|
+| **PostgreSQL** | Synchronous streaming (2 nodes sync, 1 async) | <1 sec | Patroni manages failover |
+| **Redis** | Master-Slave with Sentinel | <1 sec | Sentinel auto-failover |
+| **RabbitMQ** | Quorum queues + Federation | <1 sec | Quorum for critical queues |
+| **MinIO** | Site replication (async) | 1-5 min | 200TB sync takes 44h initially |
+
+### Recommended Architecture: Hybrid Active-Active
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    PRIMARY (Chicago)                            │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
+│  │   K8s       │  │   K8s       │  │   K8s       │             │
+│  │  Primary    │  │  Secondary  │  │  Standby    │             │
+│  │  Cluster    │  │  Cluster    │  │  Cluster    │             │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘             │
+│         │                │                │                     │
+│  ┌──────▼──────┐  ┌──────▼──────┐  ┌──────▼──────┐             │
+│  │  PostgreSQL │  │    Redis    │  │  RabbitMQ   │             │
+│  │  (Primary)  │  │  (Master)   │  │  (Primary)  │             │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘             │
+│         │                │                │                     │
+│  ┌──────▼────────────────▼────────────────▼──────┐             │
+│  │              MinIO Cluster (Primary)           │             │
+│  │              200TB Object Storage              │             │
+│  └───────────────────────────────────────────────┘             │
+└─────────────────────────────────────────────────────────────────┘
+                          │ 10 Gbps Dark Fiber (12ms)
+                          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    DR (Dallas)                                  │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
+│  │   K8s       │  │   K8s       │  │   K8s       │             │
+│  │  Standby    │  │  Standby    │  │  Standby    │             │
+│  │  Cluster    │  │  Cluster    │  │  Cluster    │             │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘             │
+│         │                │                │                     │
+│  ┌──────▼──────┐  ┌──────▼──────┐  ┌──────▼──────┐             │
+│  │  PostgreSQL │  │    Redis    │  │  RabbitMQ   │             │
+│  │  (Standby)  │  │  (Slave)    │  │  (Standby)  │             │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘             │
+│         │                │                │                     │
+│  ┌──────▼────────────────▼────────────────▼──────┐             │
+│  │              MinIO Cluster (Replica)           │             │
+│  │              Site Replication                  │             │
+│  └───────────────────────────────────────────────┘             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Service Mesh Recommendation: Cilium Cluster Mesh
+
+**Why Cilium over Istio for this scenario:**
+1. **Lower latency**: eBPF-based, no sidecar overhead
+2. **Better performance**: Native Kubernetes integration
+3. **Simpler multi-cluster**: Built-in Cluster Mesh feature
+4. **Resource efficiency**: Critical for 200TB data movement
+
+---
+
+## SC10-Part B: Ansible Playbook for PostgreSQL Streaming Replication
+
+```yaml
+---
+# SC10-Part B: PostgreSQL Streaming Replication with Patroni
+# Configures primary (Chicago) and standby (Dallas) replication
+
+- name: Configure PostgreSQL Streaming Replication with Patroni
+  hosts: "{{ group_names['patroni_cluster'] }}"
+  become: true
+  vars:
+    # Site configuration
+    primary_site: "chicago"
+    dr_site: "dallas"
+    
+    # PostgreSQL configuration
+    postgres_version: "16"
+    postgres_data_dir: "/var/lib/postgresql/{{ postgres_version }}/main"
+    postgres_port: 5432
+    postgres_replication_port: 5433
+    
+    # Patroni configuration
+    patroni_port: 8008
+    patroni_listen_address: "0.0.0.0"
+    
+    # Site-specific variables
+    chicago_primary_host: "pg-primary-chicago.insurance.internal"
+    chicago_primary_ip: "10.10.1.10"
+    chicago_standby_host: "pg-standby-chicago.insurance.internal"
+    chicago_standby_ip: "10.10.1.11"
+    
+    dallas_standby_host: "pg-standby-dallas.insurance.internal"
+    dallas_standby_ip: "10.10.2.10"
+    
+    # Replication configuration
+    synchronous_mode: true
+    synchronous_node_count: 2
+    synchronous_standby_names: "pg-standby-chicago,pg-standby-dallas"
+    
+    # etcd DCS configuration
+    etcd_chicago_hosts:
+      - "etcd-1-chicago.insurance.internal:2379"
+      - "etcd-2-chicago.insurance.internal:2379"
+      - "etcd-3-chicago.insurance.internal:2379"
+    etcd_dallas_hosts:
+      - "etcd-1-dallas.insurance.internal:2379"
+      - "etcd-2-dallas.insurance.internal:2379"
+      - "etcd-3-dallas.insurance.internal:2379"
+    etcd_namespace: "/insurance/production"
+    
+    # Replication user
+    replication_user: "replicator"
+    replication_password: "{{ vault_replication_password }}"
+    
+    # PostgreSQL parameters for replication
+    max_wal_senders: 10
+    max_replication_slots: 10
+    wal_level: "replica"
+    wal_keep_size: "1GB"
+    max_slot_wal_keep_size: "4GB"
+    
+    # SSL configuration
+    ssl_enabled: true
+    ssl_cert_file: "/etc/ssl/certs/postgresql/server.crt"
+    ssl_key_file: "/etc/ssl/private/postgresql/server.key"
+    ssl_ca_file: "/etc/ssl/certs/postgresql/ca.crt"
+
+  tasks:
+    # ========================================================================
+    # SECTION 1: Install Dependencies and Patroni
+    # ========================================================================
+    
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+
+    - name: Install PostgreSQL and dependencies
+      ansible.builtin.apt:
+        name:
+          - "postgresql-{{ postgres_version }}"
+          - "postgresql-contrib-{{ postgres_version }}"
+          - "postgresql-client-{{ postgres_version }}"
+          - python3-psycopg2
+          - python3-yaml
+          - python3-etcd
+          - etcd-client
+          - curl
+          - jq
+        state: present
+
+    - name: Install Patroni via pip
+      ansible.builtin.pip:
+        name:
+          - "patroni[etcd3]==3.3.0"
+          - "psycopg2-binary"
+          - "etcd3"
+        state: present
+        virtualenv: /opt/patroni/venv
+
+    - name: Create Patroni system user
+      ansible.builtin.user:
+        name: patroni
+        system: true
+        shell: /bin/false
+        create_home: false
+        groups: postgres
+
+    # ========================================================================
+    # SECTION 2: Configure PostgreSQL for Replication
+    # ========================================================================
+
+    - name: Configure postgresql.conf for replication
+      ansible.builtin.template:
+        src: templates/postgresql_replication.conf.j2
+        dest: "/etc/postgresql/{{ postgres_version }}/main/postgresql.conf"
+        owner: postgres
+        group: postgres
+        mode: '0640'
+      notify: Restart PostgreSQL
+
+    - name: Configure pg_hba.conf for replication connections
+      ansible.builtin.template:
+        src: templates/pg_hba_replication.conf.j2
+        dest: "/etc/postgresql/{{ postgres_version }}/main/pg_hba.conf"
+        owner: postgres
+        group: postgres
+        mode: '0640'
+      notify: Reload PostgreSQL
+
+    - name: Create replication user
+      ansible.builtin.postgresql_user:
+        name: "{{ replication_user }}"
+        password: "{{ replication_password }}"
+        role_attr_flags: REPLICATION,LOGIN
+        db: postgres
+        state: present
+      become_user: postgres
+
+    # ========================================================================
+    # SECTION 3: Configure etcd as DCS
+    # ========================================================================
+
+    - name: Install etcd client
+      ansible.builtin.apt:
+        name: etcd-client
+        state: present
+
+    - name: Configure etcd client certificate
+      ansible.builtin.copy:
+        content: |
+          [etcdctl]
+          endpoints = {{ etcd_chicago_hosts | join(',') }}
+          cert-file = /etc/ssl/certs/etcd/client.crt
+          key-file = /etc/ssl/private/etcd/client.key
+          cacert-file = /etc/ssl/certs/etcd/ca.crt
+        dest: /etc/etcd/etcdctl.conf
+        mode: '0600'
+
+    - name: Verify etcd connectivity
+      ansible.builtin.command: >
+        ETCDCTL_API=3 etcdctl --endpoints={{ etcd_chicago_hosts | join(',') }}
+        --cert=/etc/ssl/certs/etcd/client.crt
+        --key=/etc/ssl/private/etcd/client.key
+        --cacert=/etc/ssl/certs/etcd/ca.crt
+        endpoint health
+      register: etcd_health
+      changed_when: false
+      failed_when: "'not healthy" in etcd_health.stdout
+
+    # ========================================================================
+    # SECTION 4: Template Patroni Configuration
+    # ========================================================================
+
+    - name: Create Patroni configuration directory
+      ansible.builtin.file:
+        path: /etc/patroni
+        state: directory
+        owner: patroni
+        group: patroni
+        mode: '0750'
+
+    - name: Template patroni.yml configuration
+      ansible.builtin.template:
+        src: templates/patroni.yml.j2
+        dest: /etc/patroni/patroni.yml
+        owner: patroni
+        group: patroni
+        mode: '0600'
+      notify: Restart Patroni
+
+    # ========================================================================
+    # SECTION 5: Configure Systemd Service
+    # ========================================================================
+
+    - name: Deploy Patroni systemd service
+      ansible.builtin.template:
+        src: templates/patroni.service.j2
+        dest: /etc/systemd/system/patroni.service
+        mode: '0644'
+      notify:
+        - Reload systemd
+        - Restart Patroni
+
+    - name: Enable and start Patroni service
+      ansible.builtin.systemd:
+        name: patroni
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # ========================================================================
+    # SECTION 6: Configure Replication Slots
+    # ========================================================================
+
+    - name: Create physical replication slot for standby
+      ansible.builtin.command: >
+        psql -h localhost -U postgres -c
+        "SELECT pg_create_physical_replication_slot('{{ inventory_hostname }}_slot');"
+      register: slot_creation
+      changed_when: "'CREATE_REPLICATION_SLOT' in slot_creation.stdout"
+      failed_when: "'already exists' not in slot_creation.stderr and 
+                    'CREATE_REPLICATION_SLOT' not in slot_creation.stdout"
+      become_user: postgres
+      when: patroni_role == "master"
+
+    # ========================================================================
+    # SECTION 7: Verify Replication Configuration
+    # ========================================================================
+
+    - name: Verify replication settings
+      ansible.builtin.command: >
+        psql -h localhost -U postgres -t -c
+        "SHOW synchronous_standby_names;"
+      register: sync_standby_check
+      become_user: postgres
+      changed_when: false
+
+    - name: Display synchronous standby names
+      ansible.builtin.debug:
+        msg: "Synchronous Standby Names: {{ sync_standby_check.stdout }}"
+
+    - name: Check replication lag
+      ansible.builtin.command: >
+        psql -h localhost -U postgres -t -c
+        "SELECT client_addr, state, sent_lsn, write_lsn, flush_lsn, 
+         replay_lsn, sync_state FROM pg_stat_replication;"
+      register: replication_status
+      become_user: postgres
+      changed_when: false
+      when: patroni_role == "master"
+
+    - name: Display replication status
+      ansible.builtin.debug:
+        msg: "Replication Status: {{ replication_status.stdout }}"
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Restart PostgreSQL
+      ansible.builtin.systemd:
+        name: "postgresql@{{ postgres_version }}-main"
+        state: restarted
+
+    - name: Reload PostgreSQL
+      ansible.builtin.systemd:
+        name: "postgresql@{{ postgres_version }}-main"
+        state: reloaded
+
+    - name: Restart Patroni
+      ansible.builtin.systemd:
+        name: patroni
+        state: restarted
+```
+
+### Supporting Template: patroni.yml.j2
+
+```yaml
+---
+# Patroni Configuration Template
+scope: insurance-production
+namespace: {{ etcd_namespace }}
+name: {{ inventory_hostname }}
+
+restapi:
+  listen: {{ patroni_listen_address }}:{{ patroni_port }}
+  connect_address: {{ inventory_hostname }}:{{ patroni_port }}
+  authentication:
+    username: admin
+    password: "{{ vault_patroni_admin_password }}"
+
+etcd3:
+  hosts: {% if ansible_hostname | contains('chicago') %}
+    {{ etcd_chicago_hosts | join(',') }}
+  {% else %}
+    {{ etcd_dallas_hosts | join(',') }}
+  {% endif %}
+  namespace: {{ etcd_namespace }}
+  protocol: https
+  cert_file: /etc/ssl/certs/etcd/client.crt
+  key_file: /etc/ssl/private/etcd/client.key
+  cacert_file: /etc/ssl/certs/etcd/ca.crt
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    synchronous_mode: true
+    synchronous_mode_strict: false
+    synchronous_node_count: {{ synchronous_node_count }}
+    synchronous_standby_names: '{{ synchronous_standby_names }}'
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        max_connections: 500
+        max_wal_senders: {{ max_wal_senders }}
+        max_replication_slots: {{ max_replication_slots }}
+        wal_level: {{ wal_level }}
+        wal_keep_size: {{ wal_keep_size }}
+        max_slot_wal_keep_size: {{ max_slot_wal_keep_size }}
+        hot_standby: "on"
+        hot_standby_feedback: "on"
+        archive_mode: "on"
+        archive_command: >
+          /usr/local/bin/pg_archive.sh %f
+        ssl: "on"
+        ssl_cert_file: {{ ssl_cert_file }}
+        ssl_key_file: {{ ssl_key_file }}
+        ssl_ca_file: {{ ssl_ca_file }}
+        synchronous_commit: "on"
+        max_standby_streaming_delay: 30s
+        wal_sender_timeout: 60s
+      create_replica_methods:
+        - basebackup
+        - pgbackrest
+      basebackup:
+        checkpoint: fast
+        max-rate: 100M
+      pgbackrest:
+        command: pgbackrest --stanza=insurance-production archive-copy
+        keep_data: true
+        immediate: true
+        safe_horizon: true
+      initdb:
+        - encoding: UTF8
+        - data-checksums
+        - locale: en_US.UTF-8
+        - lc_collate: en_US.UTF-8
+        - lc_ctype: en_US.UTF-8
+      pg_hba:
+        - local   all             all                                trust
+        - host    all             all             127.0.0.1/32      scram-sha-256
+        - hostssl replication     replicator      10.10.1.0/24      scram-sha-256
+        - hostssl replication     replicator      10.10.2.0/24      scram-sha-256
+        - host    all             all             10.10.1.0/24      scram-sha-256
+        - host    all             all             10.10.2.0/24      scram-sha-256
+      users:
+        replicator:
+          password: "{{ replication_password }}"
+          options:
+            - REPLICATION
+            - LOGIN
+        app_user:
+          password: "{{ vault_app_user_password }}"
+          options:
+            - NOINHERIT
+            - LOGIN
+            - CREATEDB
+
+  method: create_replica
+
+postgresql:
+  listen: 0.0.0.0:{{ postgres_port }}
+  connect_address: {{ inventory_hostname }}:{{ postgres_port }}
+  data_dir: {{ postgres_data_dir }}
+  bin_dir: /usr/lib/postgresql/{{ postgres_version }}/bin
+  pgpass: /var/lib/postgresql/.pgpass
+  authentication:
+    replication:
+      username: replicator
+      password: "{{ replication_password }}"
+    superuser:
+      username: postgres
+      password: "{{ vault_postgres_password }}"
+    rewind:
+      username: rewind_user
+      password: "{{ vault_rewind_password }}"
+  parameters:
+    port: {{ postgres_port }}
+    unix_socket_directories: /var/run/postgresql
+    log_destination: stderr
+    logging_collector: "on"
+    log_directory: /var/log/postgresql
+    log_filename: postgresql-%Y-%m-%d_%H%M%S.log
+    log_rotation_age: 1d
+    log_rotation_size: 100MB
+    log_min_duration_statement: 1000
+    log_checkpoints: "on"
+    log_connections: "on"
+    log_disconnections: "on"
+    log_lock_waits: "on"
+    log_statement: ddl
+    log_temp_files: 0
+    track_activities: "on"
+    track_counts: "on"
+    track_io_timing: "on"
+    shared_buffers: 4GB
+    effective_cache_size: 12GB
+    maintenance_work_mem: 1GB
+    work_mem: 64MB
+    random_page_cost: 1.1
+    effective_io_concurrency: 200
+    default_statistics_target: 100
+    checkpoint_completion_target: 0.9
+    wal_buffers: 64MB
+    min_wal_size: 2GB
+    max_wal_size: 8GB
+    autovacuum: "on"
+    autovacuum_max_workers: 3
+    autovacuum_naptime: 1min
+    autovacuum_vacuum_threshold: 50
+    autovacuum_analyze_threshold: 50
+    autovacuum_vacuum_scale_factor: 0.1
+    autovacuum_analyze_scale_factor: 0.05
+    autovacuum_freeze_max_age: 200000000
+    autovacuum_multixact_freeze_max_age: 400000000
+    vacuum_cost_delay: 2ms
+    vacuum_cost_limit: 200
+    max_worker_processes: 8
+    max_parallel_workers: 4
+    max_parallel_workers_per_gather: 2
+    max_parallel_maintenance_workers: 2
+  create_replica_methods:
+    - basebackup
+    - pgbackrest
+  basebackup:
+    checkpoint: fast
+    max-rate: 100M
+  pgbackrest:
+    command: pgbackrest --stanza=insurance-production archive-copy
+    keep_data: true
+    immediate: true
+    safe_horizon: true
+  create_database: true
+  pg_hba:
+    - local   all             all                                trust
+    - host    all             all             127.0.0.1/32      scram-sha-256
+    - hostssl replication     replicator      10.10.1.0/24      scram-sha-256
+    - hostssl replication     replicator      10.10.2.0/24      scram-sha-256
+    - host    all             all             10.10.1.0/24      scram-sha-256
+    - host    all             all             10.10.2.0/24      scram-sha-256
+  authentication:
+    replication:
+      username: replicator
+      password: "{{ replication_password }}"
+    superuser:
+      username: postgres
+      password: "{{ vault_postgres_password }}"
+    rewind:
+      username: rewind_user
+      password: "{{ vault_rewind_password }}"
+
+watchdog:
+  mode: off
+```
+
+---
+
+## SC10-Part C: Automated Failover Orchestration
+
+### Failover Sequence Diagram
+
+```
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                    AUTOMATED FAILOVER SEQUENCE                                 │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+TIME 0:00:00 ────────────────────────────────────────────────────────────────────
+│
+├── [0:00:00] CHICAGO SITE FAILURE DETECTED
+│           │
+│           ├── Prometheus: No heartbeats from Chicago nodes (30s timeout)
+│           ├── Keepalived: VIP not responding (10s timeout)
+│           ├── Network: BGP route withdrawn (5s)
+│           └── Health Check: API endpoints returning 503 (15s)
+│
+├── [0:00:15] FAILURE CONFIRMATION (Multi-Signal Validation)
+│           │
+│           ├── Signal 1: Prometheus alerts (3 consecutive misses)
+│           ├── Signal 2: Network unreachable (ping + TCP)
+│           ├── Signal 3: No etcd heartbeats from Chicago
+│           └── Decision: Site failure confirmed (not false positive)
+│
+├── [0:00:20] DNS/GSLB FAILOVER
+│           │
+│           ├── Route53/NS1: Update TTL, point to Dallas VIP
+│           ├── Anycast: Update BGP announcements
+│           ├── CDN: Invalidate cache, redirect to Dallas
+│           └── Expected propagation: 30-60 seconds
+│
+├── [0:00:30] DATABASE FAILOVER (Patroni)
+│           │
+│           ├── Patroni: Detect master unreachable
+│           ├── Patroni: Check synchronous standby status
+│           ├── Patroni: Promote pg-standby-dallas to master
+│           ├── Patroni: Update etcd leader key
+│           └── Duration: 10-30 seconds
+│
+├── [0:00:45] REDIS FAILOVER (Sentinel)
+│           │
+│           ├── Sentinel: Detect master down (down-after-milliseconds)
+│           ├── Sentinel: Run failover election
+│           ├── Sentinel: Promote Dallas slave to master
+│           ├── Sentinel: Reconfigure other slaves
+│           └── Duration: 5-15 seconds
+│
+├── [0:01:00] RABBITMQ FAILOVER
+│           │
+│           ├── Quorum Queues: Automatic leader election
+│           ├── Federation: Update upstream links
+│           ├── Mirror Queues: Promote mirrors in Dallas
+│           └── Duration: 5-10 seconds
+│
+├── [0:01:15] MINIO SITE REPLICATION CATCH-UP
+│           │
+│           ├── MinIO: Detect primary site down
+│           ├── MinIO: Promote Dallas site to primary
+│           ├── MinIO: Begin async replication catch-up
+│           └── Note: 200TB sync = 44 hours (background)
+│
+├── [0:01:30] KUBERNETES WORKLOAD FAILOVER
+│           │
+│           ├── Service Mesh: Update service endpoints
+│           ├── Ingress: Route traffic to Dallas cluster
+│           ├── Workloads: Already running in Dallas (active-active)
+│           └── Duration: 5-10 seconds
+│
+├── [0:02:00] INFRASTRUCTURE STATE UPDATE
+│           │
+│           ├── OpenTofu: Update state file
+│           ├── Terraform Cloud: Lock state, apply changes
+│           ├── Update DNS records permanently
+│           └── Duration: 1-2 minutes
+│
+├── [0:02:30] VERIFICATION & NOTIFICATION
+│           │
+│           ├── Health checks: All services responding
+│           ├── Data consistency: Verify replication lag = 0
+│           ├── Alerts: Notify on-call team
+│           └── Monitoring: Update dashboards
+│
+└── [0:03:00] FAILOVER COMPLETE
+            │
+            └── Total RTO: ~3 minutes (well under 1 hour requirement)
+```
+
+### Detailed Component Failover Procedures
+
+#### 1. Failure Detection
+
+```yaml
+# Prometheus Alerting Rules for Site Failure Detection
+groups:
+  - name: site-health
+    rules:
+      # Node availability check
+      - alert: SiteNodesDown
+        expr: |
+          sum(up{job="node_exporter", site="chicago"}) 
+          != count(up{job="node_exporter", site="chicago"})
+        for: 30s
+        labels:
+          severity: critical
+          site: chicago
+        annotations:
+          summary: "Chicago site nodes are down"
+          runbook_url: "https://runbooks.insurance.internal/site-failover"
+
+      # Database master unreachable
+      - alert: PatroniMasterUnreachable
+        expr: |
+          patroni_master{site="chicago"} == 0
+        for: 15s
+        labels:
+          severity: critical
+          component: postgresql
+
+      # Redis master down
+      - alert: RedisMasterDown
+        expr: |
+          redis_master_up{site="chicago"} == 0
+        for: 10s
+        labels:
+          severity: critical
+          component: redis
+
+      # RabbitMQ cluster health
+      - alert: RabbitMQClusterDegraded
+        expr: |
+          rabbitmq_cluster_status{site="chicago"} != 1
+        for: 15s
+        labels:
+          severity: warning
+          component: rabbitmq
+
+      # MinIO site replication lag
+      - alert: MinIOReplicationLagHigh
+        expr: |
+          minio_replication_lag_bytes{site="chicago"} > 1073741824
+        for: 5m
+        labels:
+          severity: warning
+          component: minio
+
+      # Network connectivity between sites
+      - alert: InterSiteLatencyHigh
+        expr: |
+          probe_duration_seconds{job="blackbox", target="chicago.dallas"} > 0.1
+        for: 1m
+        labels:
+          severity: warning
+```
+
+#### 2. DNS/GSLB Failover Configuration
+
+```yaml
+# AWS Route53 Health Check and Failover Configuration
+route53_health_checks:
+  - name: chicago-primary-health
+    type: HTTP
+    resource_path: /health
+    fqdn: api.insurance.internal
+    port: 443
+    failure_threshold: 3
+    request_interval: 10
+    enabled: true
+    tags:
+      Environment: Production
+      Site: Chicago
+
+  - name: dallas-dr-health
+    type: HTTP
+    resource_path: /health
+    fqdn: api-dr.insurance.internal
+    port: 443
+    failure_threshold: 3
+    request_interval: 10
+    enabled: true
+    tags:
+      Environment: Production
+      Site: Dallas
+
+route53_record_sets:
+  - name: api.insurance.internal
+    type: A
+    failover: PRIMARY
+    set_identifier: chicago-primary
+    health_check_id: "${aws_route53_health_check.chicago-primary-health.id}"
+    resource_records:
+      - "10.10.1.100"
+    ttl: 60
+
+  - name: api.insurance.internal
+    type: A
+    failover: SECONDARY
+    set_identifier: dallas-secondary
+    health_check_id: "${aws_route53_health_check.dallas-dr-health.id}"
+    resource_records:
+      - "10.10.2.100"
+    ttl: 60
+```
+
+#### 3. Patroni Automatic Promotion Configuration
+
+```yaml
+# Patroni Failover Configuration
+patroni_failover_config:
+  scope: insurance-production
+  namespace: /insurance/production
+  
+  # Automatic failover settings
+  automatic_failover: true
+  failover_priority:
+    - pg-primary-chicago
+    - pg-standby-chicago
+    - pg-standby-dallas
+    
+  # Synchronous replication settings
+  synchronous_mode: true
+  synchronous_mode_strict: false  # Allow async if sync nodes unavailable
+  synchronous_node_count: 2
+  synchronous_standby_names: "(pg-standby-chicago,pg-standby-dallas)"
+  
+  # Failover timing
+  maximum_lag_on_failover: 1048576  # 1MB max lag
+  failover_timeout: 30  # seconds
+  leader_ttl: 30  # seconds
+  loop_wait: 10  # seconds
+  retry_timeout: 10  # seconds
+  
+  # Follow mode for cascading replication
+  follow:
+    enabled: true
+    lag_threshold: 10485760  # 10MB
+```
+
+#### 4. Redis Sentinel Failover Configuration
+
+```yaml
+# Redis Sentinel Configuration
+redis_sentinel_config:
+  sentinel_name: "mymaster"
+  
+  # Master configuration
+  master:
+    host: "redis-master-chicago.insurance.internal"
+    port: 6379
+    quorum: 2  # Number of Sentinels agreeing on master down
+    
+  # Failover timing
+  down_after_milliseconds: 5000  # 5 seconds
+  failover_timeout: 60000  # 60 seconds
+  parallel_syncs: 1  # Number of slaves that can sync simultaneously
+  
+  # Sentinel instances
+  sentinels:
+    - host: "sentinel-1-chicago.insurance.internal"
+      port: 2

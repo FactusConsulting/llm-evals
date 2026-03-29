@@ -1,0 +1,738 @@
+# SC7 — CI/CD Pipeline Causing Production Drift
+
+## Part A: Drift Sources Analysis
+
+**Drift Source 1: Manual `tofu apply` commands (14 instances)**
+- **How it occurred**: Developers bypassed the CI/CD pipeline, running `tofu apply` directly from laptops with local credentials
+- **Why dangerous**: Changes not tracked in Git, no peer review, no audit trail, state file corruption risk
+- **Data loss scenarios without state locking**:
+  - Engineer A creates a database; Engineer B's concurrent apply deletes it (B's plan doesn't know it exists)
+  - State file corruption from concurrent S3 writes creates "orphaned" resources OpenTofu can't track
+  - Race condition: both engineers read state → both apply → second apply overwrites first's changes
+
+**Drift Source 2: Diverged Helm values files**
+- **How it occurred**: Developers used `helm upgrade --set` or local `-f` files not committed to Git
+- **Why dangerous**: Staging doesn't match production, can't reproduce environments, rollback impossible
+
+**Drift Source 3: Direct `kubectl edit` on ConfigMaps**
+- **What happens with simultaneous `tofu apply`**:
+  1. Both engineers read identical state file
+  2. Both compute plans based on same baseline
+  3. Both apply changes
+  4. Second apply may delete resources first engineer created, or create duplicates
+  5. S3 state file may be corrupted by concurrent writes
+
+---
+
+## Part B: GitLab CI Pipeline
+
+```yaml
+# .gitlab-ci.yml
+variables:
+  TOFU_VERSION: "1.6.0"
+  TOFU_INIT_ARGS: "-backend-config=region=$AWS_REGION -backend-config=bucket=$TOFU_STATE_BUCKET -backend-config=key=$TOFU_STATE_KEY -backend-config=dynamodb_table=$TOFU_LOCK_TABLE"
+  TOFU_FORMAT_ARGS: "-recursive"
+  TOFU_PLAN_FILE: "plan.out"
+
+stages:
+  - validate
+  - plan
+  - apply
+
+# Format check
+tofu-fmt-check:
+  stage: validate
+  image: opentofu/opentofu:$TOFU_VERSION
+  script:
+    - tofu init $TOFU_INIT_ARGS
+    - tofu fmt -check -recursive
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# Validate
+tofu-validate:
+  stage: validate
+  image: opentofu/opentofu:$TOFU_VERSION
+  script:
+    - tofu init $TOFU_INIT_ARGS
+    - tofu validate
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# Plan for dev (auto)
+tofu-plan-dev:
+  stage: plan
+  image: opentofu/opentofu:$TOFU_VERSION
+  environment: dev
+  script:
+    - tofu init $TOFU_INIT_ARGS
+    - tofu plan -var-file=environments/dev.tfvars -out=$TOFU_PLAN_FILE
+    - echo "## Dev Environment Plan" >> $CI_MERGE_REQUEST_DESCRIPTION
+    - cat $TOFU_PLAN_FILE >> $CI_MERGE_REQUEST_DESCRIPTION
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# Plan for staging (auto)
+tofu-plan-staging:
+  stage: plan
+  image: opentofu/opentofu:$TOFU_VERSION
+  environment: staging
+  script:
+    - tofu init $TOFU_INIT_ARGS
+    - tofu plan -var-file=environments/staging.tfvars -out=$TOFU_PLAN_FILE
+    - echo "## Staging Environment Plan" >> $CI_MERGE_REQUEST_DESCRIPTION
+    - cat $TOFU_PLAN_FILE >> $CI_MERGE_REQUEST_DESCRIPTION
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# Plan for production (auto)
+tofu-plan-production:
+  stage: plan
+  image: opentofu/opentofu:$TOFU_VERSION
+  environment: production
+  script:
+    - tofu init $TOFU_INIT_ARGS
+    - tofu plan -var-file=environments/production.tfvars -out=$TOFU_PLAN_FILE
+    - echo "## Production Environment Plan" >> $CI_MERGE_REQUEST_DESCRIPTION
+    - cat $TOFU_PLAN_FILE >> $CI_MERGE_REQUEST_DESCRIPTION
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# Apply for dev (auto after merge)
+tofu-apply-dev:
+  stage: apply
+  image: opentofu/opentofu:$TOFU_VERSION
+  environment: dev
+  script:
+    - tofu init $TOFU_INIT_ARGS
+    - tofu apply -var-file=environments/dev.tfvars -auto-approve
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# Apply for staging (manual approval)
+tofu-apply-staging:
+  stage: apply
+  image: opentofu/opentofu:$TOFU_VERSION
+  environment: staging
+  when: manual
+  script:
+    - tofu init $TOFU_INIT_ARGS
+    - tofu apply -var-file=environments/staging.tfvars -auto-approve
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# Apply for production (manual approval)
+tofu-apply-production:
+  stage: apply
+  image: opentofu/opentofu:$TOFU_VERSION
+  environment: production
+  when: manual
+  script:
+    - tofu init $TOFU_INIT_ARGS
+    - tofu apply -var-file=environments/production.tfvars -auto-approve
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+```
+
+---
+
+## Part C: Drift Detection and Reconciliation System
+
+**Scheduled Drift Detection in CI:**
+
+```yaml
+# Scheduled drift detection job
+drift-detection:
+  stage: validate
+  image: opentofu/opentofu:$TOFU_VERSION
+  schedule:
+    cron: "0 */6 * * *"  # Every 6 hours
+    cron_timezone: "UTC"
+  script:
+    - tofu init $TOFU_INIT_ARGS
+    - tofu plan -var-file=environments/production.tfvars -no-color | tee drift-report.txt
+    - if grep -q "Plan: [1-9]" drift-report.txt; then
+        curl -X POST $DRIFT_WEBHOOK_URL -d @drift-report.txt;
+      fi
+```
+
+**OPA Gatekeeper Policy to Block Direct Edits:**
+
+```yaml
+# OPA Gatekeeper ConstraintTemplate
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8snoedits
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sNoEdits
+      validation:
+        openAPIV3Schema:
+          properties:
+            resources:
+              type: array
+            namespaces:
+              type: array
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8snoedits
+        violation[{"msg": msg}] {
+          input.review.object.kind == resource
+          input.review.object.metadata.namespace == ns
+          not input.review.object.metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"]
+          resource := resources[_]
+          ns := namespaces[_]
+          msg := sprintf("Direct edit of %s in namespace %s is not allowed. Use GitOps.", [resource, ns])
+        }
+```
+
+**Helmfile Structure for Shared Values:**
+
+```yaml
+# helmfile.yaml
+bases:
+  - charts/base.yaml
+
+environments:
+  dev:
+    values:
+      - environment/dev-values.yaml
+  staging:
+    values:
+      - environment/staging-values.yaml
+  production:
+    values:
+      - environment/production-values.yaml
+
+releases:
+  - name: myapp
+    chart: ./charts/myapp
+    values:
+      - values.yaml  # Common base
+```
+
+**RBAC Configuration:**
+
+```yaml
+# Kubernetes RBAC - Deny direct edits
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ci-only-writer
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: developers-read-only
+subjects:
+  - kind: Group
+    name: developers
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: ci-only-writer
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ci-pipeline-writer
+subjects:
+  - kind: ServiceAccount
+    name: gitlab-ci-runner
+    namespace: gitlab
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+
+# AWS IAM Policy
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Deny",
+      "Action": ["s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::my-tofu-state-bucket/*",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::123456789012:role/gitlab-ci-role"
+        }
+      }
+    }
+  ]
+}
+```
+
+---
+
+# SC8 — Observability Stack Scaling Failure
+
+## Part A: Diagnosis
+
+**1. Prometheus OOM (64GB RAM, 8.2M series)**
+- **Root cause**: High cardinality. Each series ≈ 7.8KB in memory. 8.2M × 7.8KB ≈ 64GB
+- **Architectural limit**: Single Prometheus instance max ~5-10M series comfortably
+- **High cardinality**: Too many unique label value combinations creating excessive series
+- **Confirm with**:
+  ```promql
+  # Memory usage
+  process_resident_memory_bytes
+  
+  # Series count
+  count(up)
+  
+  # Top cardinality metrics
+  topk(20, count by(__name__) (up))
+  
+  # Find offending labels
+  topk(10, count by(pod) (up{job="my-app"}))
+  ```
+
+**2. Loki Drops (15% during peak)**
+- **Root cause**: Ingester buffer overflow during peak ingestion
+- **Architectural limit**: Single ingester ~100K lines/sec max
+- **Confirm with**:
+  ```bash
+  # Loki metrics
+  loki_dropped_samples_total
+  loki_ingester_memory_chunks
+  ```
+
+**3. Tempo Timeouts (>2hr traces)**
+- **Root cause**: Local storage not indexed for long-term queries; no partitioning
+- **Architectural limit**: Local storage degrades after ~24hr retention
+- **Confirm with**:
+  ```bash
+  tempo_traces_received_total
+  tempo_traces_query_duration_seconds
+  ```
+
+**4. Thanos Compactor Lag (3 days behind)**
+- **Root cause**: 500GB/week growth exceeds compaction capacity
+- **Architectural limit**: Compactor needs ~2x compute of ingestion rate
+- **Confirm with**:
+  ```bash
+  thanos_compactor_blocks_pending
+  thanos_compactor_compactions_total
+  ```
+
+---
+
+## Part B: Cardinality Report Script
+
+```bash
+#!/bin/bash
+# cardinality-report.sh
+
+PROMETHEUS_URL="${PROMETHEUS_URL:-http://prometheus:9090}"
+OUTPUT_FORMAT="${OUTPUT_FORMAT:-table}"
+
+echo "=============================================="
+echo "       CARDINALITY REPORT"
+echo "=============================================="
+echo "Generated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo "Prometheus: $PROMETHEUS_URL"
+echo ""
+
+# Total unique metric names
+echo "Fetching unique metric names..."
+METRIC_NAMES=$(curl -s "$PROMETHEUS_URL/api/v1/label/__name__/values" | jq -r '.data | length')
+echo "Total unique metric names: $METRIC_NAMES"
+echo ""
+
+# Top 20 metrics by series count
+echo "Calculating series count per metric..."
+echo "| Rank | Metric Name | Series Count |"
+echo "|------|-------------|--------------|"
+
+curl -s "$PROMETHEUS_URL/api/v1/query" \
+  --data-urlencode 'query=topk(20, count by(__name__)(up))' | \
+  jq -r '.data.result[] | "\(.metric.__name__) \(.value[1])"' | \
+  sort -t' ' -k2 -rn | \
+  head -20 | \
+  awk '{rank++; printf "| %d | %-25s | %s |\n", rank, $1, $2}'
+
+echo ""
+
+# Find highest cardinality metric
+echo "Identifying highest cardinality metric..."
+HIGHEST_METRIC=$(curl -s "$PROMETHEUS_URL/api/v1/query" \
+  --data-urlencode 'query=topk(1, count by(__name__)(up))' | \
+  jq -r '.data.result[0].metric.__name__')
+
+echo "Highest cardinality metric: $HIGHEST_METRIC"
+echo ""
+
+# Get all labels for highest cardinality metric
+echo "Analyzing label cardinality for $HIGHEST_METRIC..."
+LABELS=$(curl -s "$PROMETHEUS_URL/api/v1/labels" | jq -r '.data[]')
+
+echo "| Label | Unique Values |"
+echo "|-------|---------------|"
+
+for label in $LABELS; do
+  COUNT=$(curl -s "$PROMETHEUS_URL/api/v1/label/$label/values" | jq -r '.data | length')
+  if [ "$COUNT" -gt 100 ]; then
+    printf "| %-20s | %d |\n" "$label" "$COUNT"
+  fi
+done | sort -t'|' -k3 -rn | head -10
+
+echo ""
+echo "=============================================="
+echo "RECOMMENDATIONS:"
+echo "=============================================="
+echo "1. Review metrics with >100K series for label optimization"
+echo "2. Consider dropping high-cardinality labels via relabeling"
+echo "3. Implement recording rules for expensive queries"
+echo "=============================================="
+```
+
+---
+
+## Part C: Redesigned Architecture
+
+**Architecture Diagram:**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    200 Engineering Teams                        │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    API Gateway Layer                            │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐     │
+│  │   Mimir     │  │   Loki      │  │      Tempo          │     │
+│  │  (Metrics)  │  │  (Logs)     │  │     (Traces)        │     │
+│  └──────┬──────┘  └──────┬──────┘  └──────────┬──────────┘     │
+│         │                │                     │               │
+│  ┌──────▼──────┐  ┌──────▼──────┐  ┌──────────▼──────────┐    │
+│  │  Ingest     │  │  Ingest     │  │     Ingest          │    │
+│  │  Nodes      │  │  Nodes      │  │     Nodes           │    │
+│  └──────┬──────┘  └──────┬──────┘  └──────────┬──────────┘    │
+│         │                │                     │               │
+│  ┌──────▼──────┐  ┌──────▼──────┐  ┌──────────▼──────────┐    │
+│  │  Query      │  │  Query      │  │     Query           │    │
+│  │  Frontend   │  │  Frontend   │  │     Frontend        │    │
+│  └─────────────┘  └─────────────┘  └─────────────────────┘     │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Long-term Storage (S3)                      │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐     │
+│  │ Metrics     │  │    Logs     │  │      Traces         │     │
+│  │ (Parquet)   │  │  (Owl)      │  │    (OTLP)           │     │
+│  └─────────────┘  └─────────────┘  └─────────────────────┘     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Mimir Configuration:**
+
+```yaml
+# mimir.yaml
+distributor:
+  ring:
+    kvstore:
+      store: memberlist
+  max_line_size: 2048
+  max_label_name_length: 1024
+  max_label_value_length: 2048
+  max_label_names_per_series: 30
+
+ingester:
+  max_inflight_bytes: 1073741824
+  chunk_encoding: snappy
+
+compactor:
+  working_directory: /var/lib/mimir/compactor
+  compaction_interval: 10m
+  retention_enabled: true
+  retention_delete_delay: 2h
+  retention_period: 90d
+
+querier:
+  max_concurrent: 100
+```
+
+**Loki Microservices Mode:**
+
+```yaml
+# loki-config.yaml
+auth_enabled: false
+
+schema_config:
+  configs:
+    - from: 2023-01-01
+      store: tsdb
+      object_store: s3
+      schema: v13
+      index:
+        prefix: loki_index_
+        period: 24h
+
+ingester_wal:
+  enabled: true
+
+limits_config:
+  allow_structured_metadata: true
+  max_label_name_length: 1024
+  max_label_value_length: 2048
+  max_label_names_per_series: 30
+  cardinality_limit: 100000
+  cardinality_limit_burst: 200000
+
+ruler_alertmanager_url: http://alertmanager:9093
+```
+
+**Governance Model:**
+
+```yaml
+# Recording rules for cardinality enforcement
+groups:
+  - name: cardinality-governance
+    rules:
+      # Team-level cardinality tracking
+      - record: team:metric_series_count:sum
+        expr: sum by(team) (count by(team, __name__) (up))
+      
+      # Alert on high cardinality
+      - alert: HighCardinalityMetric
+        expr: count by(__name__) (up) > 100000
+        annotations:
+          summary: "High cardinality metric detected: {{ $labels.__name__ }}"
+          description: "Metric has {{ $value }} series. Limit is 100000."
+```
+
+**Chargeback Implementation:**
+
+```python
+# chargeback_calculator.py
+from dataclasses import dataclass
+from typing import Dict, List
+
+@dataclass
+class TeamUsage:
+    team: str
+    metrics_bytes: float
+    log_bytes: float
+    trace_bytes: float
+    query_count: int
+
+def calculate_chargeback(usage: List[TeamUsage], rates: Dict[str, float]) -> Dict[str, float]:
+    """Calculate per-team charges based on telemetry consumption."""
+    charges = {}
+    for team in usage:
+        charges[team.team] = (
+            team.metrics_bytes * rates['metrics_gb'] +
+            team.log_bytes * rates['logs_gb'] +
+            team.trace_bytes * rates['traces_gb'] +
+            team.query_count * rates['query']
+        )
+    return charges
+
+# Rates per GB/month
+RATES = {
+    'metrics_gb': 0.50,
+    'logs_gb': 0.25,
+    'traces_gb': 0.75,
+    'query': 0.001
+}
+```
+
+---
+
+# SC9 — Securing a Public-Facing API After a Breach
+
+## Part A: Vulnerability Analysis
+
+**1. BOLA (Broken Object Level Authorization)**
+- **OWASP Category**: API1:2023 Broken Object Level Authorization
+- **Blast radius**: Complete data breach — attacker accesses all user records
+- **Fix**: Object-level permissions in DRF
+
+```python
+# permissions.py
+from rest_framework import permissions
+
+class IsObjectOwner(permissions.BasePermission):
+    """Only allow access to objects owned by the requesting user."""
+    
+    def has_object_permission(self, request, view, obj):
+        return obj.owner == request.user
+
+# views.py
+from rest_framework.generics import RetrieveUpdateDestroyAPIView
+
+class UserRecordView(RetrieveUpdateDestroyAPIView):
+    queryset = UserRecord.objects.all()
+    serializer_class = UserRecordSerializer
+    permission_classes = [IsAuthenticated, IsObjectOwner]
+    
+    def get_object(self):
+        # Enforce ownership at object retrieval level
+        obj = super().get_object()
+        if obj.owner != self.request.user:
+            raise PermissionDenied("Access denied")
+        return obj
+```
+
+**2. Sensitive Data Exposure**
+- **OWASP Category**: API2:2023 Broken Authentication / API6:2023 Missing Object Level Authorization
+- **Blast radius**: Internal system details exposed, employee IDs leaked
+- **Fix**: Field-level serialization control
+
+```python
+# serializers.py
+from rest_framework import serializers
+
+class UserRecordSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = UserRecord
+        fields = ['id', 'username', 'email', 'created_at']
+        # Explicitly exclude sensitive fields
+        exclude = ['created_by_employee_id', 'internal_notes', 'password_hash']
+```
+
+**3. No Rate Limiting**
+- **OWASP Category**: API4:2023 Unrestricted Resource Consumption
+- **Blast radius**: Complete database extraction, DoS, resource exhaustion
+- **Fix**: DRF Throttling
+
+```python
+# settings.py
+REST_FRAMEWORK = {
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '100/hour',
+        'user': '1000/hour',
+        'burst': '100/minute',
+    },
+}
+
+# throttling.py
+from rest_framework.throttling import SimpleRateThrottle
+
+class BurstThrottle(SimpleRateThrottle):
+    scope = 'burst'
+    
+    def get_cache_key(self, request, view):
+        if request.user and request.user.is_authenticated:
+            return f'{self.scope}:{request.user.username}'
+        return f'{self.scope}:{self.get_ident(request)}'
+```
+
+**4. API Keys in Query Parameters**
+- **OWASP Category**: API7:2023 Server-Side Request Forgery (indirectly)
+- **Blast radius**: API keys logged everywhere, easily scraped, no rotation possible
+- **Fix**: Header-based authentication
+
+```python
+# authentication.py
+from rest_framework.authentication import BaseAuthentication
+from django.core.exceptions import PermissionDenied
+
+class APIKeyHeaderAuthentication(BaseAuthentication):
+    """API key must be in Authorization header, never query params."""
+    
+    def authenticate(self, request):
+        # Reject query parameter API keys
+        if 'api_key' in request.query_params:
+            raise PermissionDenied("API keys must be in Authorization header")
+        
+        auth_header = request.META.get('HTTP_AUTHORIZATION', '')
+        if not auth_header.startswith('API-Key '):
+            return None
+        
+        api_key = auth_header[8:]  # Remove 'API-Key ' prefix
+        api_key_obj = APIKey.objects.filter(key=api_key, active=True).first()
+        
+        if not api_key_obj:
+            return None
+        
+        return (api_key_obj.user, api_key_obj)
+```
+
+---
+
+## Part B: OpenTofu WAF Configuration
+
+```hcl
+# main.tf
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+variable "alb_arn" {
+  description = "ARN of the Application Load Balancer"
+  type        = string
+}
+
+variable "allowed_countries" {
+  description = "List of ISO 3166-1 alpha-2 country codes"
+  type        = list(string)
+  default     = ["US", "CA", "GB", "DE", "FR"]
+}
+
+variable "api_endpoint" {
+  description = "API endpoint path pattern"
+  type        = string
+  default     = "/api/*"
+}
+
+# WAF Web ACL
+resource "aws_wafv2_web_acl" "api_protection" {
+  name        = "api-protection-acl"
+  description = "WAF rules for public API protection"
+  scope       = "REGIONAL"
+
+  default_action {
+    allow {}
+  }
+
+  # Rate limiting rule
+  rule {
+    name     = "rate-limit-by-ip"
+    priority = 1
+
+    action {
+      block {}
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name              = "RateLimitByIP"
+      sampled_requests_enabled = true
+    }
+
+    rate_based_statement {
+      limit              = 100
+      aggregate_key_type = "IP"
+    }
+  }
+
+  # Block API key in query string
+  rule {
+    name
