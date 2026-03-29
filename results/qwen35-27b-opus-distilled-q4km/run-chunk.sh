@@ -28,33 +28,30 @@ RESPONSE=$(curl -s --max-time 3600 "$API_URL" \
 END=$(date +%s)
 echo "Chunk completed in $((END - START))s" >&2
 
-# Extract with Python — handles control chars, prefers content over reasoning_content
-python3 -c "
+# Extract with Python via stdin — handles control chars and large responses
+echo "$RESPONSE" | python3 -c "
 import json, sys, re
-raw = sys.argv[1]
-# Clean control chars for JSON parsing
+raw = sys.stdin.read()
 cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', raw)
 try:
     d = json.loads(cleaned)
     msg = d['choices'][0]['message']
     content = msg.get('content', '') or ''
     reasoning = msg.get('reasoning_content', '') or ''
-    # Use content if it has real answers, otherwise reasoning
     best = content if len(content) > 200 else reasoning
     if len(best) < 100:
         print('ERROR: No meaningful content', file=sys.stderr)
         sys.exit(1)
     print(best)
 except Exception as e:
-    # Try regex extraction as fallback
     for field in ['content', 'reasoning_content']:
         m = re.search(r'\"' + field + r'\":\"(.*?)(?:\",\"|\"})', raw, re.DOTALL)
         if m and len(m.group(1)) > 200:
-            text = m.group(1).replace('\\n', '\n').replace('\\t', '\t').replace('\\\"', '\"')
+            text = m.group(1).replace('\\\\n', '\n').replace('\\\\t', '\t').replace('\\\\\"', '\"')
             print(text)
             sys.exit(0)
     print(f'ERROR: Parse failed: {e}', file=sys.stderr)
     sys.exit(1)
-" "$RESPONSE" > "$OUTPUT_FILE"
+" > "$OUTPUT_FILE"
 
 echo "Response saved to $OUTPUT_FILE ($(wc -l < "$OUTPUT_FILE") lines)" >&2

@@ -28,9 +28,9 @@ RESPONSE=$(curl -s --max-time 1800 "$API_URL" \
 END=$(date +%s)
 echo "Chunk completed in $((END - START))s" >&2
 
-python3 -c "
+echo "$RESPONSE" | python3 -c "
 import json, sys, re
-raw = sys.argv[1]
+raw = sys.stdin.read()
 cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', raw)
 try:
     d = json.loads(cleaned)
@@ -51,6 +51,6 @@ except Exception as e:
             sys.exit(0)
     print(f'ERROR: Parse failed: {e}', file=sys.stderr)
     sys.exit(1)
-" "$RESPONSE" > "$OUTPUT_FILE"
+" > "$OUTPUT_FILE"
 
 echo "Response saved to $OUTPUT_FILE ($(wc -l < "$OUTPUT_FILE") lines)" >&2
