@@ -172,7 +172,7 @@ def run_task(task: dict, model_url: str, model_name: str, api_key: str,
 
     # Setup
     if not run_setup(task):
-        return {"task_id": task_id, "status": "setup_failed", "score": 0}
+        return {"task_id": task_id, "title": task.get("title", ""), "tier": task.get("tier", 0), "status": "setup_failed", "verified": False, "steps": 0, "elapsed_seconds": 0, "loops_detected": 0, "score": {"completion": 0, "efficiency": 0, "recovery": 0, "quality": 0, "total": 0, "max": 10}, "steps_log": []}
 
     # Build initial messages
     messages = [
@@ -339,12 +339,12 @@ def main():
     if args.task:
         tasks.append(load_task(args.task))
     elif args.tier:
-        for f in sorted(TASKS_DIR.glob("AG*.yaml")):
+        for f in sorted(TASKS_DIR.glob("AG*.yaml"), key=lambda p: int(p.stem[2:])):
             t = yaml.safe_load(f.read_text())
             if t.get("tier") == args.tier:
                 tasks.append(t)
     elif args.all:
-        for f in sorted(TASKS_DIR.glob("AG*.yaml")):
+        for f in sorted(TASKS_DIR.glob("AG*.yaml"), key=lambda p: int(p.stem[2:])):
             tasks.append(yaml.safe_load(f.read_text()))
     else:
         parser.error("Specify --task, --tier, or --all")

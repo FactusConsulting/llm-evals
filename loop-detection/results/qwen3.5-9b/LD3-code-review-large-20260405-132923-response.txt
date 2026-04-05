@@ -1,0 +1,268 @@
+Thinking Process:
+
+1.  **Analyze the Request:**
+    *   **Task:** Code review of a Go package (`cache/cache.go` and `cache/cache_test.go`).
+    *   **Scenario:** LD3 — Large Code Review (Open-ended, High Difficulty).
+    *   **Role:** Expert systems engineer and software developer acting as an agentic worker.
+    *   **Constraints:**
+        *   State approval status (approve, request changes, block).
+        *   List concrete issues (bugs, security, correctness) with specific file and line references.
+        *   List at most 3 nits/style issues.
+        *   Stop after the review (no summaries, no repetitions).
+        *   Do not add explanatory sections after the task.
+        *   Do not repeat conclusions already stated.
+
+2.  **Analyze the Code (`cache/cache.go`):**
+    *   **`New` function:** Starts a goroutine `go c.evict()` immediately. This is a potential resource leak if the caller doesn't stop the cache. The `Cache` struct doesn't have a `Stop` or `Close` method.
+    *   **`Set` function:** Locks, sets entry with expiration, unlocks. Looks okay logically, but `interface{}` is used.
+    *   **`Get` function:** Locks, checks existence and expiration, unlocks. Returns `interface{}, bool`.
+    *   **`Delete` function:** Locks, deletes, unlocks.
+    *   **`evict` function:** Infinite loop. Sleeps 1 minute. Locks, iterates map, deletes expired entries, unlocks.
+        *   **Critical Issue:** `delete` inside a range loop over a map in Go is unsafe. `for k, e := range c.entries` followed by `delete(c.entries, k)` causes a panic.
+        *   **Critical Issue:** The `evict` goroutine runs forever. There is no way to stop it. If the application shuts down, the goroutine leaks.
+        *   **Critical Issue:** `time.Sleep(time.Minute)` is a long interval for a cache. Usually, caches want to evict sooner or use a ticker.
+        *   **Critical Issue:** `c.mu.Lock()` inside the loop. While it's locked during the iteration, the map iteration is safe, but the `delete` inside the range loop is the main panic risk.
+    *   **`cache_test.go`:**
+        *   `TestSetGet`: Tests basic functionality.
+        *   `TestDelete`: Tests deletion.
+        *   **Missing Tests:** No test for the `evict` goroutine (does it actually run? does it panic?). No test for concurrent access (race conditions). No test for `Stop`/`Close`.
+
+3.  **Drafting the Review:**
+
+    *   **Decision:** Block. The panic in `evict` is a critical runtime error. The lack of shutdown mechanism is a critical resource leak.
+    *   **Concrete Issues:**
+        1.  `cache/cache.go`, line 53 (inside `evict`): `delete` inside `range` loop causes panic.
+        2.  `cache/cache.go`, line 23 (`New`): Goroutine leak. No way to stop `evict`.
+        3.  `cache/cache.go`, line 53 (`evict`): Race condition potential if `Set`/`Get` happens while `evict` is iterating (though mutex protects, the logic is flawed). Actually, the mutex protects the map, so concurrent access is safe *if* the map isn't being modified while iterating. Wait, `delete` inside range is the specific panic. But modifying the map while iterating it (even with a lock) is generally bad practice in Go if the map is being modified concurrently. Here, `evict` holds the lock, so it's safe from concurrent `Set`/`Get` *during* the eviction, but the `delete` in range is the hard error.
+        4.  `cache/cache.go`, line 53: `delete` in range loop.
+        5.  `cache/cache.go`, line 23: Goroutine leak.
+    *   **Nits/Style:**
+        1.  `interface{}` usage (type assertion needed by callers).
+        2.  Magic number `time.Minute`.
+        3.  Missing `Close` method.
+
+    *   **Refining Constraints:**
+        *   "List concrete issues (bugs, security, correctness). Be specific: file name and line."
+        *   "List at most 3 nits/style issues."
+        *   "Stop after your review."
+
+    *   **Line Number Verification:**
+        *   `cache/cache.go`:
+            *   `evict` starts at line 49 (approx).
+            *   `for k, e := range c.entries` is around line 53.
+            *   `delete(c.entries, k)` is around line 55.
+            *   `New` starts at line 19. `go c.evict()` is line 23.
+        *   Let's count lines precisely based on the provided text.
+            1. `// cache/cache.go`
+            2. `package cache`
+            3. `import (`
+            4. `    "context"`
+            5. `    "sync"`
+            6. `    "time"`
+            7. `)`
+            8. ``
+            9. `type entry struct {`
+            10. `    value     interface{}`
+            11. `    expiresAt time.Time`
+            12. `}`
+            13. ``
+            14. `type Cache struct {`
+            15. `    mu      sync.Mutex`
+            16. `    entries map[string]entry`
+            17. `    ttl     time.Duration`
+            18. `}`
+            19. ``
+            20. `func New(ttl time.Duration) *Cache {`
+            21. `    c := &Cache{`
+            22. `        entries: make(map[string]entry),`
+            23. `        ttl:     ttl,`
+            24. `    }`
+            25. `    go c.evict()`
+            26. `    return c`
+            27. `}`
+            ...
+            49. `func (c *Cache) evict() {`
+            50. `    for {`
+            51. `        time.Sleep(time.Minute)`
+            52. `        now := time.Now()`
+            53. `        c.mu.Lock()`
+            54. `        for k, e := range c.entries {`
+            55. `            if now.After(e.expiresAt) {`
+            56. `                delete(c.entries, k)`
+            57. `            }`
+            58. `        }`
+            59. `        c.mu.Unlock()`
+            60. `    }`
+            61. `}`
+
+        *   Line 56 is the `delete` inside range.
+        *   Line 25 is the goroutine start.
+
+    *   **Nits:**
+        1.  `interface{}` is not type-safe.
+        2.  `time.Minute` is a magic number.
+        3.  Missing `Close` method.
+
+    *   **Wait, constraint check:** "List at most 3 nits/style issues."
+    *   **Constraint check:** "Stop after your review. Do not re-summarize, do not repeat concerns already listed."
+
+    *   **Decision:** Block.
+
+    *   **Formatting:**
+        *   Approval status.
+        *   Concrete issues (File:Line).
+        *   Nits (max 3).
+
+4.  **Final Polish:**
+    *   Ensure no extra text.
+    *   Ensure specific line numbers match the provided snippet.
+    *   Ensure no repetition.
+
+    *   *Self-Correction on Line Numbers:* I need to be careful with line numbers. I will count them manually from the provided block.
+    *   Block 1 (`cache/cache.go`):
+        1. `// cache/cache.go`
+        2. `package cache`
+        3. `import (`
+        4. `    "context"`
+        5. `    "sync"`
+        6. `    "time"`
+        7. `)`
+        8. ``
+        9. `type entry struct {`
+        10. `    value     interface{}`
+        11. `    expiresAt time.Time`
+        12. `}`
+        13. ``
+        14. `type Cache struct {`
+        15. `    mu      sync.Mutex`
+        16. `    entries map[string]entry`
+        17. `    ttl     time.Duration`
+        18. `}`
+        19. ``
+        20. `func New(ttl time.Duration) *Cache {`
+        21. `    c := &Cache{`
+        22. `        entries: make(map[string]entry),`
+        23. `        ttl:     ttl,`
+        24. `    }`
+        25. `    go c.evict()`
+        26. `    return c`
+        27. `}`
+        28. ``
+        29. `func (c *Cache) Set(key string, val interface{}) {`
+        30. `    c.mu.Lock()`
+        31. `    c.entries[key] = entry{value: val, expiresAt: time.Now().Add(c.ttl)}`
+        32. `    c.mu.Unlock()`
+        33. `}`
+        34. ``
+        35. `func (c *Cache) Get(key string) (interface{}, bool) {`
+        36. `    c.mu.Lock()`
+        37. `    e, ok := c.entries[key]`
+        38. `    c.mu.Unlock()`
+        39. `    if !ok || time.Now().After(e.expiresAt) {`
+        40. `        return nil, false`
+        41. `    }`
+        42. `    return e.value, true`
+        43. `}`
+        44. ``
+        45. `func (c *Cache) Delete(key string) {`
+        46. `    c.mu.Lock()`
+        47. `    delete(c.entries, key)`
+        48. `    c.mu.Unlock()`
+        49. `}`
+        50. ``
+        51. `func (c *Cache) evict() {`
+        52. `    for {`
+        53. `        time.Sleep(time.Minute)`
+        54. `        now := time.Now()`
+        55. `        c.mu.Lock()`
+        56. `        for k, e := range c.entries {`
+        57. `            if now.After(e.expiresAt) {`
+        58. `                delete(c.entries, k)`
+        59. `            }`
+        60. `        }`
+        61. `        c.mu.Unlock()`
+        62. `    }`
+        63. `}`
+
+    *   Okay, Line 58 is the `delete` inside range. Line 25 is `go c.evict()`.
+    *   Wait, the prompt text might have slightly different line breaks. I should refer to the logical lines or approximate lines based on the provided text block. I will use the line numbers from the provided text block as if it were a single file.
+    *   Actually, I should just refer to the function names and approximate lines or count carefully. The prompt asks for "file name and line". I will count based on the provided text block.
+    *   Let's recount carefully.
+    *   `// cache/cache.go` (Line 1)
+    *   `package cache` (Line 2)
+    *   `import (` (Line 3)
+    *   `    "context"` (Line 4)
+    *   `    "sync"` (Line 5)
+    *   `    "time"` (Line 6)
+    *   `)` (Line 7)
+    *   (Empty Line 8)
+    *   `type entry struct {` (Line 9)
+    *   `    value     interface{}` (Line 10)
+    *   `    expiresAt time.Time` (Line 11)
+    *   `}` (Line 12)
+    *   (Empty Line 13)
+    *   `type Cache struct {` (Line 14)
+    *   `    mu      sync.Mutex` (Line 15)
+    *   `    entries map[string]entry` (Line 16)
+    *   `    ttl     time.Duration` (Line 17)
+    *   `}` (Line 18)
+    *   (Empty Line 19)
+    *   `func New(ttl time.Duration) *Cache {` (Line 20)
+    *   `    c := &Cache{` (Line 21)
+    *   `        entries: make(map[string]entry),` (Line 22)
+    *   `        ttl:     ttl,` (Line 23)
+    *   `    }` (Line 24)
+    *   `    go c.evict()` (Line 25)
+    *   `    return c` (Line 26)
+    *   `}` (Line 27)
+    *   (Empty Line 28)
+    *   `func (c *Cache) Set(key string, val interface{}) {` (Line 29)
+    *   `    c.mu.Lock()` (Line 30)
+    *   `    c.entries[key] = entry{value: val, expiresAt: time.Now().Add(c.ttl)}` (Line 31)
+    *   `    c.mu.Unlock()` (Line 32)
+    *   `}` (Line 33)
+    *   (Empty Line 34)
+    *   `func (c *Cache) Get(key string) (interface{}, bool) {` (Line 35)
+    *   `    c.mu.Lock()` (Line 36)
+    *   `    e, ok := c.entries[key]` (Line 37)
+    *   `    c.mu.Unlock()` (Line 38)
+    *   `    if !ok || time.Now().After(e.expiresAt) {` (Line 39)
+    *   `        return nil, false` (Line 40)
+    *   `    }` (Line 41)
+    *   `    return e.value, true` (Line 42)
+    *   `}` (Line 43)
+    *   (Empty Line 44)
+    *   `func (c *Cache) Delete(key string) {` (Line 45)
+    *   `    c.mu.Lock()` (Line 46)
+    *   `    delete(c.entries, key)` (Line 47)
+    *   `    c.mu.Unlock()` (Line 48)
+    *   `}` (Line 49)
+    *   (Empty Line 50)
+    *   `func (c *Cache) evict() {` (Line 51)
+    *   `    for {` (Line 52)
+    *   `        time.Sleep(time.Minute)` (Line 53)
+    *   `        now := time.Now()` (Line 54)
+    *   `        c.mu.Lock()` (Line 55)
+    *   `        for k, e := range c.entries {` (Line 56)
+    *   `            if now.After(e.expiresAt) {` (Line 57)
+    *   `                delete(c.entries, k)` (Line 58)
+    *   `            }` (Line 59)
+    *   `        }` (Line 60)
+    *   `        c.mu.Unlock()` (Line 61)
+    *   `    }` (Line 62)
+    *   `}` (Line 63)
+
+    *   Okay, I will use these line numbers.
+    *   Issue 1: `cache/cache.go:58` - Panic in range loop.
+    *   Issue 2: `cache/cache.go:25` - Goroutine leak.
+    *   Issue 3: `cache/cache.go:58` - Actually, the panic is the main one. I can combine or list separately. I need to list concrete issues.
+    *   Issue 3: `cache/cache.go:51-63` - No stop mechanism for `evict`. (Maybe combine with Issue 2).
+    *   Let's prioritize:
+        1.  Panic in `evict` (Line 58).
+        2.  Goroutine leak (Line 25).
+        3.  Missing `Close` method (Line 27 - implied).
+    *   Wait, I need to list concrete issues.
+    *   1. `cache/cache.go:58`: `delete` inside `range` loop causes panic.
+    *   2. `cache/cache.go:25`: `go c.evict()` starts goroutine with no stop mechanism (resource leak).
+    *   3. `cache/cache.go:51-63`: `evict` loop has no exit condition (liveness issue).
+    *   Actually, 2 and 3 are related. I'll list them as distinct

@@ -1,6 +1,6 @@
 # Model Evaluation Summary
 
-Last updated: 2026-03-29
+Last updated: 2026-04-05
 
 ## Overall Scores
 
@@ -8,11 +8,26 @@ Last updated: 2026-03-29
 |-------|--------|----------|----------|-------|-----|------|-----------|-------|---|-----------|
 | **Qwen3.5-27B Opus Distilled Q4_K_M** | **1×131072** | **q4_0** | **2×5060Ti** | **240/240** | **—** | **—** | **—** | **240/240** | **100%** | **opus** |
 | **Qwen3.5-9B Q8_0** | **2×131072** | **q4_0** | **2×5060Ti** | **228/240** | **268/280** | **159/160** | **53/60** | **708/740** | **95.7%** | **opus** |
+| **Gemma 4 E4B Q6_K_L** | **2×65536** | **q4_0** | **2×5060Ti** | **217.6/240** | **262.4/280** | **158.6/160** | **15/20†** | **653.6/700†** | **93.4%** | **opus** |
 | Qwen3.5-35B-A3B Q5_K_M | 1×262144 | q8_0 | 2×5060Ti | 225.8/240 | 255.4/280 | 153.2/160 | 48.6/60 | 683/740 | 92.3% | opus |
 | Qwen3.5-35B-A3B Q5_K_M | 2×131072 | q8_0 | 2×5060Ti | 227.4/240 | 260.6/280 | 152.6/160 | 48.0/60 | 688.6/740 | 93.1% | opus |
 | Qwen3.5-35B-A3B Q5_K_M | **2×60000** | **q4_0** | **2×5060Ti** | **226/240** | **274/280** | **146/160** | **45/60** | **691/740** | **93.4%** | opus |
 | Qwen3.5-35B-A3B Q5_K_M | 2×262144 | q4_0 | 2×5060Ti | 224/240 | 256/280 | 146/160 | 42/60 | 668/740 | 90.3% | opus |
 | Qwen3.5-35B-A3B Q5_K_M | 3×131072 | q4_0 | 2×5060Ti | 211/240 | 258/280 | 143/160 | 46/60 | 658/740 | 88.9% | opus |
+
+†Gemma 4 uses 350 questions vs 370 for older models (40 fewer scenario sub-questions). Comparable question set only: 638.6/680 = **93.9%**.
+
+## New Models (2026-04-05)
+
+### Gemma 4 E4B Q6_K_L — 653.6/700 (93.4%) — 5-run average
+
+Gemma 4 4B MoE (E4B = 4 active, 27B equivalent params) running on ai-infer1 + ai-infer2 with 2 parallel slots at 65k context each. Vision-capable (mmproj enabled). 0/12 spirals in loop-detection eval.
+
+**Strengths:** Architecture (99.1%, near-perfect — 100% on App Arch/Cloud/OT), Python/.NET (97.5%), Docker/Dev (99.0%)
+**Weaknesses:** Ansible (76.0%) — module argument confusion; Scenarios (75.0%) — complex multi-step troubleshooting
+**Speed:** ~37-40 tok/s on both ai-infer1 and ai-infer2
+**Stability:** Extremely stable — 0 spirals, consistent 5-run scores (649-659, variance ±5)
+**vs Qwen3.5-9B (comparable questions):** 93.9% vs 96.3% — 2.4% gap despite being a 4B parameter model
 
 ## New Models (2026-03-29)
 
