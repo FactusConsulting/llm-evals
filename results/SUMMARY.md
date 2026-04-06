@@ -1,6 +1,6 @@
 # Model Evaluation Summary
 
-Last updated: 2026-04-05
+Last updated: 2026-04-06
 
 ## Overall Scores
 
@@ -16,6 +16,20 @@ Last updated: 2026-04-05
 | Qwen3.5-35B-A3B Q5_K_M | 3×131072 | q4_0 | 2×5060Ti | 211/240 | 258/280 | 143/160 | 46/60 | 658/740 | 88.9% | opus |
 
 †Gemma 4 uses 350 questions vs 370 for older models (40 fewer scenario sub-questions). Comparable question set only: 638.6/680 = **93.9%**.
+
+## New Models (2026-04-06)
+
+### Gemma 4 26B A4B Q4_K_M — scoring pending — 3 runs collected
+
+Gemma 4 26B MoE (A4B = 4 active params per token) running on ai-infer2, 4 slots × 262k context. Same inference cost per token as the E4B. Knowledge eval runs collected 2026-04-05.
+
+**Known issue — chunk9 (Scenarios) always fails:** On long single-turn inputs, the 26B model injects `<|channel>thought_thought<channel|>` thinking tokens mid-response. llama.cpp returns HTTP 500. Chunks 1-8 complete successfully in all 3 runs (24/27 chunks usable). Does not affect conversational use (opencode sessions work perfectly).
+
+**Loop detection (3 runs, 2026-04-05):** 5/12 scenarios spiraled in at least one run (LD3, LD4, LD7, LD9, LD12). Run 1 had 0 spirals; runs 2-3 averaged 4-5 spirals. Spirals concentrated in open-ended/ambiguous-stopping scenarios. Significantly worse than gemma4-4b (0/12 spirals) — use 4B as primary for agentic tasks, 26B as fallback only.
+
+**Scoring:** Pending Claude Opus judge run on chunks 1-8. Run: `ANTHROPIC_API_KEY=<key> python3 judge-knowledge.py --model-dir results/gemma4-26b --runs 1 2 3 --chunks 1 2 3 4 5 6 7 8`
+
+---
 
 ## New Models (2026-04-05)
 
