@@ -1,0 +1,281 @@
+*   Package: `cache`
+    *   Functionality: A simple in-memory cache with TTL and a background eviction process.
+    *   `New(ttl)`: Initializes the cache and starts a background goroutine `evict()`.
+    *   `Set(key, val)`: Adds/updates an entry with an expiration time.
+    *   `Get(key)`: Retrieves an entry if it exists and hasn't expired.
+    *   `Delete(key)`: Removes an entry.
+    *   `evict()`: A loop that sleeps for 1 minute and then iterates through all entries to delete expired ones.
+
+    *   *Issue 1: Resource Leak (Goroutine Leak).*
+        *   `New` starts `go c.evict()`.
+        *   There is no way to stop this goroutine. If `Cache` objects are created and discarded, the `evict` goroutine will run forever, leaking memory and CPU cycles.
+        *   *Fix:* Add a `Close()` method that uses a context or a stop channel to terminate the `evict` loop.
+
+    *   *Issue 2: Race Condition / Correctness (Get).*
+        *   In `Get(key)` (lines 40-46):
+            ```go
+            c.mu.Lock()
+            e, ok := c.entries[key]
+            c.mu.Unlock()
+            if !ok || time.Now().After(e.expiresAt) {
+                return nil, false
+            }
+            return e.value, true
+            ```
+        *   The check `time.Now().After(e.expiresAt)` happens *after* the mutex is released. While `e` is a copy of the `entry` struct (so the values are safe), the logic is slightly inefficient because it doesn't clean up the expired entry immediately upon a failed `Get`. However, the bigger issue is that if the entry is expired, it's still in the map until the next `evict` cycle or a `Delete` call.
+        *   Wait, actually, the `Get` logic is technically "correct" in terms of returning the right value, but it's a "lazy" check.
+        *   *Wait, look closer at `evict()`.*
+        *   `evict()` (lines 57-69):
+            ```go
+            func (c *Cache) evict() {
+                for {
+                    time.Sleep(time.Minute)
+                    now := time.Now()
+                    c.mu.Lock()
+                    for k, e := range c.entries {
+                        if now.After(e.expiresAt) {
+                            delete(c.entries, k)
+                        }
+                    }
+                    c.mu.Unlock()
+                }
+            }
+            ```
+        *   The `evict` loop holds the lock for the *entire duration* of the map iteration. If the map is very large, this will block all `Set`, `Get`, and `Delete` operations for a significant amount of time. This is a major performance/correctness issue for a high-concurrency system.
+
+    *   *Issue 3: Concurrency/Correctness (Get).*
+        *   In `Get`, if `ok` is true but the item is expired, it returns `nil, false`. This is fine.
+        *   However, there is a subtle race: if `Set` is called with the same key while `evict` is running, `evict` might delete the newly set value if the timing is extremely tight (though `now` is captured before the lock, so it's mostly okay).
+
+    *   *Issue 4: Security/Correctness (Interface{}).*
+        *   Using `interface{}` is standard for generic caches in older Go, but it lacks type safety. Not a "bug" per se, but worth noting.
+
+    *   *Issue 5: Testing.*
+        *   The tests don't check for the goroutine leak.
+
+    *   *Summary of Critical Issues:*
+        1.  **Goroutine Leak**: `evict()` runs forever with no mechanism to stop it.
+        2.  **Lock Contention/Performance**: `evict()` holds the lock for the entire duration of the map scan. In a large cache, this causes massive latency spikes.
+
+    *   *Nits:*
+        1.  `time.Now()` is called multiple times; could be passed in or optimized.
+        2.  `evict` uses a hardcoded `time.Minute`.
+        3.  `Get` doesn't proactively delete expired keys (lazy deletion).
+
+    *   *Refining the "Request Changes" decision:*
+        The goroutine leak is a definite "Block" or "Request Changes" level issue. The lock contention in `evict` is also a major architectural flaw for a "cache" library.
+
+    *   *Check `Get` again:*
+        ```go
+        c.mu.Lock()
+        e, ok := c.entries[key]
+        c.mu.Unlock()
+        if !ok || time.Now().After(e.expiresAt) {
+            return nil, false
+        }
+        ```
+        If `ok` is true, `e` is a copy of the `entry` struct. This is safe.
+
+    *   *Check `evict` again:*
+        ```go
+        c.mu.Lock()
+        for k, e := range c.entries {
+            if now.After(e.expiresAt) {
+                delete(c.entries, k)
+            }
+        }
+        c.mu.Unlock()
+        ```
+        Yes, the lock is held for the whole loop.
+
+    *   *Decision:* **Request Changes**.
+
+    *   *Issues:*
+        1.  `cache/cache.go:25`: Goroutine leak. The `evict` goroutine has no way to be stopped, meaning `Cache` instances cannot be garbage collected properly if the background loop is still running.
+        2.  `cache/cache.go:57`: Performance/Blocking. The `evict` method holds the `sync.Mutex` for the entire duration of the map iteration. For large caches, this will block all `Get`, `Set`, and `Delete` operations, causing significant latency spikes.
+        3.  `cache/cache.go:40`: Correctness/Efficiency. `Get` identifies expired entries but does not remove them from the map, relying solely on the background `evict` loop which only runs once per minute.
+
+    *   *Nits:*
+        1.  `cache/cache.go:58`: The eviction interval is hardcoded to `time.Minute`. Consider making this configurable.
+        2.  `cache/cache.go:40`: Use `time.Since(e.expiresAt) > 0` or similar for cleaner readability. (Actually, `time.Now().After` is fine). Let's suggest making the eviction interval a parameter.
+        3.  `cache/cache.go:13`: Use `any` instead of `interface{}` (Go 1.18+).
+
+    *   *Wait, let's re-evaluate the "Correctness" of `Get`.*
+        If `Get` returns `nil, false` for an expired item, it's correct. It's just "lazy". The real issue is the lock contention.
+
+    *   *Let's look for more bugs.*
+        Is there a race in `New`? `go c.evict()` is called before returning. The `entries` map is initialized. This is fine.
+
+    *   *Final List:*
+        1.  **Goroutine Leak**: `evict()` loop in `cache/cache.go:25` cannot be terminated.
+        2.  **Lock Contention**: `evict()` in `cache/cache.go:57` holds the mutex for the entire duration of the map traversal, blocking all other operations.
+        3.  **Inefficient Eviction**: `evict()` uses a hardcoded `time.Minute` interval, which might not suit all use cases.
+
+    *   *Wait, I need to be specific about file and line.*
+
+    *   *Issue 1:* `cache/cache.go:25` - Goroutine leak. The `evict` goroutine runs indefinitely with no mechanism (like a `Close` method or context) to shut it down, preventing the `Cache` from being fully cleaned up.
+    *   *Issue 2:* `cache/cache.go:57` - High lock contention. The `evict` function holds `c.mu.Lock()` for the entire duration of the map iteration. This will block all `Get`, `Set`, and `Delete` calls for the duration of the scan, which is problematic for large caches.
+
+    *   *Nits:*
+        1.  `cache/cache.go:13`: Use `any` instead of `interface{}` for modern Go style.
+        2.  `cache/cache.go:58`: The eviction interval (`time.Minute`) is hardcoded; consider making it configurable in `New`.
+        3.  `cache/cache.go:40`: `Get` could perform "lazy deletion" of expired keys to reduce the workload of the background `evict` goroutine.
+
+    *   *Wait, I should check if `Get` is actually thread-safe.*
+        `e, ok := c.entries[key]` is inside the lock. `e` is a copy of the struct. `e.value` is an `interface{}`. Accessing `e.value` after `Unlock` is safe because `e` is a local copy.
+
+    *   *Final Review Structure:*
+        - Status: Request Changes
+        - Issues:
+            - [File:Line] Description
+        - Nits:
+            - [File:Line] Description
+
+    *   *Self-Correction on Issue 1:* The line `go c.evict()` is line 25.
+    *   *Self-Correction on Issue 2:* The loop starts at line 57.
+
+    *   *One more check:* Is there a race in `New`?
+        `c := &Cache{...}`
+        `go c.evict()`
+        `return c`
+        The goroutine starts. It will try to lock `c.mu`. Since `c` is returned to the caller, and the caller will eventually call `Set` or `Get`, the memory visibility is handled by the return and the mutex. This is standard.
+
+    *   *Wait, the `evict` loop:*
+        ```go
+        for {
+            time.Sleep(time.Minute)
+            now := time.Now()
+            c.mu.Lock()
+            for k, e := range c.entries {
+                if now.After(e.expiresAt) {
+                    delete(c.entries, k)
+                }
+            }
+            c.mu.Unlock()
+        }
+        ```
+        If `c.entries` is huge, `c.mu.Lock()` is held for a long time. This is definitely the biggest issue.
+
+    *   *Final Polish of the response.*
+
+    *   *Status:* Request Changes
+    *   *Issues:*
+        1. `cache/cache.go:25`: Goroutine leak. The `evict` goroutine is started in `New` but provides no way to stop it (e.g., via a `Close()` method or `context.Context`), meaning the goroutine and the `Cache` object will leak if the cache is no longer needed.
+        2. `cache/cache.go:57`: Severe lock contention. The `evict` method holds the mutex for the entire duration of the map iteration. For a large number of entries, this will block all `Get`, `Set`, and `Delete` operations, causing significant latency spikes.
+    *   *Nits:*
+        1. `cache/cache.go:13`: Use `any` instead of `interface{}` to follow modern Go conventions.
+        2. `cache/cache.go:58`: The eviction interval is hardcoded to `time.Minute`. It would be better to allow this to be configured via `New`.
+        3. `cache/cache.go:40`: `Get` could implement lazy deletion (removing the expired entry from the map when detected) to reduce the frequency/load of the background eviction process.
+
+    *   *Wait, I should check if I missed any security issues.*
+        The use of `interface{}` is not a security vulnerability, just a type safety issue. No obvious injection or buffer overflows (it's Go). No sensitive data handling.
+
+    *   *Check constraints:*
+        - State approve/request changes/block. (Check)
+        - List concrete issues (bugs, security, correctness). (Check)
+        - Be specific: file name and line. (Check)
+        - List at most 3 nits/style issues. (Check)
+        - Stop after review. (Check)
+
+    *   *Refining Issue 1 line number:*
+        `go c.evict()` is line 25.
+    *   *Refining Issue 2 line number:*
+        `c.mu.Lock()` inside `evict` is line 59. The loop starts at 57. I'll point to the loop/lock area.
+
+    *   *Refining Issue 3 (Nit):*
+        `cache/cache.go:40` is the `Get` function.
+
+    *   *Wait, is there a bug in `Get`?*
+        ```go
+        func (c *Cache) Get(key string) (interface{}, bool) {
+            c.mu.Lock()
+            e, ok := c.entries[key]
+            c.mu.Unlock()
+            if !ok || time.Now().After(e.expiresAt) {
+                return nil, false
+            }
+            return e.value, true
+        }
+        ```
+        If `ok` is true, `e` is a copy of the `entry` struct.
+        If `e.expiresAt` is in the past, it returns `nil, false`.
+        This is correct.
+
+    *   *Wait, what if `e.value` is a pointer?*
+        The cache returns the pointer. This is standard for a cache.
+
+    *   *One more look at `evict`:*
+        `now := time.Now()` is outside the lock.
+        `c.mu.Lock()`
+        `for k, e := range c.entries`
+        `if now.After(e.expiresAt)`
+        This is fine. The `now` is a snapshot.
+
+    *   *Final check on the "Request Changes" vs "Block":*
+        A goroutine leak and a massive lock contention issue in a library designed for caching are usually "Block" level issues in a production environment, but "Request Changes" is a safe and professional stance. I will use "Request Changes".
+
+    *   *Wait, I should check if `time.Sleep(time.Minute)` is a problem.*
+        It's not a bug, but it's a design choice.
+
+    *   *Final Issue List:*
+        1. `cache/cache.go:25`: Goroutine leak. The `evict` goroutine has no mechanism to be stopped, preventing the `Cache` from being garbage collected.
+        2. `cache/cache.go:59`: Lock contention. The `evict` function holds the mutex for the entire duration of the map iteration, which will block all other cache operations for large datasets.
+
+    *   *Final Nit List:*
+        1. `cache/cache.go:13`: Use `any` instead of `interface{}`.
+        2. `cache/cache.go:58`: The eviction interval is hardcoded; consider making it configurable.
+        3. `cache/cache.go:40`: `Get` could implement lazy deletion of expired entries.
+
+    *   *Wait, I should check the line numbers one last time.*
+        1: `// cache/cache.go`
+        2: `package cache`
+        3:
+        4: `import (`
+        5: `    "context"`
+        6: `    "sync"`
+        7: `    "time"`
+        8: `)`
+        9:
+        10: `type entry struct {`
+        11: `    value     interface{}`
+        12: `    expiresAt time.Time`
+        13: `}`
+        14:
+        15: `type Cache struct {`
+        16: `    mu      sync.Mutex`
+        17: `    entries map[string]entry`
+        18: `    ttl     time.Duration`
+        19: `}`
+        20:
+        21: `func New(ttl time.Duration) *Cache {`
+        22: `    c := &Cache{`
+        23: `        entries: make(map[string]entry),`
+        24: `        ttl:     ttl,`
+        25: `    }`
+        26: `    go c.evict()`
+        27: `    return c`
+        28: `}`
+        ...
+        25: `    go c.evict()` (Wait, my manual count was off. Let's re-count carefully).
+
+        1: `// cache/cache.go`
+        2: `package cache`
+        3:
+        4: `import (`
+        5: `    "context"`
+        6: `    "sync"`
+        7: `    "time"`
+        8: `)`
+        9:
+        10: `type entry struct {`
+        11: `    value     interface{}`
+        12: `    expiresAt time.Time`
+        13: `}`
+        14:
+        15: `type Cache struct {`
+        16: `    mu      sync.Mutex`
+        17: `    entries map[string]entry`
+        18: `    ttl     time.Duration`
+        19: `}`
+        20:
+
