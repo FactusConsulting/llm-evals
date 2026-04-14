@@ -23,7 +23,7 @@ Last updated: 2026-04-06
 
 Gemma 4 26B MoE (A4B = 4 active params per token) running on ai-infer2, 4 slots × 262k context. Same inference cost per token as the E4B. Knowledge eval runs collected 2026-04-05.
 
-**Known issue — chunk9 (Scenarios) always fails:** On long single-turn inputs, the 26B model injects `<|channel>thought_thought<channel|>` thinking tokens mid-response. llama.cpp returns HTTP 500. Chunks 1-8 complete successfully in all 3 runs (24/27 chunks usable). Does not affect conversational use (opencode sessions work perfectly).
+**Original chunk9 issue (2026-04-05) — superseded:** Chunk9 (Scenarios) was reported as "always fails" with `<|channel>thought_thought<channel|>` mid-response and HTTP 500. **Root cause confirmed 2026-04-14**: this was a **timeout misdiagnosis**, not a parser bug. The llama-server `--timeout` default of 600s combined with eval `max_tokens=24576` cut off long reasoning chains mid-decode, producing the 500s. With `--timeout 1800`, `--n-predict 65536`, and `max_tokens=49152`, chunk9 completes cleanly in ~77s on Q5_K_L 524k turbo4 with thinking enabled. The earlier Q4_K_M runs would also have completed if those bumps had been applied. **Fix is permanent in `homelab/ansible/inventory/host_vars/ai-infer2.yml` (`llama_server_timeout: 1800`, `llama_n_predict: 65536`) and `llm-evals/run-chunk-validated.sh` (max_tokens=49152).**
 
 **Loop detection (3 runs, 2026-04-05):** 5/12 scenarios spiraled in at least one run (LD3, LD4, LD7, LD9, LD12). Run 1 had 0 spirals; runs 2-3 averaged 4-5 spirals. Spirals concentrated in open-ended/ambiguous-stopping scenarios. Significantly worse than gemma4-4b (0/12 spirals) — use 4B as primary for agentic tasks, 26B as fallback only.
 
