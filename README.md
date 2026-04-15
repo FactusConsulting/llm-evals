@@ -2,6 +2,15 @@
 
 Domain-specific test suites for evaluating LLM model competency in infrastructure, development, and architecture topics.
 
+## 👉 Start here
+
+- **[TESTING.md](TESTING.md)** — short overview of how we test models (the multi-judge approach + commands)
+- **[HOW-TO-DRIVE-EVAL.md](HOW-TO-DRIVE-EVAL.md)** — detailed runbook for an AI agent (or you) to drive a full model evaluation end-to-end
+- **[METHODOLOGY.md](METHODOLOGY.md)** — why we use the multi-judge architecture and what we tried that didn't work
+- **[skills/judge-llm-eval/](skills/judge-llm-eval/)** — the Claude Code skill that orchestrates judging (rubric + reference answers + validators)
+
+**Current baseline**: `gemma4-26b-q6k-458k-turbo4-v2-ai-infer2` at **98.56%** mean over 3 runs (range 0.67pp). See `results/gemma4-26b-q6k-458k-turbo4-v2-ai-infer2/verdict.md`.
+
 ## What's Here
 
 | File | Topics | Questions | Max Score |
