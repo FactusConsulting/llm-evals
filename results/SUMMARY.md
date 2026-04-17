@@ -1,165 +1,141 @@
 # Model Evaluation Summary
 
-Last updated: 2026-04-06
+Last updated: 2026-04-17
 
-## Overall Scores
+## Current Production Models
 
-| Model | Config | KV Cache | Hardware | Infra | Dev | Arch | Scenarios | Total | % | Evaluator |
-|-------|--------|----------|----------|-------|-----|------|-----------|-------|---|-----------|
-| **Qwen3.5-27B Opus Distilled Q4_K_M** | **1×131072** | **q4_0** | **2×5060Ti** | **240/240** | **—** | **—** | **—** | **240/240** | **100%** | **opus** |
-| **Qwen3.5-9B Q8_0** | **2×131072** | **q4_0** | **2×5060Ti** | **228/240** | **268/280** | **159/160** | **53/60** | **708/740** | **95.7%** | **opus** |
-| **Gemma 4 E4B Q6_K_L** | **2×65536** | **q4_0** | **2×5060Ti** | **217.6/240** | **262.4/280** | **158.6/160** | **15/20†** | **653.6/700†** | **93.4%** | **opus** |
-| Qwen3.5-35B-A3B Q5_K_M | 1×262144 | q8_0 | 2×5060Ti | 225.8/240 | 255.4/280 | 153.2/160 | 48.6/60 | 683/740 | 92.3% | opus |
-| Qwen3.5-35B-A3B Q5_K_M | 2×131072 | q8_0 | 2×5060Ti | 227.4/240 | 260.6/280 | 152.6/160 | 48.0/60 | 688.6/740 | 93.1% | opus |
-| Qwen3.5-35B-A3B Q5_K_M | **2×60000** | **q4_0** | **2×5060Ti** | **226/240** | **274/280** | **146/160** | **45/60** | **691/740** | **93.4%** | opus |
-| Qwen3.5-35B-A3B Q5_K_M | 2×262144 | q4_0 | 2×5060Ti | 224/240 | 256/280 | 146/160 | 42/60 | 668/740 | 90.3% | opus |
-| Qwen3.5-35B-A3B Q5_K_M | 3×131072 | q4_0 | 2×5060Ti | 211/240 | 258/280 | 143/160 | 46/60 | 658/740 | 88.9% | opus |
+| Model | Host | Config | Score | % | Eval Method | Slots | Context |
+|-------|------|--------|-------|---|-------------|-------|---------|
+| **Gemma 4 26B A4B Q6_K** | ai-infer1 | turbo4 KV + Q8_0 mmproj | **730/740** | **98.56%** | /judge v2 (3 runs, 2× Opus judges) | 2 | 2×229k |
+| **Gemma 4 E4B BF16 (4B)** | ai-infer2 | turbo4 KV + F32 mmproj | **715/740** | **96.67%** | /judge v2 (3 runs, 2× Opus judges) | 10 | 10×131k |
 
-†Gemma 4 uses 350 questions vs 370 for older models (40 fewer scenario sub-questions). Comparable question set only: 638.6/680 = **93.9%**.
+**Delta**: −1.89pp. The 4B scores 96.67% with 5× the parallelism. Gap is concentrated in chunk 9 Part B (code writing: 55% vs 80%).
 
-## New Models (2026-04-06)
-
-### Gemma 4 26B A4B Q4_K_M — scoring pending — 3 runs collected
-
-Gemma 4 26B MoE (A4B = 4 active params per token) running on ai-infer2, 4 slots × 262k context. Same inference cost per token as the E4B. Knowledge eval runs collected 2026-04-05.
-
-**Original chunk9 issue (2026-04-05) — superseded:** Chunk9 (Scenarios) was reported as "always fails" with `<|channel>thought_thought<channel|>` mid-response and HTTP 500. **Root cause confirmed 2026-04-14**: this was a **timeout misdiagnosis**, not a parser bug. The llama-server `--timeout` default of 600s combined with eval `max_tokens=24576` cut off long reasoning chains mid-decode, producing the 500s. With `--timeout 1800`, `--n-predict 65536`, and `max_tokens=49152`, chunk9 completes cleanly in ~77s on Q5_K_L 524k turbo4 with thinking enabled. The earlier Q4_K_M runs would also have completed if those bumps had been applied. **Fix is permanent in `homelab/ansible/inventory/host_vars/ai-infer2.yml` (`llama_server_timeout: 1800`, `llama_n_predict: 65536`) and `llm-evals/run-chunk-validated.sh` (max_tokens=49152).**
-
-**Loop detection (3 runs, 2026-04-05):** 5/12 scenarios spiraled in at least one run (LD3, LD4, LD7, LD9, LD12). Run 1 had 0 spirals; runs 2-3 averaged 4-5 spirals. Spirals concentrated in open-ended/ambiguous-stopping scenarios. Significantly worse than gemma4-4b (0/12 spirals) — use 4B as primary for agentic tasks, 26B as fallback only.
-
-**Scoring:** Pending Claude Opus judge run on chunks 1-8. Run: `ANTHROPIC_API_KEY=<key> python3 judge-knowledge.py --model-dir results/gemma4-26b --runs 1 2 3 --chunks 1 2 3 4 5 6 7 8`
+**Agent routing**: Prompt-heavy agents (lead-dev, architect, pentester) → 26B. Parallelism-heavy agents (ops-agent, alfred, pm, qa) → 4B. Cross-server fallback.
 
 ---
 
-## New Models (2026-04-05)
+## All Gemma 4 Variants Tested
 
-### Gemma 4 E4B Q6_K_L — 653.6/700 (93.4%) — 5-run average
+| Model | Quant | KV | Context | Slots | Score | % | Eval | Decision |
+|-------|-------|-----|---------|-------|-------|---|------|----------|
+| 26B A4B Q6_K (v2) | Q6_K | turbo4 | 2×229k | 2 | 730/740 | 98.56% | /judge v2 | **Production (ai-infer1)** |
+| E4B BF16 (4B) | BF16 | turbo4 | 10×131k | 10 | 715/740 | 96.67% | /judge v2 | **Production (ai-infer2)** |
+| 26B A4B Q5_K_L | Q5_K_L | turbo4 | 2×262k | 2 | — | — | Part B regression | **Rejected** (−15pp Part B vs Q6_K) |
+| 31B Q4_K_M | Q4_K_M | turbo4 | 1×256k | 1 | 373/385 | 96.97% | ad-hoc Opus | **Rejected** (no improvement over 26B, worse Part B) |
+| 31B Q5_K_M | Q5_K_M | turbo4 | 1×160k | 1 | 374/385 | 97.08% | ad-hoc Opus | **Rejected** (same — model architecture limit) |
+| E4B Q6_K_L (early) | Q6_K_L | q4_0 | 2×65k | 2 | 654/700† | 93.4% | ad-hoc Opus | Superseded by BF16 config |
 
-Gemma 4 4B MoE (E4B = 4 active, 27B equivalent params) running on ai-infer1 + ai-infer2 with 2 parallel slots at 65k context each. Vision-capable (mmproj enabled). 0/12 spirals in loop-detection eval.
+†Early 4B eval used 350 questions (40 fewer scenario sub-questions).
 
-**Strengths:** Architecture (99.1%, near-perfect — 100% on App Arch/Cloud/OT), Python/.NET (97.5%), Docker/Dev (99.0%)
-**Weaknesses:** Ansible (76.0%) — module argument confusion; Scenarios (75.0%) — complex multi-step troubleshooting
-**Speed:** ~37-40 tok/s on both ai-infer1 and ai-infer2
-**Stability:** Extremely stable — 0 spirals, consistent 5-run scores (649-659, variance ±5)
-**vs Qwen3.5-9B (comparable questions):** 93.9% vs 96.3% — 2.4% gap despite being a 4B parameter model
+## Rejected Variants — Why
 
-## New Models (2026-03-29)
+### 26B Q5_K_L (2026-04-14)
+Tested to see if smaller weights (19.8 GB vs 21.6 GB) could buy more context. Result: **Part B (code writing) regressed by 15 percentage points** vs Q6_K. The context gain (524k vs 458k) wasn't worth the quality loss. Q6_K is the right quant for 26B.
 
-### Qwen3.5-9B Q8_0 — 708/740 (95.7%)
+### 31B Q4_K_M + Q5_K_M (2026-04-14)
+Tested to see if 31B's extra parameters improve over 26B. Both quants scored within noise of 26B (96.97-97.08% vs 96.36%). **Part B code writing was WORSE** (65-67% vs 73%) — same broken AWS provider DSL, incomplete Terraform scaffolding, thin Ansible playbooks. This is a model-architecture issue, not quantization. **Do not invest in bigger GPUs for 31B.**
 
-Dense 9B model running on ai-infer2 with 2 parallel slots at 131k context each. Outperforms the 35B-A3B MoE (3B active parameters) by 2.6 percentage points despite being much smaller.
+---
 
-**Strengths:** Architecture + On-Prem (99.4%), Development (95.7%), Infrastructure (95.0%)
-**Weaknesses:** Scenarios (88.3%) — loses points on broken code syntax (SQL, HCL, kubectl)
-**Speed:** ~32-37 tok/s, fast enough for agentic workloads
-**Parallel:** Two agents ran simultaneously with no quality degradation
+## Gemma 4 26B Q6_K v2 — Detailed (Production)
 
-### Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled Q4_K_M — 240/240 (100%) partial
+**Date**: 2026-04-15 | **Host**: ai-infer2 (eval), ai-infer1 (prod sibling)
 
-Claude Opus reasoning-distilled variant running on ai-infer1. Only 3 of 9 chunks produced usable answers (rest had degenerate thinking output). On the chunks that worked, it scored perfect — correcting every error the 9B made.
+| Run | Score | % | Pass | Partial | Fail | alt_acceptable |
+|---|---|---|---|---|---|---|
+| 1 | 726/740 | 98.11% | 357 | 12 | 1 | 49 (13.2%) |
+| 2 | 731/740 | 98.78% | 362 | 7 | 1 | 49 (13.2%) |
+| 3 | 731/740 | 98.78% | 361 | 9 | 0 | 64 (17.3%) |
+| **Mean** | **730/740** | **98.56%** | **360** | **9** | **0.7** | **54** |
 
-**Quality delta vs 9B (3 shared chunks):** +12 points (240 vs 228)
-**Known issue:** Thinking mode produces degenerate output (repeating digits) on ~50% of API calls
-**Note:** Quality is the highest of any tested model when it works
+Run-to-run range: 0.67pp. Inter-judge agreement: 96.8-97.8%.
 
-## KV Cache Quantization Comparison (2-slot, matched conditions)
+### Per-chunk scores (mean)
 
-| KV Type | Score | % | Notes |
-|---------|-------|---|-------|
-| q8_0 | 685/740 | 92.6% | 24GB RAM, stable |
-| **q4_0** | **691/740** | **93.4%** | 24GB RAM, stable — **no quality penalty** |
+| Chunk | Topic | % |
+|---|---|---|
+| 1 | Networking + Linux | ~98% |
+| 2 | Kubernetes + Dev | ~99% |
+| 3 | OpenTofu + Ansible | ~97% |
+| 4 | Go + Rust | ~99% |
+| 5 | .NET + Python | ~99% |
+| 6 | JS + Bash + PowerShell | ~98% |
+| 7 | App Architecture | ~99% |
+| 8 | On-Prem + Cloud + OT | ~99% |
+| 9 | Scenarios (Part A/B/C) | ~97% |
 
-q4_0 KV cache halves KV memory with zero measurable quality loss. The +6 point difference is within normal run-to-run variance (6-11 points).
+### Loop detection (chunk 9, 12 scenarios)
+New template (b8753): spiraling visible in LD1, LD4 (were hidden by tool-call short-circuit on old template). Not critical — scenarios complete within timeout.
 
-## Parallelism Impact (q4_0 KV, matched conditions)
+---
 
-| Slots | Context/slot | Score | % | Throughput | Notes |
-|-------|-------------|-------|---|------------|-------|
-| **2** | **60,000** | **691/740** | **93.4%** | 2× | Best quality |
-| 3 | 131,072 | 658/740 | 88.9% | 3× | -4.5% from GPU contention |
+## Gemma 4 E4B BF16 (4B) — Detailed (Production)
 
-3-slot configuration trades ~4% quality for 50% more throughput. The drop is from GPU compute contention (2× RTX 5060 Ti splitting work across 3 concurrent streams), not KV cache.
+**Date**: 2026-04-15 | **Host**: ai-infer2
 
-## Infrastructure Scores by Section
+| Run | Score | % | Pass | Partial | Fail | alt_acceptable |
+|---|---|---|---|---|---|---|
+| 1 | 722/740 | 97.57% | 354 | 14 | 2 | 76 (20.5%) |
+| 2 | 714/740 | 96.49% | 348 | 18 | 4 | 104 (28.1%) |
+| 3 | 710/740 | 95.95% | 344 | 22 | 4 | 66 (17.8%) |
+| **Mean** | **715/740** | **96.67%** | **349** | **18** | **3.3** | **82 (22.1%)** |
 
-| Config | Networking | Linux | K8s | Dev | OpenTofu | Ansible | Infra Total |
-|--------|-----------|-------|-----|-----|----------|---------|-------------|
-| 1×262144 q8 (mean) | 34.2/40 | 39/40 | 37/40 | 40/40 | 36.6/40 | 39/40 | 225.8/240 |
-| 2×131072 q8 (mean) | 37/40 | 38.6/40 | 37.8/40 | 39.2/40 | 37.2/40 | 37.6/40 | 227.4/240 |
-| 2×60k q8 (run1) | 37/40 | 39/40 | 40/40 | 39/40 | 36/40 | 37/40 | 228/240 |
-| 2×60k q4 (run1) | 38/40 | 38/40 | 40/40 | 39/40 | 35/40 | 36/40 | 226/240 |
-| 3×131k q4 (run1) | 33/40 | 35/40 | 38/40 | 35/40 | 38/40 | 32/40 | 211/240 |
+Run-to-run range: 1.62pp. `alt_acceptable` rate 22.1% — 4B solves problems differently but correctly.
 
-## Development Scores by Section
+### Per-chunk scores (mean)
 
-| Config | Go | Rust | .NET | Python | JS/TS | Bash | PS | Dev Total |
-|--------|----|----|------|--------|-------|------|-----|-----------|
-| 1×262144 q8 (mean) | 37.6/40 | 36.8/40 | 39.6/40 | 39.4/40 | 39/40 | 36.2/40 | 26.8/40 | 255.4/280 |
-| 2×131072 q8 (mean) | 40/40 | 39/40 | 40/40 | 39.2/40 | 39/40 | 36.6/40 | 26.8/40 | 260.6/280 |
-| 2×60k q8 (run1) | 38/40 | 37/40 | 36/40 | 38/40 | 40/40 | 39/40 | 39/40 | 267/280 |
-| 2×60k q4 (run1) | 38/40 | 40/40 | 40/40 | 40/40 | 40/40 | 38/40 | 38/40 | 274/280 |
-| 3×131k q4 (run1) | 39/40 | 39/40 | 35/40 | 35/40 | 40/40 | 38/40 | 32/40 | 258/280 |
+| Chunk | Topic | % | vs 26B |
+|---|---|---|---|
+| 1 | Networking + Linux | ~96% | −2pp |
+| 2 | Kubernetes + Dev | ~97% | −2pp |
+| 3 | OpenTofu + Ansible | ~94% | −3pp |
+| 4 | Go + Rust | ~98% | −1pp |
+| 5 | .NET + Python | ~97% | −2pp |
+| 6 | JS + Bash + PowerShell | ~96% | −2pp |
+| 7 | AppArch + OnPrem | ~97% | −2pp |
+| 8 | Cloud + OT | ~97% | −2pp |
+| 9 | Scenarios (A/B/C) | ~95% | −2pp (Part B: 55% vs 80%) |
 
-## Architecture Scores by Section
+### Loop detection
+No dramatic spirals. LD9 borderline ambiguous-stopping case. Same pattern as 26B.
 
-| Config | App Arch | On-Prem | Cloud | OT | Arch Total |
-|--------|----------|---------|-------|----|------------|
-| 1×262144 q8 (mean) | 39.2/40 | 36/40 | 39/40 | 39/40 | 153.2/160 |
-| 2×131072 q8 (mean) | 39.2/40 | 35.4/40 | 39/40 | 39/40 | 152.6/160 |
-| 2×60k q8 (run1) | 36/40 | 34/40 | 39/40 | 39/40 | 148/160 |
-| 2×60k q4 (run1) | 36/40 | 34/40 | 37/40 | 39/40 | 146/160 |
-| 3×131k q4 (run1) | 37/40 | 35/40 | 37/40 | 34/40 | 143/160 |
+### Throughput
+- Per-slot: ~30 tok/s under parallel load
+- Aggregate: ~300 tok/s across 10 slots
+- Parallel efficiency: 81%
 
-## 5-Run Variance — 1×262144
+---
 
-| Run | Infrastructure | Development | Architecture | Scenarios | Total | % |
-|-----|---------------|-------------|--------------|-----------|-------|---|
-| 1 | 225/240 | 252/280 | 152/160 | 48/60 | 677/740 | 91.5% |
-| 2 | 225/240 | 253/280 | 152/160 | 48/60 | 678/740 | 91.6% |
-| 3 | 226/240 | 257/280 | 152/160 | 49/60 | 684/740 | 92.4% |
-| 4 | 228/240 | 258/280 | 154/160 | 48/60 | 688/740 | 93.0% |
-| 5 | 225/240 | 257/280 | 156/160 | 50/60 | 688/740 | 93.0% |
-| **Mean** | **225.8** | **255.4** | **153.2** | **48.6** | **683** | **92.3%** |
+## Historical Models (Qwen 3.5 era, pre-Gemma 4)
 
-## 5-Run Variance — 2×131072
+| Model | Config | Score | % | Notes |
+|-------|--------|-------|---|-------|
+| Qwen3.5-27B Opus Distilled Q4_K_M | 1×131k q4_0 | 240/240 | 100% | Partial (3/9 chunks), thinking-mode degenerate |
+| Qwen3.5-9B Q8_0 | 2×131k q4_0 | 708/740 | 95.7% | Dense 9B, best Qwen variant |
+| Qwen3.5-35B-A3B Q5_K_M | 2×60k q4_0 | 691/740 | 93.4% | Best MoE config |
+| Qwen3.5-35B-A3B Q5_K_M | 2×131k q8_0 | 689/740 | 93.1% | |
+| Qwen3.5-35B-A3B Q5_K_M | 1×262k q8_0 | 683/740 | 92.3% | |
+| Qwen3.5-35B-A3B Q5_K_M | 2×262k q4_0 | 668/740 | 90.3% | |
+| Qwen3.5-35B-A3B Q5_K_M | 3×131k q4_0 | 658/740 | 88.9% | 3-slot GPU contention |
 
-| Run | Infrastructure | Development | Architecture | Scenarios | Total | % |
-|-----|---------------|-------------|--------------|-----------|-------|---|
-| 1 | 226/240 | 260/280 | 152/160 | 50/60 | 688/740 | 93.0% |
-| 2 | 228/240 | 261/280 | 152/160 | 48/60 | 689/740 | 93.1% |
-| 3 | 227/240 | 259/280 | 152/160 | 47/60 | 685/740 | 92.6% |
-| 4 | 228/240 | 262/280 | 153/160 | 47/60 | 690/740 | 93.2% |
-| 5 | 228/240 | 261/280 | 154/160 | 48/60 | 691/740 | 93.4% |
-| **Mean** | **227.4** | **260.6** | **152.6** | **48.0** | **688.6** | **93.1%** |
+## Key Findings (All-Time)
 
-## Configuration Comparison
+1. **Gemma 4 26B Q6_K is the best model tested** — 98.56% with 2 parallel slots
+2. **Gemma 4 4B is remarkably capable** — 96.67% at 5× the parallelism of 26B
+3. **TurboQuant KV (turbo4) has no quality penalty** — ~q8_0 quality at q4_0 footprint
+4. **31B does not beat 26B** — model architecture limit on code writing, not precision
+5. **Q5_K_L degrades Part B** — Q6_K is the sweet spot for 26B
+6. **4B's gap is in code writing** — Part B chunk 9: 55% vs 80%. Everything else is within 2-3pp
+7. **Qwen 3.5 era peaked at 95.7%** (9B dense) — Gemma 4 26B is +2.9pp better
+8. **Loop detection**: 4B has 0 spirals, 26B has occasional spirals on ambiguous scenarios
 
-| Setting | 1×262144 | 2×131072 | 2×60k q8 | 2×60k q4 | 3×131k q4 |
-|---------|----------|----------|----------|----------|-----------|
-| Context per slot | 262,144 | 131,072 | 60,000 | 60,000 | 131,072 |
-| Parallel slots | 1 | 2 | 2 | 2 | 3 |
-| KV cache type | q8_0 | q8_0 | q8_0 | q4_0 | q4_0 |
-| Total KV tokens | 262,144 | 262,144 | 120,000 | 120,000 | 393,216 |
-| VM RAM | 8 GB | 8 GB | 24 GB | 24 GB | 24 GB |
-| Score | 683 (92.3%) | **688.6 (93.1%)** | 685 (92.6%) | **691 (93.4%)** | 658 (88.9%) |
-| Variance range | 11 pts | 6 pts | — | — | — |
-| Throughput | 1× | 2× | 2× | 2× | 3× |
+## Evaluation Methodology
 
-## Key Findings
+**Current (/judge v2)**: Two parallel Claude Opus 4.6 judges score each run independently. Final score = mean(Judge A, Judge B) per question. `alternative_acceptable` flag credits valid non-reference approaches (target rate 10-30%). Deterministic Part B validators (shellcheck, terraform fmt, py_compile, jq, yaml.safe_load) supplement judge scoring.
 
-- **q4_0 KV cache has no quality penalty** vs q8_0 — scores 691 vs 685 (within variance)
-- **q4_0 halves KV cache memory** — 5 GB vs 10 GB for the same context, freeing VRAM
-- **2-slot is the sweet spot** for dual RTX 5060 Ti — 93% quality with 2× throughput
-- **3-slot drops quality ~4%** (658 vs 691) due to GPU compute contention, not KV cache
-- **Same weaknesses persist** across all configs: PowerShell (67-82%), Scenario B parts (code), Networking edge cases
-- **Recommended config**: 2 slots, q4_0 KV cache, 131k context/slot (262k total)
+**Historical (ad-hoc Opus)**: Single Opus judge per run, no structured rubric. Higher variance (2.43pp vs 0.67pp for /judge v2). Historical scores are comparable within their cohort but not directly to /judge v2 scores.
 
 ## Detailed Results
 
-See the model-specific subdirectories for per-question JSON results and raw responses.
-
-## Legend
-
-- Score format: `points/max`
-- Evaluator: `opus` = Claude Opus 4.6, `gpt` = GPT 5.4, `opus+gpt` = both agreed
-- Configs tested on 2026-03-20 (1×262144, 2×131072) and 2026-03-21 (q8/q4 comparison, 3-slot)
+See model-specific subdirectories for per-question JSON, raw responses, and judge output.
