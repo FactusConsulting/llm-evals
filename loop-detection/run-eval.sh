@@ -98,7 +98,7 @@ print(json.dumps(payload))
     -H "Content-Type: application/json" \
     ${API_KEY:+-H "Authorization: Bearer ${API_KEY}"} \
     -d "$payload" \
-    --max-time 300)
+    --max-time 600)
 
   # Extract content from response
   python3 -c "
