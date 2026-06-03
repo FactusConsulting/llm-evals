@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 cd /home/lars/source/llm-evals/results/qwen35-27b-opus-distilled-q4km
-API_KEY="63a83819062c0946e9907b257b234be96cec03ea0fb388db716e95558ccf630d"
+API_KEY="${API_KEY:?set the API_KEY environment variable}"
 API_URL="http://192.168.2.170:8001/v1/chat/completions"
 
 mkdir -p run1/splits

@@ -8,7 +8,7 @@ RUN_LOG="/home/lars/source/llm-evals/results/qwen35-9b-vllm/stress-3h-$(date +%Y
 mkdir -p "$RUN_LOG"
 MAIN_LOG="$RUN_LOG/main.log"
 
-API_KEY="3960bd38560adb401e986c5ad15e5ca3c7bc1aa7864297d0dc14bcbc564cce45"
+API_KEY="${API_KEY:?set the API_KEY environment variable}"
 API_URL="http://192.168.2.171:8000"
 DURATION_SECS=$((3 * 3600))   # 3 hours
 START_TIME=$(date +%s)

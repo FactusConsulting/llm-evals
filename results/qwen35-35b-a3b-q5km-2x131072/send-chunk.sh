@@ -5,7 +5,7 @@ set -euo pipefail
 
 CHUNK_FILE="$1"
 OUTPUT_FILE="$2"
-API_KEY="63a83819062c0946e9907b257b234be96cec03ea0fb388db716e95558ccf630d"
+API_KEY="${API_KEY:?set the API_KEY environment variable}"
 API_URL="http://localhost:18001/v1/chat/completions"
 
 PROMPT=$(cat "$CHUNK_FILE")
