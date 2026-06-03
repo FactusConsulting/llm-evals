@@ -10,7 +10,7 @@ for f in splits/chunk*.txt; do
   name=$(basename "$f" .txt)
   out="run1/splits/${name}-response.txt"
   
-  if [ -f "$out" ] && [ -s "$out" ] && ! head -1 "$out" | grep -q "Let me work\|ERROR"; then
+  if [[ -f "$out" ]] && [[ -s "$out" ]] && ! head -1 "$out" | grep -q "Let me work\|ERROR"; then
     echo "[$(date +%H:%M:%S)] $name: already done, skipping"
     continue
   fi
