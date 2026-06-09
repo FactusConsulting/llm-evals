@@ -1,0 +1,1657 @@
+## SC1 — Medium — Broken Deployments After Cluster Upgrade
+
+Part A: The pods are failing because the combination of the new Restricted Pod Security Standard (PSS) and the container image's USER directive is causing a conflict. The Restricted PSS requires `runAsNonRoot: true` and `runAsUser` to be set to a non-zero value. The container image (cgr.dev/chainguard/static:latest) defaults to `USER root` (UID 0), but the pod spec does not explicitly set `runAsUser`. This results in the container running as root, which violates the Restricted PSS. Kubernetes enforces PSS at admission time, so the pod fails to start. The change from Baseline (which allows root) to Restricted (which enforces non-root) is the key factor.
+
+Part B: One-liner to identify failing pods and their securityContext:
+```bash
+kubectl get pods --all-namespaces --field-selector=status.phase=Running --field-selector=status.phase=Pending --field-selector=status.phase=Failed --field-selector=status.phase=CrashLoopBackOff --field-selector=status.phase=ImagePullBackOff --field-selector=status.phase=ErrImagePull --field-selector=status.phase=Unknown --field-selector=status.phase=CrashLoopBackOff -o jsonpath='{range .items[?(@.status.containerStatuses[*].restartCount > 0)]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.containers[*].securityContext}{"\n"}{end}'
+```
+Note: This command is complex and might need adjustment. A more robust approach would use `kubectl get pods -A -o json | jq '.items[] | select(.status.containerStatuses[].restartCount > 0) | {namespace: .metadata.namespace, name: .metadata.name, securityContext: .spec.containers[].securityContext}'`.
+
+Part C: Remediation strategy:
+1. **Image-Level Fix**: Rebuild the container images with a base image that defaults to a non-root user (e.g., cgr.dev/chainguard/static:latest with a non-root user) or explicitly set `USER` in the Dockerfile to a non-root UID.
+2. **Kubernetes Manifest Changes**: Update the pod specifications to explicitly set `securityContext.runAsUser` to a non-zero value (e.g., 65532 for Chainguard images) and ensure `runAsNonRoot: true` is set. This should be done for all affected pods.
+3. **CI Pipeline Gate**: Implement a CI pipeline gate that:
+    * Scans container images for the `USER` directive and verifies it's non-root.
+    * Validates that Kubernetes manifests explicitly set `runAsUser` and `runAsNonRoot` correctly.
+    * Runs a local PSS validation tool (e.g., `kubectl apply --dry-run=server` or a custom script) against the manifests.
+4. **Rollout Without Downtime**: Use a rolling update strategy with a small batch size and a short interval. Monitor the rollout closely. If issues arise, roll back to the previous version. Consider using a canary deployment for critical services.
+
+## SC2 — Hard — Cross-Region Database Failover Gone Wrong
+
+Part A: The stale data issue arises because promoting a cross-region read replica means you are now serving writes to a database that was previously only receiving asynchronous replication of writes from the primary. The replication lag (the time it takes for WAL records to be shipped from the primary to the replica and applied) means that any writes made to the old primary after the last successful WAL shipment are lost. PostgreSQL streaming replication is asynchronous by default for cross-region setups. Data loss scenarios include:
+    * **Network Partition**: If the network between primary and replica is down, the replica cannot receive WALs, leading to data loss when it's promoted.
+    * **Replication Lag**: The replica is always slightly behind the primary. Promoting it means accepting that data written in the last few seconds (or minutes, depending on lag) is lost.
+To quantify data loss, check the replica's `pg_last_wal_receive_lsn` and `pg_last_wal_replay_lsn` against the primary's `pg_current_wal_lsn()`. The difference indicates the amount of WAL not yet applied.
+
+Part B: Terraform operations:
+1. **Import the promoted replica**: `terraform import aws_db_instance.my_db_replica <replica_arn>`
+2. **Update the resource definition**: Change the `replica_source_db_instance_identifier` to `null` (or remove it) and set `engine_mode` to `provisioned` (if needed) and `promotion_tier` to `primary`.
+3. **Update dependent resources**:
+    * **Security Groups**: Update rules to allow traffic to the new primary's endpoint.
+    * **Route53 Records**: Update the CNAME or Alias record to point to the new primary's endpoint.
+    * **Parameter Groups**: Ensure the new primary uses the correct parameter group.
+    * **Other resources**: Update any resources that reference the old instance's ARN or endpoint.
+4. **Apply changes**: `terraform apply`. Terraform will update the state to reflect the new primary and modify dependent resources without destroying the instance.
+
+Part C: Future-proof architecture:
+1. **RDS Proxy vs PgBouncer**: Use RDS Proxy for connection management. It handles connection pooling, throttling, and failover more robustly than PgBouncer, especially in a multi-AZ or cross-region setup. RDS Proxy also integrates with IAM for authentication.
+2. **Route53 Health Checks & DNS Failover**: Implement Route53 health checks on the RDS instances. Use DNS failover (e.g., latency-based routing or failover routing) to automatically redirect traffic to the healthy region.
+3. **Application-Level Retry Logic**: Implement retries with exponential backoff in the application for database operations to handle transient errors during failover.
+4. **RPO < 1 second**: Use Aurora Global Database. It provides low RPO (typically seconds) by replicating data to a secondary region with a lag of a few seconds. It also supports fast failover.
+5. **Recommendation**: Yes, Aurora Global Database is highly recommended. It natively addresses the issues of replication lag, data loss, and failover speed, and integrates well with AWS services.
+
+## SC3 — Medium — Container Image Supply Chain Compromise
+
+Part A: Immediate incident response steps:
+1. **Containment**: Isolate the affected pods by scaling down their deployments or deleting them. Do not destroy the compromised containers immediately to preserve forensic evidence.
+2. **Capture Evidence**:
+    * **Process Tree**: `kubectl exec <pod> -- ps auxf` or `kubectl exec <pod> -- pstree -aup`.
+    * **Network Connections**: `kubectl exec <pod> -- netstat -tunap` or `kubectl exec <pod> -- ss -tunap`.
+    * **Filesystem Diff**: `kubectl exec <pod> -- find / -type f -newer /etc/lastlog` (or a similar method to find recently modified files). For a more comprehensive diff, you might need to copy the container's filesystem to a forensic analysis environment.
+3. **Analyze**: Examine the captured data for malicious processes, network connections to suspicious IPs, and modified files.
+4. **Kill**: Once evidence is captured, kill the compromised pods and rebuild them with a known-good image.
+
+Part B: Python script to compare image digests and flag layers:
+```python
+import boto3
+import hashlib
+import json
+import os
+import sys
+
+# Configuration
+ECR_REGION = 'your-ecr-region'
+ECR_REPO = 'your-ecr-repo'
+NODE_IMAGE_TAG = 'node:20-slim'
+API_GATEWAY_IMAGE = 'your-api-gateway-image:tag'
+KNOWN_GOOD_DIGESTS_FILE = 'known_good_digests.json' # Should contain { "node:20-slim": "sha256:..." }
+
+# Load known good digests
+try:
+    with open(KNOWN_GOOD_DIGESTS_FILE, 'r') as f:
+        known_good_digests = json.load(f)
+except FileNotFoundError:
+    print(f"Error: {KNOWN_GOOD_DIGESTS_FILE} not found.")
+    sys.exit(1)
+
+# Get ECR client
+ecr_client = boto3.client('ecr', region_name=ECR_REGION)
+
+def get_image_digest(image_uri):
+    try:
+        response = ecr_client.describe_images(
+            repositoryName=image_uri.split('/')[1],
+            imageIds=[{'imageTag': image_uri.split('/')[-1]}]
+        )
+        if response['images']:
+            return response['images'][0]['imageDigest']
+        else:
+            print(f"Error: Image {image_uri} not found.")
+            return None
+    except Exception as e:
+        print(f"Error getting image digest for {image_uri}: {e}")
+        return None
+
+def get_image_layers(image_uri):
+    try:
+        response = ecr_client.batch_get_image(
+            repositoryName=image_uri.split('/')[1],
+            imageIds=[{'imageTag': image_uri.split('/')[-1]}],
+            acceptedMediaTypes=['application/vnd.docker.distribution.manifest.v2+json']
+        )
+        if response['images']:
+            manifest = json.loads(response['images'][0]['imageManifest'])
+            return manifest.get('layers', [])
+        else:
+            print(f"Error: Image {image_uri} not found for layers.")
+            return []
+    except Exception as e:
+        print(f"Error getting image layers for {image_uri}: {e}")
+        return []
+
+# Check node image digest
+node_image_uri = f"{ECR_REPO}/{NODE_IMAGE_TAG}"
+node_digest = get_image_digest(node_image_uri)
+if node_digest:
+    known_node_digest = known_good_digests.get(NODE_IMAGE_TAG)
+    if node_digest != known_node_digest:
+        print(f"ALERT: Digest mismatch for {NODE_IMAGE_TAG}!")
+        print(f"Current: {node_digest}, Known Good: {known_node_digest}")
+    else:
+        print(f"INFO: Digest for {NODE_IMAGE_TAG} matches known good.")
+
+# Check api-gateway image layers
+api_gateway_image_uri = f"{ECR_REPO}/{API_GATEWAY_IMAGE}"
+api_gateway_layers = get_image_layers(api_gateway_image_uri)
+if api_gateway_layers:
+    print(f"INFO: Layers for {API_GATEWAY_IMAGE}:")
+    for layer in api_gateway_layers:
+        print(f"  {layer['digest']}")
+else:
+    print(f"ERROR: Could not retrieve layers for {API_GATEWAY_IMAGE}.")
+
+# Flag any layer not present in a known-good build (this part is complex and requires a baseline)
+# For simplicity, this script only checks the node image digest.
+# A full solution would compare the entire layer list against a known-good image's layer list.
+```
+Note: The script above is a starting point. Comparing layers requires a baseline of a known-good image's layers.
+
+Part C: Hardened CI/CD pipeline architecture:
+1. **Image Signing**: Use Cosign/Sigstore to sign container images upon build. This provides cryptographic proof of origin and integrity.
+2. **Admission Controllers**: Implement Kyverno or OPA Gatekeeper in the Kubernetes cluster to enforce policies that require image signatures before allowing pods to run.
+3. **Base Image Pinning**: Always use base images by their SHA-256 digest (e.g., `node:20-slim@sha256:...`) instead of tags to prevent unexpected changes.
+4. **SBOM Generation**: Generate Software Bill of Materials (SBOMs) for all images using tools like Syft or Trivy. Integrate SBOMs into the CI/CD pipeline for auditing and vulnerability management.
+5. **Notary v2**: Notary v2 is a decentralized trust and signing system for container images. It can be used to manage and verify image signatures, complementing Cosign/Sigstore.
+
+## SC4 — Hard — Migrating a Stateful Monolith to Kubernetes
+
+Part A: Top 5 technical blockers and solutions:
+1. **Sticky Sessions (Local Memory)**:
+    * Problem: Kubernetes pods are ephemeral and not sticky. Local memory in pods will not survive pod restarts or rescheduling.
+    * Solution: Implement a distributed session store (e.g., Redis, Hazelcast) or use Kubernetes StatefulSets with persistent volumes for session data.
+2. **Local NFS Mount (/data/uploads)**:
+    * Problem: Local NFS mounts are tied to specific nodes and not portable.
+    * Solution: Use a Kubernetes PersistentVolume (PV) backed by a network-attached storage (NAS) or a cloud storage solution (e.g., AWS EFS, Azure Files, GCP Filestore) that can be mounted by any pod.
+3. **On-Prem Oracle 19c Database**:
+    * Problem: The monolith is tightly coupled to the on-prem database. Migrating the database is a separate, complex task.
+    * Solution: Containerize the Oracle database using a suitable image (e.g., Oracle's official image or a community image) and run it in Kubernetes. Alternatively, use a managed database service (e.g., Oracle Cloud Database, AWS RDS for Oracle) and update the application connection string.
+4. **IBM MQ Integration**:
+    * Problem: The monolith communicates with a mainframe via IBM MQ. Ensuring reliable messaging in a containerized environment requires careful configuration.
+    * Solution: Use a containerized IBM MQ instance (e.g., IBM MQ Advanced for Developers) or a managed MQ service (e.g., IBM Cloud MQ, AWS MQ). Ensure the Kubernetes application has network access to the MQ instance.
+5. **F5 BIG-IP Load Balancer**:
+    * Problem: F5 is a physical load balancer. Replacing it with Kubernetes-native Ingress controllers (e.g., NGINX Ingress, Traefik) requires configuration changes and testing.
+    * Solution: Implement an Ingress controller in Kubernetes. Configure it to handle SSL termination, routing, and health checks. Gradually shift traffic from F5 to the Ingress controller.
+
+Part B: OpenTofu module for NFS-backed storage:
+```hcl
+variable "nfs_server_address" {
+  description = "Address of the NFS server"
+  type        = string
+}
+
+variable "nfs_export_path" {
+  description = "Export path on the NFS server"
+  type        = string
+}
+
+variable "storage_capacity" {
+  description = "Storage capacity for the PersistentVolumeClaim"
+  type        = string
+  default     = "10Gi"
+}
+
+variable "storage_class_name" {
+  description = "Name of the StorageClass"
+  type        = string
+  default     = "nfs-storage"
+}
+
+variable "pv_name" {
+  description = "Name of the PersistentVolume"
+  type        = string
+  default     = "nfs-pv"
+}
+
+variable "pvc_name" {
+  description = "Name of the PersistentVolumeClaim"
+  type        = string
+  default     = "nfs-pvc"
+}
+
+resource "kubernetes_storage_class" "nfs" {
+  metadata {
+    name = var.storage_class_name
+  }
+  provisioner "local-exec" {
+    command = "echo 'Creating StorageClass ${var.storage_class_name}'"
+  }
+  # For NFS CSI driver, typically no parameters are needed if the driver is configured globally
+  # If specific parameters are needed, they would go here.
+}
+
+resource "kubernetes_persistent_volume" "nfs_pv" {
+  metadata {
+    name = var.pv_name
+  }
+  spec {
+    capacity {
+      storage = var.storage_capacity
+    }
+    access_modes = ["ReadWriteMany"] # Necessary for multiple pods to access the same volume
+    persistent_volume_reclaim_policy = "Retain"
+    storage_class_name = var.storage_class_name
+    nfs {
+      path = var.nfs_export_path
+      server = var.nfs_server_address
+    }
+  }
+}
+
+resource "kubernetes_persistent_volume_claim" "nfs_pvc" {
+  metadata {
+    name = var.pvc_name
+  }
+  spec {
+    access_modes = ["ReadWriteMany"]
+    storage {
+      # This should match the StorageClass name if dynamic provisioning is used,
+      # or the PV name if static provisioning is used.
+      # For this static PV, we specify the PV name.
+      # If using dynamic provisioning, you would omit the volume_name and specify storage_class_name.
+      volume_name = kubernetes_persistent_volume.nfs_pv.metadata[0].name
+      storage     = var.storage_capacity
+    }
+  }
+}
+```
+Explanation: `ReadWriteMany` access mode is necessary because the legacy application likely expects multiple instances (or the same instance on different nodes) to be able to read and write to the `/data/uploads` directory simultaneously. NFS is a common filesystem that supports `ReadWriteMany`.
+
+Part C: Phased migration plan (Strangler Fig pattern):
+1. **Phase 1: Lift and Shift with API Gateway**:
+    * Move: Containerize the monolith and run it on Kubernetes. Expose it via an API Gateway (e.g., Kong, AWS API Gateway) that handles routing, authentication, and rate limiting.
+    * Traffic Split: Route a small percentage of traffic (e.g., 10%) to the new Kubernetes version. Keep the F5 BIG-IP as the primary load balancer for the old version.
+    * MQ Integration: Ensure the Kubernetes application can connect to the IBM MQ instance (either on-prem or migrated to Kubernetes).
+    * Rollback: If issues arise, scale down the Kubernetes deployment and revert to the F5 load balancer.
+    * Metrics: Monitor error rates, latency, and resource utilization for the new version.
+2. **Phase 2: Strangle Core Functionality**:
+    * Move: Identify a non-critical feature or module of the monolith and replace it with a new microservice built on Kubernetes.
+    * Traffic Split: Gradually increase traffic to the new microservice for the strangled feature.
+    * Database: If the strangled feature uses a separate database, migrate it to a containerized database instance in Kubernetes.
+    * Rollback: If the new microservice fails, revert to the monolith for that feature.
+    * Metrics: Monitor the performance and stability of the strangled feature.
+3. **Phase 3: Full Migration and Decommissioning**:
+    * Move: Continue strangling features until the entire monolith is replaced by microservices on Kubernetes.
+    * Traffic Split: Once all features are migrated, route 100% of traffic to the new Kubernetes platform.
+    * Decommission: Remove the old F5 BIG-IP load balancer and the on-prem Oracle database (if migrated to Kubernetes or a managed service).
+    * Rollback: If a critical issue occurs, have a plan to quickly revert to the previous state (e.g., by redeploying the monolith on F5).
+    * Metrics: Ensure all key performance indicators (KPIs) are met and stable on the new platform.
+
+## SC5 — Medium — Mysterious Latency Spike in Microservices
+
+Part A: Systematic debugging approach:
+1. **Istio Metrics**:
+    * Check `istio_requests_total` for error rates and `istio_request_duration_milliseconds_bucket` for latency distribution between checkout-service and inventory-service.
+    * Examine Envoy proxy metrics: `envoy_cluster_upstream_rq_pending_overflow`, `envoy_cluster_upstream_rq_pending_active`, `envoy_cluster_upstream_rq_retry`, `envoy_cluster_upstream_rq_timeout` for the inventory-service cluster. These can indicate proxy-level issues like queueing or timeouts.
+    * Look at `envoy_cluster_upstream_cx_connect_time_ms` and `envoy_cluster_upstream_cx_rx_bytes_total` to see if network latency is high.
+2. **Kubernetes Metrics**:
+    * Check CPU and memory utilization of inventory-service pods during the spike (already confirmed low).
+    * Check network I/O and disk I/O for inventory-service pods.
+    * Check the number of active connections to the inventory-service pods.
+3. **Application-Level Metrics**:
+    * Inventory-service: Monitor its own application metrics (e.g., request processing time, database query times, lock contention metrics if available).
+    * Checkout-service: Monitor its own metrics for the call to inventory-service (e.g., time spent waiting for a response).
+4. **Distributed Tracing (Jaeger/Zipkin)**:
+    * Capture traces during the spike. Look for:
+        * Increased latency in the span representing the call from checkout-service to inventory-service.
+        * If the latency is in the network: The span duration will be high, and network-related metrics (e.g., TCP connect time, TLS handshake time) will be high.
+        * If the latency is in the sidecar proxy: The span duration will be high, and Envoy proxy metrics (as listed above) will show issues.
+        * If the latency is in the inventory-service application: The span duration will be high, and application-level metrics for inventory-service will show high processing times.
+5. **Specific Envoy Metrics**:
+    * `envoy_cluster_upstream_rq_pending_active`: Number of active requests pending in the proxy's queue. High values indicate the proxy is overwhelmed.
+    * `envoy_cluster_upstream_rq_pending_overflow`: Number of requests that were dropped due to queue overflow. High values indicate severe proxy overload.
+    * `envoy_cluster_upstream_rq_retry`: Number of requests that were retried. High values might indicate transient issues with the upstream service.
+    * `envoy_cluster_upstream_rq_timeout`: Number of requests that timed out. High values indicate the upstream service is slow or unresponsive.
+
+Part B: SQL diagnostic query for PostgreSQL:
+```sql
+SELECT
+    blocked.pid AS blocked_pid,
+    blocked.state AS blocked_state,
+    blocked.query AS blocked_query,
+    blocked.wait_event_type AS blocked_wait_event_type,
+    blocked.wait_event AS blocked_wait_event,
+    blocked.wait_duration_ms AS blocked_wait_duration_ms,
+    blocking.pid AS blocking_pid,
+    blocking.state AS blocking_state,
+    blocking.query AS blocking_query,
+    blocking.wait_event_type AS blocking_wait_event_type,
+    blocking.wait_event AS blocking_wait_event,
+    blocking.wait_duration_ms AS blocking_wait_duration_ms
+FROM pg_stat_activity blocked
+JOIN pg_locks bl ON blocked.pid = bl.pid
+JOIN pg_locks br ON bl.locktype = br.locktype AND bl.database IS NOT DISTINCT FROM br.database AND bl.relation IS NOT DISTINCT FROM br.relation AND bl.page IS NOT DISTINCT FROM br.page AND bl.tuple IS NOT DISTINCT FROM br.tuple AND bl.virtualxid IS NOT DISTINCT FROM br.virtualxid AND bl.transactionid IS NOT DISTINCT FROM br.transactionid AND bl.classid IS NOT DISTINCT FROM br.classid AND bl.objid IS NOT DISTINCT FROM br.objid AND bl.objsubid IS NOT DISTINCT FROM br.objsubid AND bl.pid != br.pid
+JOIN pg_stat_activity blocking ON br.pid = blocking.pid
+WHERE NOT blocked.granted;
+```
+Go code snippet for circuit breaker in checkout-service (using `gobreaker`):
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/sony/gobreaker"
+)
+
+// MockInventoryServiceClient is a placeholder for the actual inventory service client.
+type MockInventoryServiceClient struct{}
+
+func (c *MockInventoryServiceClient) GetInventory(ctx context.Context, itemID string) (string, error) {
+	// Simulate a slow or failing inventory service during the spike.
+	// In reality, this would be an HTTP call or gRPC call.
+	time.Sleep(3 * time.Second) // Simulate 3-second delay
+	return "100", nil // Simulate successful response
+}
+
+func main() {
+	inventoryClient := &MockInventoryServiceClient{}
+
+	// Create a circuit breaker
+	cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+		Name:        "InventoryService",
+		MaxRequests: 3, // Allow 3 requests before opening the circuit
+		Interval:     30 * time.Second, // Time to wait before trying again after opening
+		Timeout:      10 * time.Second, // Time to wait before half-opening the circuit
+		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			return counts.ConsecutiveFailures > 2
+		},
+	})
+
+	http.HandleFunc("/checkout", func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+
+		// Use the circuit breaker to call the inventory service
+		response, err := cb.Execute(func() (interface{}, error) {
+			return inventoryClient.GetInventory(ctx, "item123")
+		})
+
+		if err != nil {
+			http.Error(w, "Inventory service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+
+		fmt.Fprintf(w, "Inventory: %v", response)
+	})
+
+	http.ListenAndServe(":8080", nil)
+}
+```
+
+Part C: Architectural solution to eliminate this class of problem:
+1. **CQRS (Command Query Responsibility Segregation)**:
+    * Separate the read path (queries) from the write path (commands). The reconciliation job should only write to the database, not read from it in a way that blocks other operations.
+2. **Read Replica for Reconciliation**:
+    * Run the inventory reconciliation job against a dedicated read replica of the database. This isolates the read load from the primary database, preventing lock contention on the primary.
+3. **Bulkhead Isolation for Database Connection Pool**:
+    * Implement separate connection pools for the serving application (checkout-service) and the reconciliation job. This prevents the reconciliation job from exhausting the connection pool used by the serving application.
+4. **Adjust CronJob Scheduling**:
+    * Schedule the reconciliation job during off-peak hours to minimize impact on serving applications.
+    * Consider breaking the reconciliation job into smaller, more frequent batches to reduce the duration of locks.
+5. **Kubernetes PodDisruptionBudgets (PDBs) and Resource Quotas**:
+    * **PDBs**: Define PDBs for the inventory-service pods to ensure a minimum number of replicas are always available during voluntary disruptions (e.g., node maintenance). This prevents the reconciliation job from being scheduled on the last available node if it's resource-intensive.
+    * **Resource Quotas**: Set resource quotas for namespaces or specific pods to limit the CPU and memory consumption of the reconciliation job, preventing it from starving the serving pods.
+
+## SC6 — Hard — Zero-Trust Network Overhaul for a Hybrid Environment
+
+Part A: Identity and access layer design:
+1. **Machine Identity**:
+    * **SPIFFE/SPIRE**: Implement SPIFFE (Secure Production Identity Framework For Everyone) for workload identity. SPIRE (SPIFFE Runtime Environment) will issue and manage short-lived X.509 certificates for workloads.
+    * **AWS IAM Roles**: For AWS workloads, use IAM Roles for Service Accounts (IRSA) to associate IAM roles with Kubernetes service accounts. SPIRE can integrate with IRSA to issue SPIFFE IDs that map to IAM roles.
+    * **Azure Managed Identities**: For Azure workloads, use Azure Managed Identities. SPIRE can integrate with Azure to issue SPIFFE IDs that map to Managed Identities.
+    * **On-Prem PKI**: For on-prem workloads, integrate SPIRE with the existing on-prem PKI. SPIRE can issue SPIFFE IDs that are signed by the on-prem CA.
+2. **Federating Identity**:
+    * Use a federated identity provider (IdP) like Keycloak, Dex, or an enterprise IdP (e.g., Okta, Azure AD) that can integrate with SPIRE.
+    * Workloads in AWS can authenticate to the IdP using their IAM roles (via OIDC federation).
+    * Workloads in Azure can authenticate using their Managed Identities (via OIDC federation).
+    * On-prem workloads can authenticate using their on-prem PKI certificates.
+    * The IdP will issue short-lived JWTs or SAML assertions that are then used by SPIRE to issue SPIFFE X.509 certificates. This allows a workload in AWS to authenticate to a service on-prem without shared secrets, as both use certificates issued by a trusted CA (the IdP's CA or a CA trusted by the IdP).
+
+Part B: OpenTofu configuration for AWS networking (zero-trust foundation):
+```hcl
+variable "vpc_cidr" {
+  description = "CIDR block for the VPC"
+  type        = string
+  default     = "10.0.0.0/16"
+}
+
+variable "private_subnet_cidrs" {
+  description = "List of CIDR blocks for private subnets"
+  type        = list(string)
+  default     = ["10.0.1.0/24", "10.0.2.0/24"]
+}
+
+variable "transit_gateway_cidr" {
+  description = "CIDR block for the Transit Gateway"
+  type        = string
+  default     = "10.1.0.0/24"
+}
+
+variable "vpn_tunnel_cidrs" {
+  description = "List of CIDR blocks for VPN tunnels"
+  type        = list(string)
+  default     = ["10.1.1.0/30", "10.1.2.0/30"]
+}
+
+variable "private_link_services" {
+  description = "List of AWS services to create PrivateLink endpoints for"
+  type        = list(string)
+  default     = ["s3", "ecr.api", "ecr.dkr", "rds", "secretsmanager"]
+}
+
+resource "aws_vpc" "main" {
+  cidr_block = var.vpc_cidr
+  tags = {
+    Name = "zero-trust-vpc"
+  }
+}
+
+resource "aws_subnet" "private" {
+  count             = length(var.private_subnet_cidrs)
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.private_subnet_cidrs[count.index]
+  availability_zone = "us-east-1a" # Adjust as needed
+  map_public_ip_on_launch = false
+  tags = {
+    Name = "private-subnet-${count.index}"
+  }
+}
+
+resource "aws_internet_gateway" "gw" {
+  vpc_id = aws_vpc.main.id
+  tags = {
+    Name = "zero-trust-igw"
+  }
+}
+
+resource "aws_ec2_transit_gateway" "tgw" {
+  description = "Zero Trust Transit Gateway"
+  dns_support = "enable"
+  vpn_ecmp_support = "enable"
+  tags = {
+    Name = "zero-trust-tgw"
+  }
+}
+
+resource "aws_ec2_transit_gateway_vpc_attachment" "private_attachment" {
+  count             = length(var.private_subnet_cidrs)
+  subnet_ids        = [aws_subnet.private[count.index].id]
+  transit_gateway_id = aws_ec2_transit_gateway.tgw.id
+  tags = {
+    Name = "tgw-attachment-private-${count.index}"
+  }
+}
+
+resource "aws_ec2_transit_gateway_vpn_attachment" "vpn_attachment" {
+  count             = length(var.vpn_tunnel_cidrs)
+  transit_gateway_id = aws_ec2_transit_gateway.tgw.id
+  vpn_connection_id  = aws_vpn_connection.main[count.index].id
+  tags = {
+    Name = "tgw-attachment-vpn-${count.index}"
+  }
+}
+
+resource "aws_vpn_connection" "main" {
+  count             = length(var.vpn_tunnel_cidrs)
+  type              = "ipsec.1"
+  customer_gateway_id = aws_customer_gateway.main.id
+  transit_gateway_id  = aws_ec2_transit_gateway.tgw.id
+  static_routes_only = true
+  tags = {
+    Name = "zero-trust-vpn-${count.index}"
+  }
+}
+
+resource "aws_customer_gateway" "main" {
+  bgp_asn    = 65000
+  ip_address = "10.1.0.1" # On-prem VPN gateway IP
+  type       = "ipsec.1"
+  tags = {
+    Name = "zero-trust-cgw"
+  }
+}
+
+resource "aws_ec2_transit_gateway_route_table" "main" {
+  transit_gateway_id = aws_ec2_transit_gateway.tgw.id
+  tags = {
+    Name = "zero-trust-tgw-rtb"
+  }
+}
+
+resource "aws_ec2_transit_gateway_route" "private_to_tgw" {
+  destination_cidr_block = var.vpc_cidr
+  transit_gateway_attachment_id = aws_ec2_transit_gateway_vpc_attachment.private_attachment[0].id
+  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.main.id
+}
+
+resource "aws_ec2_transit_gateway_route" "tgw_to_private" {
+  destination_cidr_block = var.private_subnet_cidrs[0]
+  transit_gateway_attachment_id = aws_ec2_transit_gateway_vpc_attachment.private_attachment[0].id
+  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.main.id
+}
+
+resource "aws_ec2_transit_gateway_route" "vpn_to_tgw" {
+  count             = length(var.vpn_tunnel_cidrs)
+  destination_cidr_block = var.vpn_tunnel_cidrs[count.index]
+  transit_gateway_attachment_id = aws_ec2_transit_gateway_vpn_attachment.vpn_attachment[count.index].id
+  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.main.id
+}
+
+resource "aws_ec2_transit_gateway_route" "tgw_to_vpn" {
+  count             = length(var.vpn_tunnel_cidrs)
+  destination_cidr_block = var.vpn_tunnel_cidrs[count.index]
+  transit_gateway_attachment_id = aws_ec2_transit_gateway_vpn_attachment.vpn_attachment[count.index].id
+  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.main.id
+}
+
+resource "aws_vpc_endpoint" "private_link" {
+  count             = length(var.private_link_services)
+  vpc_id            = aws_vpc.main.id
+  service_name      = "com.amazonaws.${var.aws_region}.var.private_link_services[count.index]"
+  vpc_endpoint_type = "GatewayLoadBalancer" # Or "Interface" depending on service
+  subnet_ids        = aws_subnet.private[*].id
+  private_dns_enabled = true
+  tags = {
+    Name = "private-link-${var.private_link_services[count.index]}"
+  }
+}
+
+resource "aws_security_group" "default_sg" {
+  name        = "zero-trust-default-sg"
+  description = "Default security group for zero-trust VPC"
+  vpc_id      = aws_vpc.main.id
+  ingress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"] # Default deny-all, allow specific rules below
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  tags = {
+    Name = "zero-trust-default-sg"
+  }
+}
+
+# Example: Allow traffic from private subnets to PrivateLink endpoints
+resource "aws_security_group_rule" "allow_private_to_private_link" {
+  type                     = "ingress"
+  from_port                = 0
+  to_port                  = 0
+  protocol                 = "-1"
+  source_security_group_id = aws_security_group.default_sg.id
+  security_group_id        = aws_security_group.default_sg.id
+  description              = "Allow traffic from private subnets to PrivateLink endpoints"
+}
+```
+Note: This is a simplified example. A full zero-trust setup would involve more detailed security group rules (default-deny, allow specific traffic), network ACLs, and potentially service mesh for east-west traffic.
+
+Part C: VPN upgrade comparison:
+1. **Upgrade to AWS Direct Connect**:
+    * **Cost**: Higher upfront and monthly costs for ports and cross-connects. More expensive than VPN.
+    * **Bandwidth**: Higher bandwidth options (up to 100 Gbps) available. Better for high-throughput needs.
+    * **Encryption**: AWS handles encryption over the public internet for Direct Connect. For private connections, MACsec can be used.
+    * **Failover**: Can be configured with redundant ports and connections for high availability.
+    * **Zero-Trust Fit**: Fits well as it provides a dedicated, high-bandwidth connection. However, it still relies on IPsec for the last mile to the on-prem network. It needs to be integrated with the overall zero-trust architecture (e.g., using Transit Gateway).
+    * **Routing Changes**: Requires configuring BGP on the on-prem router and AWS side. Routes need to be propagated through the Transit Gateway.
+2. **Adding a Second VPN Tunnel with ECMP**:
+    * **Cost**: Lower cost compared to Direct Connect. Only requires additional VPN tunnels.
+    * **Bandwidth**: Aggregates bandwidth of multiple tunnels. Can achieve higher throughput than a single VPN.
+    * **Encryption**: Each tunnel is encrypted separately.
+    * **Failover**: ECMP provides load balancing and failover between tunnels.
+    * **Zero-Trust Fit**: Fits well as it's a standard AWS service. Can be used with Transit Gateway. Still relies on IPsec.
+    * **Routing Changes**: Requires configuring BGP on the on-prem router and AWS side. ECMP needs to be configured on the on-prem router.
+3. **Hybrid Mesh (Tailscale/Netbird)**:
+    * **Cost**: Tailscale has a free tier and paid plans. Netbird is open-source. Generally lower cost than Direct Connect or multiple VPN tunnels.
+    * **Bandwidth**: Depends on the underlying internet connection. May not be suitable for very high bandwidth needs.
+    * **Encryption**: Provides end-to-end encryption for all traffic between nodes in the mesh.
+    * **Failover**: Can be resilient if nodes have multiple internet connections.
+    * **Zero-Trust Fit**: Excellent fit for zero-trust. Provides a secure overlay network that bypasses traditional network segmentation. Workloads can communicate securely regardless of their location (on-prem, AWS, Azure). Integrates well with SPIFFE/SPIRE for workload identity.
+    * **Routing Changes**: Requires installing the mesh agent on all nodes. Routing is handled by the mesh overlay. No need for complex BGP configurations on the on-prem router for inter-site traffic.
+
+## SC7 — Medium — CI/CD Pipeline Causing Production Drift
+
+Part A: Explanation of drift sources and dangers:
+1. **Manual tofu apply commands**:
+    * How it occurred: Developers ran `tofu apply` directly on their laptops, bypassing the CI pipeline.
+    * Danger: This leads to untracked changes in the infrastructure state. If the state file is not locked or versioned, concurrent changes can cause data loss, resource deletion, or inconsistent states. It also makes it impossible to know what the actual infrastructure looks like.
+    * Data loss/outage: If two developers apply changes simultaneously without locking, Terraform might delete resources it thinks are no longer needed, or create conflicting resources. If the state file is not versioned, reverting to a previous state is impossible.
+2. **Diverged Helm values files**:
+    * How it occurred: Developers made changes to Helm values files in staging and production without committing them to the Git repository or through the CI pipeline.
+    * Danger: This leads to a discrepancy between the declared configuration in Git and the actual deployed configuration. It makes deployments unpredictable and difficult to manage.
+    * Data loss/outage: If a deployment uses a diverged values file, it might deploy incorrect configurations, leading to service disruptions, incorrect data handling, or security vulnerabilities.
+3. **Direct kubectl edit on ConfigMaps**:
+    * How it occurred: Developers used `kubectl edit` to modify ConfigMaps directly in the cluster, bypassing the CI/CD pipeline.
+    * Danger: This leads to untracked changes in Kubernetes resources. It makes it impossible to know the source of truth for the configuration and can lead to inconsistencies between environments.
+    * Data loss/outage: If a critical ConfigMap is edited incorrectly, it can cause services to malfunction or crash. If the change is not rolled back, it can lead to prolonged outages.
+
+Part B: GitLab CI pipeline (.gitlab-ci.yml) for OpenTofu:
+```yaml
+stages:
+  - validate
+  - plan
+  - apply
+
+variables:
+  TF_STATE_S3_BUCKET: "your-tf-state-bucket"
+  TF_STATE_S3_KEY: "path/to/your/state.tfstate"
+  TF_STATE_LOCK_TABLE: "your-dynamodb-lock-table"
+  AWS_REGION: "your-region"
+
+.tfenv:
+  image: hashicorp/terraform:latest
+  before_script:
+    - tfenv install
+    - tfenv use
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+    - aws configure set default.region $AWS_REGION
+    - aws configure set default.output json
+```

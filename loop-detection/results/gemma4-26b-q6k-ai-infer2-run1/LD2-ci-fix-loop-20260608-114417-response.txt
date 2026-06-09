@@ -1,0 +1,202 @@
+*   Error message: `./store.go:47:15: cannot use db (variable of type *sql.DB) as type Store in argument to NewCache`.
+    *   Specific reason for failure: `*sql.DB does not implement Store (missing method Close with correct signature)`.
+    *   Context: The user tried adding a `Close() error` stub to an "sql.DB wrapper", but it failed. This implies they are likely trying to pass a standard library `*sql.DB` where a custom interface `Store` is expected, or they have a wrapper that isn't actually being used/passed correctly.
+
+    *   The error says `db` is of type `*sql.DB`.
+    *   Standard library `database/sql.DB` has a method `Close() error`.
+    *   Wait, if `*sql.DB` already has `Close() error`, why does the compiler say it's missing?
+    *   Let's look closer at the error: `*sql.DB does not implement Store (missing method Close with correct signature)`.
+    *   If `*sql.DB` *already* has `Close() error`, then the mismatch must be in the **signature**.
+    *   Common mistake 1: The interface `Store` expects `Close()` (no return value), while `*sql.DB.Close()` returns `error`.
+    *   Common mistake 2: The interface `Store` expects something else entirely, and the developer assumed `Close` was the only issue.
+    *   However, looking at Attempt 1 & 2: "Added `Close() error` stub to sql.DB wrapper". This suggests there is a wrapper involved, but the variable passed (`db`) is explicitly typed as `*sql.DB` (the standard lib one).
+
+    *Re-reading the error:* `./store.go:47:15: cannot use db (variable of type *sql.DB) as type Store...`
+    The variable being passed is `db` which is `*sql.DB`.
+    Standard library `*sql.DB.Close()` signature is `func (*DB) Close() error`.
+
+    Why would it say "missing method Close with correct signature"?
+    Possibility A: The `Store` interface defines `Close()` without any parameters or return values? No, usually interfaces for DBs include errors.
+    Possibility B: The `Store` interface defines `Close() error`, but for some reason, the compiler doesn't see it on `*sql.DB`. But `*sql.DB` definitely has it.
+    Wait! If I am passing `*sql.DB` directly, and the error says it lacks the method, then either:
+    1.  The interface `Store` expects something else named `Close`.
+    2.  There is a pointer receiver vs value receiver mismatch (unlikely for `*sql.DB`).
+    3.  **Crucial realization:** In Go, if an interface requires `Close() error`, and you pass `*sql.DB`, it should work perfectly because `*sql.DB` implements `Close() error`.
+
+    Let's look at the previous attempts again: "Added `Close() error` stub to sql.DB wrapper". This implies they are trying to extend/wrap `sql.DB`. But the code being passed is `db` of type `*sql.DB`. You cannot add methods to types from another package (`database/sql`) in Go. Even if they created a wrapper, the variable `db` in `store.go:47` is explicitly identified as `*sql.DB`.
+
+    If the user wants to use `*sql.DB` where a `Store` is required, and `Store` requires certain methods, we can't change `*sql.DB`. We must wrap it.
+
+    Wait, let's re-examine the error message very carefully:
+    `./store.go:47:15: *sql.DB does not implement Store (missing method Close with correct signature)`
+
+    If `*sql.DB` has `Close() error`, why would it say it doesn't have the "correct signature"?
+    This usually happens when:
+    Interface defines: `Close()` (no return)
+    Actual implementation: `Close() error`
+    OR
+    Interface defines: `Close(ctx context.Context) error`
+    Actual implementation: `Close() error`
+
+    Let's look at common patterns. In many modern Go libraries or custom interfaces, `Close` might be expected to take no arguments and return nothing, OR it might require a context. However, standard `sql.DB.Close()` returns an `error`.
+
+    Actually, there's another possibility. If the interface `Store` expects `Close() error`, but for some reason, the compiler thinks `*sql.DB` doesn't satisfy it... that is impossible unless `*sql.DB` changed (it hasn't).
+
+    **WAIT.** Let's look at the error again.
+    `cannot use db (variable of type *sql.DB) as type Store in argument to NewCache`
+    The variable being passed is `db`. The type is `*sql.DB`.
+    If I pass a `*sql.DB` into a function expecting `Store`, and it fails because of `Close`, then `Store` must define `Close` differently than what `*sql.DB` provides.
+
+    Standard `sql.DB.Close()` signature: `func (db *DB) Close() error`
+
+    What could `Store.Close` be?
+    1.  `Close() error` -> This should work. Since it "failed", this isn't the case or something else is wrong.
+    2.  `Close()` (no return) -> Standard `sql.DB.Close()` returns an error, so it wouldn't match.
+    3.  `Close(ctx context.Context) error` -> Standard `sql.DB.Close()` takes no args.
+
+    Let's re-read Attempt 1/2: "Added `Close() error` stub to sql.DB wrapper". They tried adding `Close() error` to a wrapper. But they are passing `db` which is `*sql.DB`. You can't add methods to `*sql.DB`. If they passed their wrapper instead of `db`, the error would say `cannot use wrapper (type *Wrapper) as type Store...`. Instead, it says `cannot use db (variable of type *sql.DB)...`.
+
+    This means the code at line 47 is doing something like:
+    `NewCache(db)` where `db` is `*sql.DB`.
+
+    If the compiler says `missing method Close with correct signature`, and we know `*sql.DB` has `Close() error`, then the interface `Store` **must** be expecting a different signature for `Close`.
+
+    Most likely scenario in modern Go development: The interface expects `Close() error` but there's a mismatch? No, that matches.
+    What if the interface expects `Close() error` but the user provided a wrapper that doesn't satisfy other methods too? The error only mentions `Close`.
+
+    Let's look at the most common mistake when people "wrap" things. They create a struct that embeds `*sql.DB`.
+    ```go
+    type MyStore struct {
+        *sql.DB
+    }
+    ```
+    But the variable being passed is explicitly `*sql.DB`.
+
+    Wait! I see the logic flaw in the previous attempts.
+    The developers tried to add a method to a "wrapper", but they are passing the original `*sql.DB` object to the function instead of the wrapped version.
+
+    However, even if they pass the wrapper, why would it fail?
+    Because you cannot extend `*sql.DB` by adding methods directly. You must wrap it in a new type.
+
+    If the goal is to make `db` (which is `*sql.DB`) satisfy `Store`, and `Store` has a specific signature for `Close` that differs from `sql.DB.Close()`, we have a problem because we can't change `sql.DB`. We *must* use a wrapper.
+
+    **BUT**, the error says: `cannot use db (variable of type *sql.DB) as type Store`.
+    This confirms the input is indeed the raw pointer.
+
+    Let's assume the interface `Store` defines `Close()` without an error return or with a context.
+    Actually, look at the most common mismatch:
+    Interface: `Close() error`
+    Implementation (`*sql.DB`): `Close() error`
+    Wait... these match. Why does the compiler say they don't?
+
+    Is there any other method? The error only mentions `Close`.
+    What if `Store` expects `Close(ctx context.Context) error`?
+    Then `*sql.DB.Close()` (no args) would not match.
+
+    Let's re-read Attempt 1/2 again. "Added `Close() error` stub to sql.DB wrapper". They thought adding `Close() error` was the fix. If it didn't work, then `Close() error` is **not** what the interface wants.
+
+    If `Close() error` isn't what the interface wants, and the developer tried that, what else could it be?
+    Maybe `Close() error` is correct for the interface, but they are passing `*sql.DB` instead of their wrapper? Yes, that explains why the attempts failed. They added the method to a wrapper but passed the original `db`.
+
+    So, Step 1: Diagnose.
+    The previous attempts failed because they were attempting to add methods to an `sql.DB` wrapper, but the code in `store.go:47` continues to pass the raw `*sql.DB` object instead of the wrapped instance. Since `*sql.DB` does not satisfy the `Store` interface (due to a signature mismatch on `Close`), the compilation fails.
+
+    Step 2: What is the correct signature?
+    The error says: `missing method Close with correct signature`.
+    Since `*sql.DB.Close()` returns `error`, if the compiler says this is the wrong signature, the interface must want something else.
+    Commonly, interfaces like this might expect `Close() error` (which matches) or maybe just `Close()`? No, usually errors are returned.
+    Wait! Look at the error again: `*sql.DB does not implement Store (missing method Close with correct signature)`.
+    If it was just missing the method entirely, it would say `missing method Close`. The phrase "with correct signature" implies the name exists but the parameters/returns don't match.
+
+    Does `*sql.DB` have a `Close` method? Yes.
+    What is its signature? `func (*DB) Close() error`.
+    If that doesn't match the "correct signature", then the interface `Store` wants something different.
+    Possibilities for `Store.Close`:
+    1.  `Close() error` -> This *is* what `*sql.DB` has. If this were the requirement, the error wouldn't trigger.
+    2.  `Close(ctx context.Context) error` -> Very common in modern Go.
+    3.  `Close() error` where the receiver is different? No.
+
+    Let's look at Attempt 1 & 2 again. They added `Close() error` to a wrapper. That didn't work.
+    This means even if they had passed the wrapper, it still wouldn't satisfy the interface because the interface likely expects `Close(context.Context) error` or similar.
+
+    Wait, I need to be careful. If I can't see the code, I must deduce.
+    The error says: `missing method Close with correct signature`.
+    In Go compiler terminology, when an interface requires `Method(A) B` and you provide `Method(C) D`, it says "missing method Method with correct signature".
+
+    Since `*sql.DB.Close()` is `func() error`, then `Store.Close` **cannot** be `func() error`.
+    If it were `func() error`, the compiler would say `*sql.DB implements Store but missing method...` (wait, no).
+    Actually, if the signatures don't match, the error message is exactly what we see.
+
+    So, `Store.Close` must have a different signature than `func() error`.
+    What are the candidates?
+    - `Close(ctx context.Context) error`
+    - `Close() error` (But wait, Attempt 1/2 tried this on a wrapper and failed - though they didn't pass the wrapper, so that's moot).
+
+    Let's look at the most likely scenario in a high-difficulty CI fix loop: The developer keeps trying to fix the *wrong thing*. They think the problem is the return type or existence of `Close`, but the real problem is either:
+    a) Passing the wrong object (`db` instead of `wrapper`).
+    b) The interface requires a context.
+
+    Wait! If I am an agent fixing this, I should propose wrapping `*sql.DB` into a struct that satisfies `Store`.
+
+    To satisfy `Store`:
+    The wrapper needs to implement all methods of `Store`.
+    One of them is `Close(...) ...`.
+    Since `*sql.DB.Close()` doesn't match, let's assume `Store.Close` takes a context.
+
+    **BUT**, there is a much simpler explanation for "missing method Close with correct signature".
+    In Go, if you have:
+    ```go
+    type Store interface {
+        Close() error
+    }
+    ```
+    And you provide something that has `Close()`, it works.
+    If the compiler says "missing method Close with correct signature", it means the name matches but the signature doesn't.
+
+    What if `Store` defines `Close(ctx context.Context) error`?
+    Then `*sql.DB.Close()` (which is `func() error`) would trigger exactly this error.
+
+    Let's look at Attempt 1/2 again. They added `Close() error` to a wrapper. This suggests they *thought* the problem was just the return type or existence. If they had passed the wrapper and it still failed, then even `Close() error` wouldn't be enough.
+
+    However, I cannot see the code. I must provide a fix.
+    The most robust fix is:
+    1. Create a wrapper struct that embeds `*sql.DB`.
+    2. Implement the `Close` method of the interface on that wrapper.
+    3. Pass the **wrapper** instead of the raw `db`.
+
+    Wait, what is the signature for `Close` in the interface?
+    Given the error message, it's not `func() error`.
+    It's likely `func(context.Context) error`.
+
+    Actually, let's think about common Go patterns. Many interfaces use `Close() error`. Standard library uses `Close() error`.
+    If the compiler says "missing method Close with correct signature", there is only one way `*sql.DB.Close()` fails to match: if the signatures are different.
+
+    Is there any other possibility?
+    What if `Store` defines `Close() error`, but the variable `db` is actually `*sql.DB` (the pointer), and the method is on the value? No, `sql.DB` methods are on pointers. The error says `*sql.DB`.
+
+    Let's look at the previous attempts again. They added `Close() error` to a *wrapper*. This implies they were trying to solve the mismatch by adding the missing piece to a new type. But they failed because they didn't change the call site (`store.go:47`) to use that wrapper.
+
+    **Diagnosis:**
+    1.  The code at `store.go:47` passes `db` (type `*sql.DB`) instead of a wrapped version.
+    2.  Even if it passed a wrapper, the interface `Store` requires a specific `Close` signature that `*sql.DB.Close()` does not satisfy. Based on the error message "missing method Close with correct signature", the required signature for `Store.Close` must be different from `func() error`. Most likely `func(context.Context) error`.
+
+    Wait! I just realized something. If Attempt 1/2 tried adding `Close() error` to a wrapper and still got the same error... wait, no, the error log says:
+    `cannot use db (variable of type *sql.DB) as type Store in argument to NewCache`
+    This means even after their attempts, the variable being used is STILL `db` of type `*sql.DB`. They never updated the call site to use their wrapper. This explains why both attempts were identical in failure.
+
+    So the fix is two-fold:
+    1. Define a wrapper that implements `Store`.
+    2. Ensure the wrapper's `Close` matches the interface. Since we don't know the exact signature but the compiler says `*sql.DB.Close()` is wrong, let's assume the most common modern requirement: `Close(ctx context.Context) error`. Or simply, if they want `Close() error`, then the problem was purely passing the raw `db`.
+
+    Actually, look at this: "missing method Close with correct signature".
+    If the interface wanted `Close() error`, then `*sql.DB.Close()` would have matched perfectly. The fact it doesn't match tells us the interface wants something else.
+
+    Let's try to be more precise. If I am an agent and I can only reason from text:
+    The error message explicitly states `*sql.DB does not implement Store (missing method Close with correct signature)`.
+    Since `*sql.DB` *has* a `Close() error` method, the required signature for `Store.Close` must be different.
+    Commonly, this means `Close(context.Context) error`.
+
+    **Proposed Fix:**
+    1.  Create a type `sqlStore` that embeds `*sql.DB`.
+    2.  Implement `Close(ctx context.Context) error` on `sqlStore` (or whatever the actual signature is). Since I don't know the exact signature, but I know `func() error` is wrong, I will assume the standard modern pattern of including a context or just being aware that the wrapper must be used.
+    3.  Update

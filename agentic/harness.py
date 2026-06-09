@@ -154,7 +154,7 @@ def call_model(url: str, api_key: str, model: str, messages: list,
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             raw = resp.read().decode()
             # Clean control characters
             raw = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', raw)
