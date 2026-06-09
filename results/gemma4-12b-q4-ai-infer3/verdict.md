@@ -1,64 +1,46 @@
 # Verdict — Gemma 4 12B Q4_K turbo4 (ai-infer3)
 
-**Knowledge/reasoning score: 92.4%** (684/740 points; 1 run, 1 Opus-subagent judge
-per chunk, 370 scored items, 2026-06-09). Judged with the verbatim `judge-knowledge.py`
-rubric (pass=2 / partial=1 / fail=0) via subscription-Opus subagents (the metered
-ANTHROPIC key is dry).
+**Knowledge/reasoning score: 89.9%** (665.0/740, 2-round average; 740 pts / 370 items;
+re-judged 2026-06-09 in one consistent single-judge session alongside Q8 and 26B).
+Generated against ai-infer3 `:8001` (12B **Q4_K** turbo4, 6×131k), judged with the
+verbatim `judge-knowledge.py` rubric (pass=2 / partial=1 / fail=0) by Opus subagents.
 
-## Per-chunk
+> **Correction to the earlier 92.4%.** The first Q4 verdict (92.4%, 1 lenient judge
+> round) over-stated the score. Re-judged in the same session as Q8/26B with 2 averaged
+> rounds, the SAME responses score **89.9%**. The 92.4 ↔ 88.4–91.4 swing on identical
+> text shows how noisy single-round judging is for Q4 specifically (see below).
 
-| Chunk | Topic | Score |
-| :-- | :-- | --: |
-| 1 | networking / linux | 76/80 (95.0%) |
-| 2 | k8s / dev | 76/80 (95.0%) |
-| 3 | opentofu / ansible | 70/80 (87.5%) |
-| 4 | go / rust | 76/80 (95.0%) |
-| 5 | .net / python | 77/80 (96.3%) |
-| 6 | js / bash / powershell | 111/120 (92.5%) |
-| 7 | app-arch / on-prem | 77/80 (96.3%) |
-| 8 | cloud / OT | 78/80 (97.5%) |
-| 9 | **scenarios (Part A/B/C)** | **43/60 (71.7%)** |
-| **knowledge prose (1–8)** | | **641/680 (94.3%)** |
-| **TOTAL** | | **684/740 (92.4%)** |
+## Per-chunk (2-round avg)
 
-## Profile — textbook 12B family
+| Chunk | Topic | Score | rounds |
+| :-- | :-- | --: | :-- |
+| 1 | networking / linux | 74.5/80 (93.1%) | 72/77 |
+| 2 | k8s / dev | 74.5/80 (93.1%) | 74/75 |
+| 3 | opentofu / ansible | 68.0/80 (85.0%) | 68/68 |
+| 4 | go / rust | 76.0/80 (95.0%) | 75/77 |
+| 5 | .net / python | 77.0/80 (96.2%) | 77/77 |
+| 6 | js / bash / powershell | 102.0/120 (85.0%) | 103/101 |
+| 7 | app-arch / on-prem | 76.0/80 (95.0%) | 75/77 |
+| 8 | cloud / OT | 74.5/80 (93.1%) | 72/77 |
+| 9 | **scenarios (A/B/C)** | **42.5/60 (70.8%)** | 38/47 |
+| **knowledge prose (1–8)** | | **622.5/680 (91.5%)** | |
+| **TOTAL** | | **665.0/740 (89.9%)** | |
 
-- **Knowledge prose (chunks 1–8): 94.3% — strong throughout.** Networking subnet
-  math, Linux internals, k8s, go/rust, .net/python, js/bash/powershell, app-arch,
-  cloud/OT all near-flagship. Only isolated slips (BGP order, MTU/IPsec estimate,
-  a few command-syntax nits, ndots `dnsConfig` casing).
-- **Chunk 9 scenarios (write runnable code): 71.7% — the weak spot.** 7 of 10
-  Part-B "write working code/config" items were stubs / fictitious APIs / non-
-  runnable (jq piped into jq, invalid HCL `to_set`, WAF `default_action=block`,
-  Ansible single-task-not-playbook, bash `jq 'count'`). Part A (reason) + Part C
-  (architect) scored well — it's specifically *generating complete runnable code
-  for the hardest multi-part tasks* that fails.
+## Profile
 
-This is **exactly the documented 12B-family weakness** — the bf16 verdict on the
-same eval says the identical thing ("Chunk 9 Part-B: the only consistent
-weakness"). No sign of Q4-quant-specific degradation; the QAT-Q4 reasons like the
-family.
+- **Knowledge prose 91.5%** — ~2.7 pts below Q8 (94.2%). A small but consistent step
+  down. Weakest at chunk 3 (opentofu/ansible, 85.0%) and chunk 6 (js/bash/ps, 85.0%).
+- **Wide run-to-run spread (654–676).** Q4's answers sit in the pass/partial gray zone
+  more often than Q8's (681/682, ~zero spread), so two independent Opus judges disagreed
+  by up to 22 pts on identical text. The spread width is itself a quality signal: Q4 is
+  more often "almost right" rather than decisively right.
+- **Chunk-9 scenarios 70.8%** — the family Part-B weakness, comparable to Q8 (68.3%).
 
-## Comparability caveat (do not over-read the 92.4 vs 97.95)
+## Comparison & role
 
-| Model | Knowledge eval | Method |
-| :-- | --: | :-- |
-| 31B Q6_K | 98.92% | 6 judges (2/run × 3 runs) |
-| 26B Q6_K | 98.56% | 6 judges |
-| 12B bf16 | 97.95% | 6 judges |
-| **12B Q4 (this)** | **92.4%** | **1 judge × 1 run, strict** |
-
-The 12B-Q4 number is **NOT apples-to-apples** with the references: 1 run / 1 judge
-vs 2-judge × 3-run averaging, and these subagent judges were strict (esp. the 7
-chunk-9 Part-B fails — the references reported the same weakness but evidently
-fewer hard fails and/or softer scoring). The reliable, same-harness Q4-vs-bf16
-comparison is the **agentic eval: Q4 65.0% vs bf16 67.6% — equivalent within
-noise** (and 0/12 loop-spirals each).
-
-## Takeaway
-
-Q4_K on ai-infer3 reasons like a normal Gemma 4 12B: **strong knowledge (~94%),
-weak only at writing complete runnable code for the hardest scenarios** — the
-known family trait, not a quant artifact. Fit for the agentic-overflow / failover
-role it serves. For a directly-comparable knowledge number, re-run with the full
-2-judge × 3-run method (deferred to the dedicated eval session).
+Same-session ranking: **26B 94.1% > Q8 92.1% > Q4 89.9%** — see
+[`../12b-q4-vs-q8-vs-26b-knowledge-singlejudge.md`](../12b-q4-vs-q8-vs-26b-knowledge-singlejudge.md).
+Q4 carries a small (~2 pt) real knowledge penalty vs Q8 — but on the deterministic
+**agentic eval** Q4 (65.0%) ≈ bf16 (67.6%), equivalent. Fit for the agentic
+overflow/failover role ai-infer3 serves; the knowledge gap is immaterial there.
+NOT comparable to the historical 6-judge references (this method runs ~4–5 pts stricter).
