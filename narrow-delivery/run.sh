@@ -35,7 +35,7 @@ for line in "${IDS[@]}"; do
   resp=$(curl -s --max-time 600 "$URL/v1/chat/completions" -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' -d "$body")
   echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['message'].get('content',''))" > "$OUT/$id.response.txt" 2>/dev/null
   # grade
-  gout=$(bash "$grader" "$OUT/$id.response.txt" 2>/dev/null); rc=$?
+  gout=$(bash "$grader" "$OUT/$id.response.txt" 2>/dev/null </dev/null); rc=$?
   ob=$(echo "$gout" | grep -oE 'obedience=[01]' | cut -d= -f2); ob=${ob:-0}
   tr=$(echo "$gout" | grep -oE 'trap_avoidance=[01]' | cut -d= -f2); tr=${tr:-0}
   ve=$(echo "$gout" | grep -oE 'verification=[01]' | cut -d= -f2); ve=${ve:-0}
