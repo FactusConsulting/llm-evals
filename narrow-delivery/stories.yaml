@@ -1,0 +1,169 @@
+# Narrow-delivery corpus. Each story is a tight, well-specified task with an
+# explicit constraint, a known trap (the wrong answer oc-factus actually shipped),
+# a known-correct reference, and a FUNCTIONAL grader (exit 0 = works).
+#
+# Scored on: obedience (met the constraint), trap_avoidance (didn't ship the trap),
+# verification (grader passes). Delivered = all three.
+
+stories:
+  # ─────────────── from the 7 broken oc-factus PRs (2026-06-22) ───────────────
+
+  - id: pdb-single-replica
+    domain: k8s-yaml
+    source_pr: flux-home#541
+    prompt: |
+      infrastructure/grafana/loki-values.yaml runs Loki as a SINGLE replica
+      (singleBinary.replicas: 1). Add a PodDisruptionBudget via the chart's
+      podDisruptionBudget toggle. HARD CONSTRAINT: node drains (k8s upgrades,
+      Longhorn migrations, pve host drains) must still succeed — the PDB must
+      NOT make the eviction API unsatisfiable. Output only the podDisruptionBudget
+      block.
+    constraints:
+      - "PDB is enabled"
+      - "does NOT block voluntary node drains on a single-replica workload"
+    trap: "minAvailable: 1  (on 1 replica → eviction API can never satisfy it → drain deadlock)"
+    reference: |
+      podDisruptionBudget:
+        enabled: true
+        maxUnavailable: 1
+    grader: graders/pdb-single-replica.sh
+
+  - id: wire-kustomization
+    domain: k8s-yaml
+    source_pr: flux-home#540
+    prompt: |
+      A new file flux-podmonitor.yaml has been created in infrastructure/monitoring/.
+      Make Flux actually deploy it. HARD CONSTRAINT: after your change,
+      `kustomize build infrastructure/monitoring` must include the PodMonitor in
+      its output. Output the edit to kustomization.yaml.
+    constraints:
+      - "flux-podmonitor.yaml is referenced in kustomization.yaml resources"
+      - "kustomize build emits the PodMonitor"
+    trap: "leaving the new file unreferenced — kustomize build succeeds but deploys nothing (inert)"
+    reference: "add `- flux-podmonitor.yaml` to the resources: list"
+    grader: graders/wire-kustomization.sh
+
+  - id: tls-cafile-pattern
+    domain: k8s-yaml
+    source_pr: flux-home#545
+    prompt: |
+      applications/chess-combat/database/postgres.yaml sets SSL_VERIFY=true for
+      its CNPG barman backup to minio.lwa.dk. The ObjectStore in
+      backup-objectstore.yaml is missing the matching CA trust config, so the
+      backup TLS handshake has no trust anchor. Fix it to MATCH how
+      applications/pgvector/backup-objectstore.yaml does it. Output the added block.
+    constraints:
+      - "adds spec.tls.caFileSecret referencing the minio-ca-bundle secret"
+      - "matches the pgvector pattern (name: minio-ca-bundle, key: ca-bundle.pem)"
+    trap: "leaving SSL_VERIFY=true with no caFileSecret → backups fail TLS validation"
+    reference: |
+      tls:
+        caFileSecret:
+          name: minio-ca-bundle
+          key: ca-bundle.pem
+    grader: graders/tls-cafile-pattern.sh
+
+  - id: dind-resource-bound
+    domain: k8s-yaml
+    source_pr: flux-home#544
+    prompt: |
+      Bound the dind sidecar resources on the Android GitHub-runner scale set
+      (dindResources). Context: the runner container's OWN memory limit was raised
+      to 16Gi after OOM kills, and dind handles image pulls + `docker build` layer
+      I/O during Android CI. HARD CONSTRAINTS: the memory limit must not risk
+      OOM-killing dind (so >= 4Gi), and you must bound ephemeral-storage (dind
+      stores image layers on disk). Output the dindResources block.
+    constraints:
+      - "memory limit >= 4Gi"
+      - "ephemeral-storage limit is set"
+    trap: "memory limit 2Gi (OOM risk given runner is 16Gi) and/or no ephemeral-storage bound"
+    reference: |
+      dindResources:
+        limits: { cpu: "1000m", memory: "4Gi", ephemeral-storage: "20Gi" }
+        requests: { cpu: "500m", memory: "1Gi", ephemeral-storage: "10Gi" }
+    grader: graders/dind-resource-bound.sh
+
+  - id: cve-filter-injection-safe
+    domain: python
+    source_pr: flux-home#542
+    prompt: |
+      Write a Python one-liner for a CI `run:` step that reads a YAML file (argv[1])
+      which is a list of {image, cves} entries, and prints (one per line) every CVE
+      whose image key matches a scanned image string. The scanned image is provided
+      at runtime by the shell variable $img. HARD CONSTRAINT: $img must NOT be
+      interpolated into the Python source — it must be passed as an argument
+      (argv[2]) — to avoid shell/code injection. A match = entry image is a substring
+      of $img OR $img startswith entry-image + ":". Output just the `python3 -c '...'`
+      invocation.
+    constraints:
+      - "$img passed as argv[2], NOT interpolated into the -c source string"
+      - "correct match semantics (substring OR startswith image+':')"
+    trap: "img = '''$img'''  (interpolating $img into source → a crafted ref runs arbitrary Python)"
+    reference: |
+      python3 -c 'import sys,yaml; d=yaml.safe_load(open(sys.argv[1])); img=sys.argv[2]; print("\n".join(sorted({c for e in d if (e["image"] in img or img.startswith(e["image"]+":")) for c in e["cves"]})))' map.yaml "$img"
+    grader: graders/cve-filter-injection-safe.sh
+
+  - id: flux-promql-valid-status
+    domain: promql
+    source_pr: flux-home#540
+    prompt: |
+      Write a PromQL expression for a FluxReconciliationStuck alert: fire when a
+      Flux controller has its Ready condition False (metric:
+      gotk_reconcile_condition, labels type and status). HARD CONSTRAINT: only use
+      status values that gotk_reconcile_condition actually emits. Do not add filter
+      clauses that match nothing. Output just the expr.
+    constraints:
+      - "uses status=\"False\" (a real value)"
+      - "does NOT reference status=\"Deleted\" (not a real condition status → dead clause)"
+    trap: "unless ... gotk_reconcile_condition{status=\"Deleted\"}  — Deleted is an event type, not a condition status; matches nothing"
+    reference: 'sum by (exported_namespace,controller,name,kind) (gotk_reconcile_condition{type="Ready",status="False"}) > 0'
+    grader: graders/flux-promql-valid-status.sh
+
+  - id: kotlin-deprecation-artifact
+    domain: kotlin-gradle
+    source_pr: hotlaps-androidapp-benchmark#10
+    prompt: |
+      A Gradle convention plugin in build-logic/build.gradle.kts needs the Kotlin
+      Gradle plugin API on its classpath to configure kotlinOptions. HARD
+      CONSTRAINT: use a Maven artifact that ACTUALLY EXISTS on the configured
+      repositories (Maven Central / Google / Gradle Plugin Portal). Output the
+      single dependency line.
+    constraints:
+      - "the kotlin(...) accessor maps to a real published artifact"
+    trap: 'kotlin("android")  → org.jetbrains.kotlin:kotlin-android does NOT exist on any repo; build fails to resolve'
+    reference: 'implementation(kotlin("gradle-plugin"))  → org.jetbrains.kotlin:kotlin-gradle-plugin (exists)'
+    grader: graders/kotlin-deprecation-artifact.sh
+
+  # ─────────────── genuine coding tasks (not just YAML) ───────────────
+
+  - id: go-race-fix
+    domain: go
+    prompt: |
+      fixtures/go-race/counter.go has a Counter type incremented from multiple
+      goroutines, causing a data race. Fix it so it is safe under `go test -race`.
+      HARD CONSTRAINT: the public API (Inc() and Value() int) and the struct name
+      Counter must NOT change — callers depend on them. Do not change counter_test.go.
+      Output the full corrected counter.go.
+    constraints:
+      - "no data race under -race"
+      - "Counter, Inc(), Value() int signatures unchanged"
+    trap: "changing the API (e.g. returning a mutex, renaming), or using a non-atomic read of Value while Inc writes"
+    reference: "guard the int with sync.Mutex (or use sync/atomic) inside the existing methods"
+    grader: graders/go-race-fix.sh
+
+  - id: py-edgecase-fix
+    domain: python
+    prompt: |
+      fixtures/py-edgecase/dateparse.py has parse_duration(s) that turns strings
+      like "1h30m", "45m", "2h", "90s" into total seconds. It currently mishandles
+      a bare unitless number and an empty string. Fix parse_duration so it: returns
+      0 for "" , and for a bare integer like "120" interprets it as SECONDS. HARD
+      CONSTRAINT: all EXISTING passing cases in test_dateparse.py must keep passing;
+      do not change the test file. Output the full corrected dateparse.py.
+    constraints:
+      - 'parse_duration("") == 0'
+      - 'parse_duration("120") == 120  (bare number = seconds)'
+      - "all pre-existing cases still pass"
+    trap: "rewriting the parser in a way that breaks the existing 1h30m/45m/2h/90s cases"
+    reference: "handle empty → 0 and a fullmatch of \\d+ → int(seconds) before the unit-regex loop"
+    grader: graders/py-edgecase-fix.sh
