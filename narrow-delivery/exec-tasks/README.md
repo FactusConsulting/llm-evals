@@ -24,3 +24,12 @@ not incapacity.
 
 NDE1-wire, NDE2-kfix, NDE3-gorace, NDE4-pyedge. (PDB/promql/dind judgment-footguns stay in
 the chat corpus — no command proves their correctness.)
+
+## Cross-domain result (2026-06-22)
+
+Fleet Qwen3.6-35B delivered **13/13** — blind, self-verifying, ground-truth-verified —
+across infra (nginx/bash/systemd), gitops (wire/kfix/promql/helm/kubeconform), and
+programming (go-race/go-logic/python-edge/python-crash/sql). Does NOT prove the model
+handles all tasks; it proves that tasks meeting TASK-DESIGN.md (atomic + command-checkable
++ enforced self-verify + self-contained) get delivered reliably — and that those criteria
+produce dev-ready tasks. The 0/6 broad-PR failures were structure, not capability.
