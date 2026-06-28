@@ -9,7 +9,7 @@ Domain-specific test suites for evaluating LLM model competency in infrastructur
 - **[METHODOLOGY.md](METHODOLOGY.md)** — why we use the multi-judge architecture and what we tried that didn't work
 - **[skills/judge-llm-eval/](skills/judge-llm-eval/)** — the Claude Code skill that orchestrates judging (rubric + reference answers + validators)
 
-**Current baseline**: `gemma4-26b-q6k-458k-turbo4-v2-ai-infer2` at **98.56%** mean over 3 runs (range 0.67pp). See `results/gemma4-26b-q6k-458k-turbo4-v2-ai-infer2/verdict.md`.
+**Per-model results + the vLLM-vs-llama.cpp comparison** → **[DASHBOARD.md](DASHBOARD.md)** (one row per model, latest generation, with the GX10 vLLM campaign deltas). Knowledge high-water-mark is currently Qwen3.6-27B BF16 (vLLM) at 99.05%.
 
 ## What's Here
 
