@@ -33,9 +33,10 @@ are judge-confounded** (vLLM runs judged Opus-4.8, the 4.6 metered key is dry; 4
 stricter → treat ties as ties). **Agentic** cross-engine numbers are **date-confounded**
 where the llama.cpp run predates vLLM 0.23's unified tool-parser — flagged inline.
 
-| Model | Knowledge vLLM | Knowledge llama.cpp | Agentic vLLM | Agentic llama.cpp | Loop | Read |
-|---|---|---|---|---|---|---|
+| Model | Knowledge vLLM | Knowledge llama.cpp | Agentic vLLM | Agentic llama.cpp | Loop | Notes | Read |
+|---|---|---|---|---|---|---|---|
 | **Gemma 4 26B-A4B** | **98.24%** (BF16) | 98.56% (Q6_K) | **88.7%** | 58.0% ⚠ᵈ | 0/0 tie ✅ | knowledge **tie**; agentic date-confound | [verdict](results/gemma4-26b-bf16-vllm-gx10/VERDICT.md) |
+| **Gemma 4 12B** | **97.07%** (BF16) | 97.95% BF16 · 92.1% Q8 · 89.9% Q4 | **77.3%** | 65.0% (Q4) ⚠ᵈ | 0/0 tie ✅ | quant ladder: BF16 ≫ Q8 ≫ Q4 (~5–7 pt); engine tie | [verdict](results/gemma4-12b-bf16-vllm-gx10/VERDICT.md) |
 | **Qwen3.5-122B-A10B** | **96.60%** (Int4) | 98.92% (Q5_K_M) | 83.3% | 87.7% | 0/0 tie ✅ | Int4 ~2pt back (judge-confounded); Q5-GGUF can't load on vLLM | [verdict](results/qwen35-122b-int4-vllm-gx10/VERDICT.md) |
 | **Qwen3.6-35B-A3B** | 98.65% (BF16) | ~97.4% (Q5 stock) | — | 80% (8/10) | 0/0 tie ✅ | BF16 vLLM = the model's knowledge ceiling | [run](results/qwen36-35b-a3b-BF16-262k-gx10/) |
 | **Qwen3.6-27B** | 99.05% (BF16) | — *(vLLM-only)* | 100% (10/10) | — | — | dense 27B, not in the llama.cpp fleet | [run](results/qwen36-27b-bf16-gx10/) |
