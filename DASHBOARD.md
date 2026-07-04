@@ -37,15 +37,29 @@ where the llama.cpp run predates vLLM 0.23's unified tool-parser — flagged inl
 |---|---|---|---|---|---|---|---|
 | **Gemma 4 26B-A4B** | **98.24%** (BF16) | 98.56% (Q6_K) | **88.7%** | 58.0% ⚠ᵈ | 0/0 tie ✅ | knowledge **tie**; agentic date-confound | [verdict](results/gemma4-26b-bf16-vllm-gx10/VERDICT.md) |
 | **Gemma 4 12B** | **97.07%** (BF16) | 97.95% BF16 · 92.1% Q8 · 89.9% Q4 | **77.3%** | 65.0% (Q4) ⚠ᵈ | 0/0 tie ✅ | quant ladder: BF16 ≫ Q8 ≫ Q4 (~5–7 pt); engine tie | [verdict](results/gemma4-12b-bf16-vllm-gx10/VERDICT.md) |
+| **Gemma 4 31B** | **98.38%** (BF16) | 98.92% (Q6_K) | **88.0%** | — (no prior) | 0/0 tie ✅ | family-highest knowledge, tie; first 31B agentic. Dense → slow ~4 tok/s | [verdict](results/gemma4-31b-bf16-vllm-gx10/VERDICT.md) |
+| **Gemma 4 E4B** (4B) | **96.08%** (BF16) | 96.67% (BF16) | 67.7% | **86.0%** ⚠ᵉ | 0/0 tie ✅ | knowledge tie; **agentic −18 pt on vLLM** (E4B elastic/centroid-head arch) | [verdict](results/gemma4-e4b-bf16-vllm-gx10/VERDICT.md) |
 | **Qwen3.5-122B-A10B** | **96.60%** (Int4) | 98.92% (Q5_K_M) | 83.3% | 87.7% | 0/0 tie ✅ | Int4 ~2pt back (judge-confounded); Q5-GGUF can't load on vLLM | [verdict](results/qwen35-122b-int4-vllm-gx10/VERDICT.md) |
 | **Qwen3.6-35B-A3B** | 98.65% (BF16) | ~97.4% (Q5 stock) | — | 80% (8/10) | 0/0 tie ✅ | BF16 vLLM = the model's knowledge ceiling | [run](results/qwen36-35b-a3b-BF16-262k-gx10/) |
 | **Qwen3.6-27B** | 99.05% (BF16) | — *(vLLM-only)* | 100% (10/10) | — | — | dense 27B, not in the llama.cpp fleet | [run](results/qwen36-27b-bf16-gx10/) |
+| **Mistral Medium 3.5** | **97.93%** (Int4) | — *(not a fleet model)* | not run | — | **2/24** ⚠️ | 128B dense **~3 tok/s → too slow for the interactive/orchestrator role**; campaign's first loop spirals | [verdict](results/mistral-medium-3.5-awq-vllm-gx10/VERDICT.md) |
 
 **⚠ᵈ date-confound:** the Gemma-26B llama.cpp agentic (58.0%) is a 2026-06-17 run on an
 older harness/parser; the +30 pt vLLM gap is mostly tooling-era, not BF16-vs-Q6_K. Needs
 a same-day llama.cpp re-run to attribute. **Takeaway so far:** vLLM serves these models at
 **no knowledge cost** (26B/35B tie or beat llama.cpp same-judge; only the 122B *must* use
 Int4 — Q5-GGUF won't load — and pays ~2 confounded pt for it).
+
+**⚠ᵉ E4B agentic:** the one clear vLLM regression — E4B agentic is 18 pt *lower* on vLLM
+than llama.cpp (not a date-confound; the llama.cpp run is older). E4B's elastic/centroid-head
+arch serves knowledge fine on vLLM but its tool-calling degrades. Prefer llama.cpp for E4B agentic.
+
+### vLLM 0.23 architecture maturity (sm_121 / Blackwell)
+Gemma 4 + Qwen serve cleanly. Newer/exotic archs hit edges on the GX10's `v0.23.0-aarch64-cu129`:
+- **Mistral Medium 3.5** — multimodal (Pixtral); default mistral-format path crashes the
+  `MistralCommonPixtralProcessor` at init → fix: `--config-format hf --limit-mm-per-prompt {image:0}`.
+- **Cohere North-Mini-Code 1.0** — `cohere2_moe.py` loader `KeyError: layers.0.mlp.down_proj.weight`
+  (hybrid dense+MoE weight naming). **Blocked** on vLLM 0.23; needs a loader fix / newer image.
 
 ### Provenance notes
 - **ᵍ Qwen3.6-35B-A3B** — knowledge 98.65% was measured on the **GX10 vLLM BF16** run (`results/qwen36-35b-a3b-BF16-262k-gx10`, runs 1–5); loop+agentic from the llama.cpp BF16 runs. The **deployed fleet** serves `Q5_K_M stock` on llama.cpp (its own deploy-eval scored ~97.4% knowledge). Treat 98.65% as the model's ceiling, not the exact fleet number.
