@@ -42,7 +42,10 @@ where the llama.cpp run predates vLLM 0.23's unified tool-parser — flagged inl
 | **Qwen3.5-122B-A10B** | **96.60%** (Int4) | 98.92% (Q5_K_M) | 83.3% | 87.7% | 0/0 tie ✅ | Int4 ~2pt back (judge-confounded); Q5-GGUF can't load on vLLM | [verdict](results/qwen35-122b-int4-vllm-gx10/VERDICT.md) |
 | **Qwen3.6-35B-A3B** | 98.65% (BF16) | ~97.4% (Q5 stock) | — | 80% (8/10) | 0/0 tie ✅ | BF16 vLLM = the model's knowledge ceiling | [run](results/qwen36-35b-a3b-BF16-262k-gx10/) |
 | **Qwen3.6-27B** | 99.05% (BF16) | — *(vLLM-only)* | 100% (10/10) | — | — | dense 27B, not in the llama.cpp fleet | [run](results/qwen36-27b-bf16-gx10/) |
-| **Mistral Medium 3.5** | **97.93%** (Int4) | — *(not a fleet model)* | not run | — | **2/24** ⚠️ | 128B dense **~3 tok/s → too slow for the interactive/orchestrator role**; campaign's first loop spirals | [verdict](results/mistral-medium-3.5-awq-vllm-gx10/VERDICT.md) |
+| **Mistral Medium 3.5** | **97.93%** (Int4) | — *(not a fleet model)* | not run | — | **2/24** ⚠️ | 128B dense **~3 tok/s → too slow** (also on 0.24); campaign's first loop spirals | [verdict](results/mistral-medium-3.5-awq-vllm-gx10/VERDICT.md) |
+| **Granite 4.1 30B** | **96.40%** (BF16) | — *(not a fleet model)* | not run | — | 0/24 ✅ | hybrid Mamba/Transformer **~3.4 tok/s → too slow** (unchanged on 0.24) | [verdict](results/granite-4.1-30b-vllm-gx10/VERDICT.md) |
+| **GLM-4.7-Flash 30B-A3B** ᵛ | **96.80%** (BF16) | — *(vLLM-only)* | not run | — | **2/24** ⚠️ | **0.24-only unblock** — MoE **~20 tok/s**, fast + strong, adopt-worthy | [verdict](results/glm-4.7-flash-vllm-gx10/VERDICT.md) |
+| **Cohere North-Mini-Code 30B-A3B** ᵛ | 93.11% raw / ~96.6% | — *(vLLM-only)* | not run | — | **2/24** ⚠️ | **0.24-only unblock** — MoE **~27 tok/s** coding model; loop-spiral caveat | [verdict](results/north-mini-code-1.0-vllm-gx10/VERDICT.md) |
 
 **⚠ᵈ date-confound:** the Gemma-26B llama.cpp agentic (58.0%) is a 2026-06-17 run on an
 older harness/parser; the +30 pt vLLM gap is mostly tooling-era, not BF16-vs-Q6_K. Needs
@@ -54,12 +57,27 @@ Int4 — Q5-GGUF won't load — and pays ~2 confounded pt for it).
 than llama.cpp (not a date-confound; the llama.cpp run is older). E4B's elastic/centroid-head
 arch serves knowledge fine on vLLM but its tool-calling degrades. Prefer llama.cpp for E4B agentic.
 
-### vLLM 0.23 architecture maturity (sm_121 / Blackwell)
-Gemma 4 + Qwen serve cleanly. Newer/exotic archs hit edges on the GX10's `v0.23.0-aarch64-cu129`:
-- **Mistral Medium 3.5** — multimodal (Pixtral); default mistral-format path crashes the
-  `MistralCommonPixtralProcessor` at init → fix: `--config-format hf --limit-mm-per-prompt {image:0}`.
-- **Cohere North-Mini-Code 1.0** — `cohere2_moe.py` loader `KeyError: layers.0.mlp.down_proj.weight`
-  (hybrid dense+MoE weight naming). **Blocked** on vLLM 0.23; needs a loader fix / newer image.
+### Owner test-order campaign (2026-06→07) — the real verdict, incl. vLLM 0.24
+The owner asked to eval a set of newer 30–120B chat/coding/orchestrator candidates. First run
+on `v0.23.0-aarch64-cu129`; the blocked ones **re-tested on `v0.24.0-aarch64-cu129-ubuntu2404`**.
+**ᵛ = the 0.24 image is required.**
+
+| Model | Arch | vLLM 0.23 | vLLM 0.24 |
+|---|---|---|---|
+| Mistral Medium 3.5 128B | dense (multimodal) | ✅ w/ `--config-format hf --limit-mm-per-prompt {image:0}` but **~3 tok/s** | still ~3 tok/s (dense-bound) |
+| Granite 4.1 30B | hybrid Mamba/Transformer | ✅ but **~3.4 tok/s** | **still ~3.4 tok/s** (0.24 doesn't fix the Mamba path) |
+| Cohere North-Mini-Code 30B-A3B | MoE | ⛔ `cohere2_moe` loader `KeyError` | ✅ **unblocked, ~27 tok/s** |
+| GLM-4.7-Flash 30B-A3B | `Glm4MoeLite` | ⛔ `AssertionError` at init | ✅ **unblocked, ~20 tok/s** |
+| Mistral Small 4 119B | MoE (multimodal, NVFP4) | ⛔ NVFP4-MoE `c10::Error` at init | 🟡 **arch fixed** (loads past init) but the 66 GB NVFP4 checkpoint **OOMs during load** on 121 GB UMA — a memory-capacity wall, not arch |
+| Mistral Small 3.2 24B | dense (multimodal) | ⛔ tokenizer garble (unsloth HF repo) / no consolidated for mistral-format | not re-run (repo/format issue, not a vLLM-version issue) |
+
+**Bottom line.** Practically usable vLLM models on this GX10 today: the **Gemma + Qwen families**
+(0.23/0.24) plus — **on 0.24 only** — **GLM-4.7-Flash** and **Cohere North-Mini-Code** (both fast MoE,
+~20–27 tok/s, ~96–97% knowledge). **0.24 is the image to use.** What 0.24 does *not* fix: the
+**dense/Mamba speed wall** (Mistral Medium 128B, Granite 4.1 → ~3 tok/s, bandwidth/Mamba-bound) and
+the **memory-capacity wall** for the biggest quants (the 119B NVFP4 won't stage into 121 GB UMA).
+So: prefer **fast MoE (3–4B active)** for local vLLM on this box; big-dense and hybrid-Mamba are
+knowledge-strong but too slow to serve interactively here.
 
 ### Provenance notes
 - **ᵍ Qwen3.6-35B-A3B** — knowledge 98.65% was measured on the **GX10 vLLM BF16** run (`results/qwen36-35b-a3b-BF16-262k-gx10`, runs 1–5); loop+agentic from the llama.cpp BF16 runs. The **deployed fleet** serves `Q5_K_M stock` on llama.cpp (its own deploy-eval scored ~97.4% knowledge). Treat 98.65% as the model's ceiling, not the exact fleet number.
