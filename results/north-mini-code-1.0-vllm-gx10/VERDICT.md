@@ -11,7 +11,7 @@ baseline → vLLM-only.
 | Knowledge (~370q, 3-judge Opus-4.8) | **93.11% raw** / **~96.6% loop-excluded** | one run lost chunk3 entirely to a reasoning loop (see below) |
 | Loop | **not measured** ⁿ | the 24-gen run produced only zero-byte responses; the real loop evidence is the knowledge-eval chunk zeroed by an infinite reasoning loop (T18) |
 | Speed | **~26.7 tok/s** | fast — MoE 3B-active |
-| Agentic (30 tasks, real tool use) | **70.0%** (210/300, 23/30 verified) | 23 PASS / 7 FAIL — see serving note below |
+| Agentic (30 tasks, real tool use) | **70.0%** ᵃ (210/300, 23/30 verified) | 23 PASS / 7 FAIL — see serving note below |
 
 ## Coding chunks (the owner's languages)
 Strong where it matters: **.NET/Python ~99%**, **Go/Rust ~95%**, **JS/Bash/PowerShell ~95%**,
@@ -55,3 +55,5 @@ are zero-byte (the two LD12 spiral flags are artifacts of an empty file missing 
 phrase). See that directory's `RUN-FAILED.md`. **The loop-spiral conclusion above still stands**,
 because it rests on independent evidence: an entire 40-question knowledge chunk really was lost
 to an infinite reasoning loop, which is what separates 93.11% raw from ~96.6% loop-excluded.
+
+**ᵃ AG27 never reached the model.** It is recorded as `setup_failed` in this run but still contributes 0/10 to the 70.0% total and is counted among the 30 tasks. Excluding it, the score is **72.4% (210/290)**. The raw figure is kept as the headline so it stays comparable with the other 30-task runs.

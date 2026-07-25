@@ -10,7 +10,7 @@ BF16, 32k ctx. No llama.cpp baseline (not a fleet model) → vLLM-only.
 | Knowledge (~370q, 3-judge Opus-4.8) | **96.80%** (spread 1.62pp) | competitive with the Gemma/Qwen band |
 | Loop | **not measured** | the 24-gen run produced only zero-byte responses — withdrawn, see below |
 | Speed | **~20 tok/s** | FAST — MoE 3B-active; unlike the dense ~3 tok/s models |
-| Agentic (30 tasks, real tool use) | **65.0%** (195/300, 27/30 verified) | served with `--tool-call-parser glm47 --reasoning-parser glm47` — tool-calling works |
+| Agentic (30 tasks, real tool use) | **65.0%** ᵃ (195/300, 27/30 verified) | served with `--tool-call-parser glm47 --reasoning-parser glm47` — tool-calling works |
 
 ## Why it matters
 This is the proof that **the 0.23 "only Gemma/Qwen" wall was a vLLM-version limit, not a
@@ -37,3 +37,5 @@ The two LD12 entries marked `is_spiral` are scoring artifacts of an empty file m
 terminal phrase. GLM-4.7-Flash's loop behaviour is simply **unknown** — it has neither been shown
 to spiral nor shown to resist. See that directory's `RUN-FAILED.md`; re-running needs the model
 re-downloaded (purged from the GX10 at campaign close).
+
+**ᵃ AG27 never reached the model.** It is recorded as `setup_failed` in this run but still contributes 0/10 to the 65.0% total and is counted among the 30 tasks. Excluding it, the score is **67.2% (195/290)**. The raw figure is kept as the headline so it stays comparable with the other 30-task runs.
