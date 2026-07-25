@@ -2,21 +2,6 @@
 
 Goal: documented, validated vLLM settings per model so each works in **reasoning** mode AND **agentic** (tool-calling) mode. Box: `lars@192.168.2.173`, GB10 compute_cap **12.1 (sm_121)**, 121 GB unified mem, CUDA 13 driver. One model served at a time on `:8000`. This is the GX10 vLLM playground (not in the LiteLLM production fleet — that runs llama.cpp; see `../homelab/ansible/inventory/model_profiles/` for fleet configs).
 
-## Managed serving (2026-07-08) — systemd + vLLM 0.24
-
-The GX10 now runs a **managed, restart-on-boot** vLLM service instead of ad-hoc `docker run`.
-Files codified in [`gx10-serving/`](gx10-serving/) (deployed copies live at
-`/usr/local/bin/gx10-vllm-serve` and `/etc/systemd/system/vllm-gx10.service` on the box):
-
-- **Image: `vllm/vllm-openai:v0.24.0-aarch64-cu129-ubuntu2404`** — 0.24 is required for the
-  MoE arches (GLM-4.7-Flash `Glm4MoeLite`, Cohere `cohere2_moe`) that 0.23 refused to init.
-- **Swap the served model:** `gx10-vllm-serve <key>` where key ∈ `glm | cohere | gemma-26b | qwen-27b`.
-  It rewrites `/etc/gx10-vllm.model`, frees memory (rm + drop_caches + wait — avoids the UMA
-  load-OOM race), then starts the container. `systemctl restart vllm-gx10` re-serves the saved key.
-- **Default = `glm`** (GLM-4.7-Flash, ~96.8% knowledge, ~20 tok/s). `cohere` = North-Mini-Code
-  coding model (~27 tok/s, watch loop-spirals).
-- One model at a time (121 GB UMA). The big NVFP4 119B (Mistral Small 4) still OOMs on load
-  even on 0.24 — not in the managed set. See `../DASHBOARD.md` for the full campaign verdict.
 ## Hard-won general rules
 - **sm_121 needs a kernel-compatible image.** Plain pip wheels cap at sm_120 → `no kernel image available`. Use vLLM's container images. The standard `v0.23.0-aarch64-cu129` image DOES run on GB10 despite being cu129 (the cu130 requirement was overstated for that tag).
 - **vLLM publishes MODEL-SPECIFIC images** (Docker Hub `vllm/vllm-openai`): `qwen3_5-*`, `gemma-*`, `gemma4-unified-*`, `minimax-m3-*`, `glm52-*`, etc. — day-0 builds with that model's arch+parsers. Try these when a model is new/unsupported in mainline.
@@ -78,6 +63,31 @@ sudo docker run -d --name vllm --ipc=host --gpus all --restart unless-stopped \
 ```
 Per-size (same config + own model dir): **E4B** ~19.8 tok/s; **26B-A4B** ~14.3 tok/s (thinking verbose → give generous `max_tokens`); **31B** ~3.9 tok/s (dense, bandwidth-bound). All: reasoning separated + tools verified.
 
+## ✅ Gemma 4 26B-A4B **FP8-dynamic** (vLLM **0.26.0**) — DEPLOYED default 2026-07-17, engine bumped 2026-07-25 — 1.6× decode, quality-neutral
+`RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic` (W8A8, ~27GB) on `vllm/vllm-openai:v0.26.0-aarch64-cu129-ubuntu2404`.
+
+**0.26.0 bump (2026-07-25) — config 1:1 compatible, perf-neutral.** Verified on the box: `VLLM_TEST_FORCE_FP8_MARLIN` gate and `--kernel-config` schema are byte-identical to 0.25.1 (same file/line in `kernels/linear/scaled_mm/marlin.py:49` + `fused_moe/oracle/fp8.py:374`); log confirms `Selected MarlinFP8ScaledMMLinearKernel` + `Using MARLIN Fp8 MoE backend`. Decode 600 tok single-stream: **14.7–15.7 s (≈40 tok/s) on 0.26 vs 14.8–15.5 s on 0.25.1 = no change.** Attention still `TRITON_ATTN` (FA4 remains gated to SM100; GB10 is 12.1). KV cache 2.68M tokens. Tool-calls ✅, `message.reasoning` ✅ (3.3k chars with `chat_template_kwargs:{enable_thinking:true}`), LiteLLM route `gemma4-26b-gx10` ✅. Rollback = flip `IMG` back (0.25.1 image kept on the box). Nothing in 0.26 targets this config — the release's Blackwell work is SM100/GB300, and **DSpark spec-decode is Gemma4-**12B**-dense only** (`deepseek-ai/dspark_gemma4_12b_block7`, PR #47216), no 26B-A4B MoE draft. 0.26 also adds a first-class `--linear-backend marlin` flag as an alternative to the `--kernel-config` JSON blob (avoids the no-spaces quoting gotcha).
+Decode **~37.5 tok/s** (bf16 ~23); KV cache 3.07M tokens. **Agentic 86.7% (260/300, 26/30 verified) = tie with bf16** (88.7% baseline / 86.0% on-0.25.1-isolation) — quantization cost ≈ 0 on the axis where NVFP4 lost 16pt.
+
+**sm_121 gotcha — TWO knobs both required** (GB10 has no native FP8 tensor cores → auto CUTLASS W8A8 crashes `cutlass_gemm_caller … Error Internal`):
+- env `VLLM_TEST_FORCE_FP8_MARLIN=1` **and** `--kernel-config '{"linear_backend":"marlin"}'`
+- Marlin does weight-only in-kernel dequant to bf16; the env is needed because vLLM gates FP8-Marlin behind it on "high-capability" GPUs (assumes cutlass works — it doesn't on GB10).
+
+## ❌ Gemma 4 26B-A4B **NVFP4** (vLLM 0.25.1) — REJECTED 2026-07-16 — 2.3× decode but −16pt agentic
+`RedHatAI/gemma-4-26B-A4B-it-NVFP4` (compressed-tensors, 16.4GB vs 49GB bf16) on
+`vllm/vllm-openai:v0.25.1-aarch64-cu129-ubuntu2404`. Decode **~53 tok/s** (bf16: ~23);
+KV cache 3.5M tokens (26.8× @131K). **0.25.1 minimum** — the patch fixes an NVFP4 +
+Gemma-style-FP32-RMSNorm fusion bug that produces garbage output on earlier versions.
+
+**sm_121 backend maze (GB10 has NO native FP4 tensor cores) — the load-bearing flag:**
+`--kernel-config '{"moe_backend":"marlin","linear_backend":"marlin"}'`
+- auto → `FLASHINFER_CUTLASS` → crash `no kernel image is available` on sm_121
+- `flashinfer_b12x` (the "DGX Spark backend"): no NVFP4-linear kernel, and its MoE rejects Gemma's `GELU_TANH`
+- **`marlin` = only working path**: weight-only in-kernel dequant to bf16 (W4A16-style) — keeps the full 4× bandwidth win, which is all that matters at ~273GB/s
+- FA4 remains impossible on GB10 (vllm-flash-attn gates FA4 to CC==10; GB10 is 12.1) → TRITON_ATTN stays
+
+**Quality — REJECTED:** own agentic eval **72.7% (218/300, 21/30 verified) = −16pt vs bf16** (88.7% baseline, 86.0% on-0.25.1-isolation-proof the engine is innocent). Failure modes: premature TASK_COMPLETE after 2-4 steps + step-budget-burning loops; tool-call mechanics fine, it's judgment that degrades. Matches RedHatAI's own BFCLv4-Agentic 80.9% recovery, amplified in our harness. **Lesson: FP4 on a 4B-active MoE costs agentic judgment — little redundancy to quantize away; knowledge/IF evals hide it, always run the agentic harness.** Kept as a documented dead-end; FP8-dynamic is the deployed choice.
+
 ---
 
 ## 🟡 Qwen3.5-122B-A10B (MoE) — GPTQ-Int4 only on this box
@@ -88,3 +98,41 @@ Per-size (same config + own model dir): **E4B** ~19.8 tok/s; **26B-A4B** ~14.3 t
 
 ## ⬜ Gemma diffusion (`google/diffusiongemma-26B-A4B-it`) — TODO (expected vLLM LIMIT)
 Text-diffusion model (iterative denoising, NOT autoregressive). vLLM's engine (PagedAttention, continuous batching, AR decode) does not serve diffusion LLMs. EXPECT vLLM to reject the arch. This is the deliberate "what vLLM can't do" data point — confirm the failure mode, then note it needs a diffusion-specific runtime. Don't force it.
+
+---
+
+## 🟢 GLM-4.7-Flash & Cohere North-Mini-Code (vLLM 0.24) — parsers for agentic mode
+Both are 30B-A3B MoE reasoning models, **blocked on 0.23** (arch), unblocked on
+`vllm/vllm-openai:v0.24.0-aarch64-cu129-ubuntu2404`. Full evals: knowledge/loop/agentic all done.
+
+| Model | Reasoning + tool parser | Image | Agentic (30 tasks) |
+|---|---|---|---|
+| **GLM-4.7-Flash** | `--reasoning-parser glm47 --enable-auto-tool-choice --tool-call-parser glm47` | stock 0.24 | **65.0%** (195/300) |
+| **North-Mini-Code** | `--reasoning-parser cohere_command4 --enable-auto-tool-choice --tool-call-parser cohere_command4` | **`vllm-gx10:0.24-cohere`** ¹ | **70.0%** (210/300) |
+
+**¹ Cohere needs an extra package.** vLLM 0.24's two parser layers differ: `cohere_command3`/
+`cohere_command4` appear in the tool-parser registry list, but they **lazy-import `cohere_melody`**
+which isn't in the stock image → `--enable-auto-tool-choice` crashes engine init with
+`tool_parser:'cohere_command4' which has not been registered`. `cohere_melody` has a
+`cp312 manylinux aarch64` wheel, so bake it in (see `gx10-serving/Dockerfile.cohere`). `glm47`
+needs no extra package. **Diagnostic:** force the lazy load to see the real cause —
+`python3 -c "from vllm.tool_parsers import ToolParserManager as T; T.get_tool_parser('cohere_command4')"`.
+
+## Managed serving (systemd, restart-on-boot)
+The GX10 runs one model at a time via `vllm-gx10.service` (oneshot + `RemainAfterExit`) →
+`/usr/local/bin/gx10-vllm-serve <key>`. Both the script and unit are tracked in `gx10-serving/`.
+
+**2026-07-25 — boot default is HARDCODED:** the unit runs `ExecStart=/usr/local/bin/gx10-vllm-serve gemma-26b`,
+so boot and `systemctl restart` always land on FP8-dynamic. `/etc/gx10-vllm.model` now only *records*
+the last manual invocation — it is no longer consulted at boot. **Why:** a Saga session switched the key
+to `gemma-26b-bf16` for a test and left it persisted; every later restart then silently served the bf16
+rollback at **24 tok/s instead of 41 tok/s** — no error, just 40 % slower, and nothing surfaced it.
+To deviate, run `sudo gx10-vllm-serve gemma-26b-bf16` directly; the next restart/reboot returns to FP8.
+Verify after any restart: `cat /etc/gx10-vllm.model` + `docker inspect vllm --format '{{range .Mounts}}{{.Source}}{{end}}'`.
+
+**Keys:** `gemma-26b` (boot default — FP8-dynamic + `VLLM_TEST_FORCE_FP8_MARLIN=1` + marlin
+kernel-config) and `gemma-26b-bf16` (rollback). The old `glm|cohere|qwen-27b` keys were removed
+when the model zoo was purged from disk (evals complete; verdicts in DASHBOARD.md). The
+`Dockerfile.cohere` derived image was also deleted from the box — rebuild from
+`gx10-serving/Dockerfile.cohere` if ever needed.
+Swap model (temporary, until next restart): `sudo gx10-vllm-serve gemma-26b-bf16`.

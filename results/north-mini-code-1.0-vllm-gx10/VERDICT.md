@@ -9,9 +9,9 @@ baseline → vLLM-only.
 | Dimension | North-Mini-Code (BF16, vLLM 0.24) | Notes |
 |---|---|---|
 | Knowledge (~370q, 3-judge Opus-4.8) | **93.11% raw** / **~96.6% loop-excluded** | one run lost chunk3 entirely to a reasoning loop (see below) |
-| Loop (24 gens) | **2 spirals** ⚠️ | + a knowledge-eval chunk was zeroed by an infinite reasoning loop (T18) |
+| Loop | **not measured** ⁿ | the 24-gen run produced only zero-byte responses; the real loop evidence is the knowledge-eval chunk zeroed by an infinite reasoning loop (T18) |
 | Speed | **~26.7 tok/s** | fast — MoE 3B-active |
-| Agentic | not run | fast enough; deferred |
+| Agentic (30 tasks, real tool use) | **70.0%** ᵃ (210/300, 23/30 verified) | 23 PASS / 7 FAIL — see serving note below |
 
 ## Coding chunks (the owner's languages)
 Strong where it matters: **.NET/Python ~99%**, **Go/Rust ~95%**, **JS/Bash/PowerShell ~95%**,
@@ -19,7 +19,7 @@ Strong where it matters: **.NET/Python ~99%**, **Go/Rust ~95%**, **JS/Bash/Power
 
 ## The caveat: reasoning-loop spirals
 North-Mini-Code is a reasoning model and **spirals into infinite reasoning** on a non-trivial
-fraction of prompts: 2/24 loop-detection gens flagged, and **1 of 3 knowledge runs lost an
+fraction of prompts: **1 of 3 knowledge runs lost an
 entire 40-question chunk** (chunk3, stuck on one question, emitted no final answers → 0). For a
 model meant to run **unattended as a coding subagent**, that's a real reliability risk — a
 spiral burns tokens/time and produces nothing. Interactive use is fine (you see it and stop it).
@@ -28,6 +28,32 @@ spiral burns tokens/time and produces nothing. Interactive use is fine (you see 
 **Unblocked by 0.24 and genuinely strong + fast at coding** — a legitimate local coding model.
 BUT the loop-spiral tendency means: use it interactively / with a hard step+token budget and a
 loop-detector in the agent harness; do **not** turn it loose fully unattended without those
-guards. Run the agentic suite next to quantify the coding-agent profile under real tool use.
+guards. Agentic came in at **70.0%** (210/300, 23/30 verified) under real tool use — the highest
+of the two GX10 0.24 MoE models (GLM-4.7-Flash 65%), consistent with its coding-agent niche,
+though still below the fleet's Qwen3.6-35B (89%).
 
-Knowledge detail: `KNOWLEDGE-SUMMARY.md`. Loop: `../../loop-detection/results/north-mini-code/` (24 gens, 2 spirals).
+## Serving note (tool-calling requires an extra package)
+Cohere's tool-call parsers (`cohere_command3` / `cohere_command4`) are **not usable in the stock
+`vllm/vllm-openai:v0.24.0-aarch64-cu129-ubuntu2404` image** — they lazy-import the `cohere_melody`
+package, which isn't installed → `--enable-auto-tool-choice` crashes engine init with
+`tool_parser:'cohere_command4' which has not been registered`. Fix: bake `cohere_melody` (has a
+`cp312 manylinux aarch64` wheel) into a derived image and serve from it:
+
+```dockerfile
+FROM vllm/vllm-openai:v0.24.0-aarch64-cu129-ubuntu2404
+RUN pip install --no-cache-dir cohere_melody
+```
+→ `vllm-gx10:0.24-cohere`, then serve with
+`--reasoning-parser cohere_command4 --enable-auto-tool-choice --tool-call-parser cohere_command4`.
+(GLM-4.7-Flash's `glm47` parser needs no extra package — it works on the stock image.)
+
+Knowledge detail: `KNOWLEDGE-SUMMARY.md`.
+
+**ⁿ Loop-detection run withdrawn (2026-07-25).** The "2/24 spirals" figure this verdict used to
+cite was not a measurement — all 24 generations in `../../loop-detection/results/north-mini-code/`
+are zero-byte (the two LD12 spiral flags are artifacts of an empty file missing its terminal
+phrase). See that directory's `RUN-FAILED.md`. **The loop-spiral conclusion above still stands**,
+because it rests on independent evidence: an entire 40-question knowledge chunk really was lost
+to an infinite reasoning loop, which is what separates 93.11% raw from ~96.6% loop-excluded.
+
+**ᵃ AG27 never reached the model.** It is recorded as `setup_failed` in this run but still contributes 0/10 to the 70.0% total and is counted among the 30 tasks. Excluding it, the score is **72.4% (210/290)**. The raw figure is kept as the headline so it stays comparable with the other 30-task runs.

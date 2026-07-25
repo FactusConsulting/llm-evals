@@ -17,7 +17,7 @@ chunk3 = 93.8/92.5%). Per-chunk otherwise: .NET/Py ~99, arch 100, Go/Rust ~95, J
 Tofu/Ansible ~93, scenarios ~94. Coding-strong.
 
 ## Notes
-- **~26.7 tok/s** (MoE 3B-active) — fast. Loop-spiral tendency (2/24 loop gens + the run2 chunk
+- **~26.7 tok/s** (MoE 3B-active) — fast. Loop-spiral tendency (the run2 chunk
   loss) is the real caveat — see VERDICT.md.
 - No llama.cpp baseline → vLLM-only. Story = the **0.23→0.24 unblock**.
 

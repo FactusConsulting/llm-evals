@@ -1,21 +1,31 @@
 #!/usr/bin/env bash
-# Managed vLLM serving on the GX10 (DGX Spark, sm_121) using the 0.24 image.
+# Managed vLLM serving on the GX10 (DGX Spark, sm_121).
 # Installed at /usr/local/bin/gx10-vllm-serve on lars@192.168.2.173.
 # Usage: gx10-vllm-serve <model-key>   (default: reads /etc/gx10-vllm.model)
-# Swap model: `gx10-vllm-serve cohere` (rewrites /etc/gx10-vllm.model + restarts container).
+# 2026-07-25: image bumped 0.25.1 -> 0.26.0 (config 1:1 compatible — same marlin env +
+#   --kernel-config; decode unchanged ~40 tok/s; tools + reasoning re-verified). Rollback =
+#   flip IMG back to v0.25.1-aarch64-cu129-ubuntu2404 (image kept on the box).
+# 2026-07-17: default = gemma-26b (FP8-dynamic, 37.5 tok/s, agentic 86.7% =
+#   quality-tie w/ bf16 88.7%). NVFP4 was tested and REJECTED (agentic 72.7%, -16pt on a
+#   4B-active MoE — FP4 costs judgment). Quant ladder verdict in llm-evals DASHBOARD.md.
+#   sm_121 GB10 kernel gotchas (no native FP4/FP8 tensor cores → cutlass "Error Internal"):
+#     FP8: needs env VLLM_TEST_FORCE_FP8_MARLIN=1 + --kernel-config linear_backend=marlin
+#          (auto CUTLASS W8A8 crashes; marlin is gated behind the env on "high-cap" GPUs).
+#     NVFP4 (if ever revived): --kernel-config moe+linear=marlin (cutlass/b12x both fail).
 set -uo pipefail
-IMG=vllm/vllm-openai:v0.24.0-aarch64-cu129-ubuntu2404
-MODEL_KEY="${1:-$(cat /etc/gx10-vllm.model 2>/dev/null || echo glm)}"
-COMMON="--ipc=host --gpus all --restart unless-stopped -p 8000:8000 -e HF_HUB_OFFLINE=1 -e OTEL_SERVICE_NAME=vllm-gx10"
+IMG=vllm/vllm-openai:v0.26.0-aarch64-cu129-ubuntu2404
+MODEL_KEY="${1:-$(cat /etc/gx10-vllm.model 2>/dev/null || echo gemma-26b)}"
+COMMON="--ipc=host --gpus all --restart unless-stopped -p 8000:8000 -e HF_HUB_OFFLINE=1 -e OTEL_SERVICE_NAME=vllm-gx10 -e VLLM_ENABLE_CUDA_COMPATIBILITY=0"
 OTLP="--otlp-traces-endpoint http://192.168.2.58:4317"
+GEMMA_ARGS="--served-model-name gemma4-26b --dtype bfloat16 --gpu-memory-utilization 0.85 --max-model-len 131072 --max-num-seqs 4 --reasoning-parser gemma4 --enable-auto-tool-choice --tool-call-parser gemma4 --enable-prefix-caching --trust-remote-code"
+EXTRA_ENV=""
+KERNEL_CONFIG=""
 case "$MODEL_KEY" in
-  glm)       VOL=/home/lars/models/GLM-4.7-Flash;        ARGS="--served-model-name glm-4.7-flash --dtype bfloat16 --gpu-memory-utilization 0.85 --max-model-len 32768 --max-num-seqs 4 --enable-prefix-caching --trust-remote-code" ;;
-  cohere)    VOL=/home/lars/models/North-Mini-Code-1.0;  ARGS="--served-model-name north-mini-code --dtype bfloat16 --gpu-memory-utilization 0.85 --max-model-len 32768 --max-num-seqs 4 --enable-prefix-caching --trust-remote-code" ;;
-  gemma-26b) VOL=/home/lars/models/gemma-4-26B-A4B-it;   ARGS="--served-model-name gemma4-26b --dtype bfloat16 --gpu-memory-utilization 0.85 --max-model-len 131072 --max-num-seqs 4 --reasoning-parser gemma4 --enable-auto-tool-choice --tool-call-parser gemma4 --enable-prefix-caching --trust-remote-code" ;;
-  qwen-27b)  VOL=/home/lars/models/Qwen3.6-27B-hf;       ARGS="--served-model-name qwen3.6-27b --dtype bfloat16 --gpu-memory-utilization 0.85 --max-model-len 131072 --max-num-seqs 4 --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_xml --enable-prefix-caching --trust-remote-code" ;;
-  *) echo "unknown model key: $MODEL_KEY (glm|cohere|gemma-26b|qwen-27b)"; exit 2 ;;
+  gemma-26b)      VOL=/home/lars/models/gemma-4-26B-A4B-it-FP8-dynamic; ARGS="$GEMMA_ARGS"; EXTRA_ENV="-e VLLM_TEST_FORCE_FP8_MARLIN=1"; KERNEL_CONFIG='--kernel-config {"linear_backend":"marlin"}' ;;
+  gemma-26b-bf16) VOL=/home/lars/models/gemma-4-26B-A4B-it; ARGS="$GEMMA_ARGS" ;;
+  *) echo "unknown model key: $MODEL_KEY (gemma-26b|gemma-26b-bf16)"; exit 2 ;;
 esac
-echo "[gx10-vllm-serve] serving '$MODEL_KEY' from $VOL"
+echo "[gx10-vllm-serve] serving '$MODEL_KEY' from $VOL (image $IMG)"
 sudo docker rm -f vllm >/dev/null 2>&1; sleep 5; sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null; sleep 25
 echo "$MODEL_KEY" | sudo tee /etc/gx10-vllm.model >/dev/null
-exec sudo docker run -d --name vllm $COMMON -v "$VOL":/model:ro $IMG /model $ARGS $OTLP
+exec sudo docker run -d --name vllm $COMMON $EXTRA_ENV -v "$VOL":/model:ro $IMG /model $ARGS $KERNEL_CONFIG $OTLP
