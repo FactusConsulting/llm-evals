@@ -9,7 +9,7 @@ Addresses two weaknesses of the chat-completion stories.yaml corpus:
    passes before finishing — the exact step it skipped in the broken production PRs.
 
 Run via the agentic harness (real shell on the exec-host):
-  cd ../../agentic && ln -sf ../narrow-delivery/exec-tasks/NDE*.yaml tasks/ && \
+  cd ../../agentic && ln -sfr ../narrow-delivery/exec-tasks/NDE*.yaml tasks/ && \
   python3 harness.py --model-url <url> --model-name <m> --api-key <k> \
     --exec-host ubuntu@192.168.2.175 --task NDE2-kfix
 

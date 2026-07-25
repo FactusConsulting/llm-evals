@@ -57,13 +57,13 @@ arch-blocked on 0.23). Full profile now complete for each:
 
 | Model | Active | Knowledge | Loop | Agentic | tok/s | Tool parser |
 |---|---|---|---|---|---|---|
-| **GLM-4.7-Flash** | 3B / 31B | 96.80% | 2/24 ⚠️ | **65.0%** (195/300) | ~20 | `glm47` (stock image) |
-| **North-Mini-Code** | 3B / 30B | ~96.6%* | 2/24 ⚠️ | **70.0%** (210/300) | ~27 | `cohere_command4` (needs `cohere_melody`) |
+| **GLM-4.7-Flash** | 3B / 31B | 96.80% | not measured ⁿ | **65.0%** (195/300) | ~20 | `glm47` (stock image) |
+| **North-Mini-Code** | 3B / 30B | ~96.6%* | not measured ⁿ | **70.0%** (210/300) | ~27 | `cohere_command4` (needs `cohere_melody`) |
 
 *Cohere raw 93.11%; one run lost a chunk to a reasoning-loop → loop-excluded ~96.6%.
 
 **Neither beats the fleet.** Both are knowledge-competitive but land **below Qwen3.6-35B on
-agentic** (65/70 vs 87) and both carry a loop-spiral tendency (2/24) that the fleet Qwen and
+agentic** (65/70 vs 87); North-Mini-Code additionally carries a loop-spiral tendency ⁿ that the fleet Qwen and
 Gemma models don't. They're solid, fast, tool-capable local models — but not a fleet upgrade.
 Value delivered: vLLM-0.24 serving know-how + the parser/`cohere_melody` gotchas, now codified
 in `configs/gx10-serving/`.
@@ -78,3 +78,9 @@ models + GLM-4.7-Flash + North-Mini-Code (MoE, fast) and the dense/slow/memory-w
 Qwen3.6-35B-A3B for the fleet's agentic workload. The best fast model to *run on the GX10
 itself* is **Gemma 4 26B-A4B BF16** (98.24% knowledge / 88.7% agentic / 0 loops) — a distinct
 family from the fleet — now hooked up as the GX10's managed default.
+
+**ⁿ Loop figures withdrawn (2026-07-25).** GLM-4.7-Flash and North-Mini-Code previously showed
+"2/24 ⚠️" here. That run produced only zero-byte generations, so it measured nothing — see
+`../loop-detection/results/{glm-4.7-flash,north-mini-code}/RUN-FAILED.md`. North-Mini-Code's
+loop-spiral caveat survives on independent evidence (a knowledge chunk lost to an infinite
+reasoning loop); GLM-4.7-Flash's loop behaviour is unknown.

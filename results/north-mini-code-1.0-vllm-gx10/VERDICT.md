@@ -9,7 +9,7 @@ baseline → vLLM-only.
 | Dimension | North-Mini-Code (BF16, vLLM 0.24) | Notes |
 |---|---|---|
 | Knowledge (~370q, 3-judge Opus-4.8) | **93.11% raw** / **~96.6% loop-excluded** | one run lost chunk3 entirely to a reasoning loop (see below) |
-| Loop (24 gens) | **2 spirals** ⚠️ | + a knowledge-eval chunk was zeroed by an infinite reasoning loop (T18) |
+| Loop | **not measured** ⁿ | the 24-gen run produced only zero-byte responses; the real loop evidence is the knowledge-eval chunk zeroed by an infinite reasoning loop (T18) |
 | Speed | **~26.7 tok/s** | fast — MoE 3B-active |
 | Agentic (30 tasks, real tool use) | **70.0%** (210/300, 23/30 verified) | 23 PASS / 7 FAIL — see serving note below |
 
@@ -19,7 +19,7 @@ Strong where it matters: **.NET/Python ~99%**, **Go/Rust ~95%**, **JS/Bash/Power
 
 ## The caveat: reasoning-loop spirals
 North-Mini-Code is a reasoning model and **spirals into infinite reasoning** on a non-trivial
-fraction of prompts: 2/24 loop-detection gens flagged, and **1 of 3 knowledge runs lost an
+fraction of prompts: **1 of 3 knowledge runs lost an
 entire 40-question chunk** (chunk3, stuck on one question, emitted no final answers → 0). For a
 model meant to run **unattended as a coding subagent**, that's a real reliability risk — a
 spiral burns tokens/time and produces nothing. Interactive use is fine (you see it and stop it).
@@ -47,4 +47,11 @@ RUN pip install --no-cache-dir cohere_melody
 `--reasoning-parser cohere_command4 --enable-auto-tool-choice --tool-call-parser cohere_command4`.
 (GLM-4.7-Flash's `glm47` parser needs no extra package — it works on the stock image.)
 
-Knowledge detail: `KNOWLEDGE-SUMMARY.md`. Loop: `../../loop-detection/results/north-mini-code/` (24 gens, 2 spirals).
+Knowledge detail: `KNOWLEDGE-SUMMARY.md`.
+
+**ⁿ Loop-detection run withdrawn (2026-07-25).** The "2/24 spirals" figure this verdict used to
+cite was not a measurement — all 24 generations in `../../loop-detection/results/north-mini-code/`
+are zero-byte (the two LD12 spiral flags are artifacts of an empty file missing its terminal
+phrase). See that directory's `RUN-FAILED.md`. **The loop-spiral conclusion above still stands**,
+because it rests on independent evidence: an entire 40-question knowledge chunk really was lost
+to an infinite reasoning loop, which is what separates 93.11% raw from ~96.6% loop-excluded.

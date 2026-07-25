@@ -7,6 +7,9 @@ limmem=$(echo "$out" | awk '/limits:/{f=1} /requests:/{f=0} f' | grep -oE 'memor
 # trap = memory LIMIT of 2Gi (a 2Gi request is fine)
 limlow=$(echo "$out" | awk '/limits:/{f=1} /requests:/{f=0} f' | grep -oE 'memory:\s*"?2Gi')
 [ -n "$limlow" ] && trap_hit=1
-echo "$out" | grep -qE 'ephemeral-storage' && [ "$ob" = 1 ] && ver=1
+# ephemeral-storage must be a LIMIT too — matching it anywhere accepted an answer that
+# only set an ephemeral-storage *request*, which the story explicitly does not ask for.
+limeph=$(echo "$out" | awk '/limits:/{f=1} /requests:/{f=0} f' | grep -cE 'ephemeral-storage')
+[ "$limeph" -gt 0 ] && [ "$ob" = 1 ] && ver=1
 echo "obedience=$ob trap_avoidance=$((1-trap_hit)) verification=$ver"
 [ "$ob" = 1 ] && [ "$trap_hit" = 0 ] && [ "$ver" = 1 ]
