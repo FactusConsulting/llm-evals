@@ -1,0 +1,360 @@
+
+**DN1** – Easy  
+*Class* is a reference type allocated on the heap; instances are accessed via references and support inheritance, polymorphism, and can be `null`. *Struct* is a value type allocated inline (on the stack or inside containing objects); it is copied on assignment, cannot inherit from another struct (but can implement interfaces), and cannot be `null` unless made nullable (`struct?`). Use a struct when the type is small (< ~16 bytes), immutable, and frequently created/destroyed (e.g., points, colors, numeric wrappers) to avoid heap allocation pressure. Avoid structs for large data, when you need reference semantics, or when you anticipate inheritance.
+
+**DN2** – Easy  
+`IEnumerable<T>` represents a forward‑only sequence whose evaluation logic is unknown; LINQ operators execute in‑process using `IEnumerable<T>` extension methods. `IQueryable<T>` extends `IEnumerable<T>` and carries an expression tree (`IQueryProvider`) that can be translated to another query language (e.g., SQL). For ORMs like EF Core, the provider translates the expression tree to SQL, letting the database do filtering, projection, and joins. Using `IEnumerable<T>` after a query forces the provider to materialize all rows first, then apply LINQ in memory, which can be disastrous for large tables.
+
+**DN3** – Medium  
+`async/await` is syntactic sugar for a state machine that rewrites the method into a continuation‑passing style. When you `await` a `Task`, the compiler captures the rest of the method as a continuation, yields control back to the caller, and resumes when the awaited task completes.  
+- `Task` is a reference type representing a pending operation; allocating it incurs a heap allocation.  
+- `ValueTask<T>` (or `ValueTask`) is a struct that can represent either a completed result (no allocation) or a reference to a `Task`. It is useful when the operation often completes synchronously (e.g., caching, fast I/O) to avoid unnecessary allocations. Use `ValueTask` when profiling shows allocation overhead from `Task` and the API can guarantee it won’t be awaited multiple times (otherwise you risk double‑consumption).
+
+**DN4** – Medium  
+Dependency Injection (DI) in .NET registers services with an `IServiceProvider`. Three lifetimes:  
+- **Transient** – new instance each time it’s requested.  
+- **Scoped** – one instance per logical scope (e.g., per HTTP request).  
+- **Singleton** – single instance for the lifetime of the application.  
+A common bug: injecting a `Scoped` service (e.g., `DbContext`) into a `Singleton` (or transient that lives longer than a scope). The singleton receives the scoped instance from the first resolution and reuses it across scopes, leading to disposed‑object errors or data leakage. Fix: make the consumer scoped, or use `IServiceScopeFactory` to create a child scope inside the singleton when needed.
+
+**DN5** – Medium  
+`string` is an immutable heap‑allocated reference type; each substring operation creates a new string. `ReadOnlySpan<char>` is a stack‑only view (ref struct) over contiguous memory (string, char[], stackalloc, native buffer) that avoids allocations. Use `Span<T>`/`ReadOnlySpan<char>` for high‑performance parsing, slicing, or buffering where you don’t need to store the data beyond the current method call. Because spans are ref structs, they cannot be fields of heap objects or captured by async lambdas.
+
+**DN6** – Medium  
+.NET GC is a generational, tracing collector. Objects start in **Gen 0**; after a Gen 0 collection, survivors are promoted to Gen 1, then Gen 2. Most short‑lived objects die in Gen 0, reducing pause times. Gen 2 collects infrequently (full GC). The **Large Object Heap (LOH)** holds objects ≥ 85 KB (arrays, large buffers); LOH is not compacted by default (though .NET 5+ can enable compacting).  
+`IDisposable` provides deterministic release of unmanaged resources (file handles, sockets, native memory) that the GC cannot know about. Even though the GC manages memory, you still need `Dispose`/`using` to close resources promptly; relying on finalizers is nondeterministic and can cause resource exhaustion.
+
+**DN7** – Hard  
+By default, `await` captures the current `SynchronizationContext` (or `TaskScheduler`) and resumes the continuation on that context (e.g., UI thread). `ConfigureAwait(false)` tells the awaiter not to capture the context; the continuation runs on whatever thread the completed task returns on (usually a thread‑pool thread).  
+- Use `ConfigureAwait(false)` in library code that doesn’t need to return to a UI/context, to avoid deadlocks and unnecessary context switches.  
+- Do **not** use it in ASP.NET Core controllers, Razor pages, or UI code where you need the original context (e.g., accessing `HttpContext` after an await).  
+If there is no synchronization context (e.g., console app, thread‑pool), `ConfigureAwait(false)` behaves like the default.
+
+**DN8** – Hard  
+*Primary constructors* allow constructor parameters directly in the class/record declaration, automatically generating private fields. *Collection expressions* (`[1,2,3]`) create arrays, lists, or spans with a unified syntax. *FrozenDictionary<TKey,TValue>* is an immutable, hash‑based dictionary optimized for read‑only scenarios (faster look‑ups, no allocations on read).  
+
+Minimal example with DI (ASP.NET Core minimal API):
+
+```csharp
+// Program.cs
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddSingleton<IWeatherService, WeatherService>();
+var app = builder.Build();
+
+app.MapGet("/weather", (IWeatherService svc) => svc.GetForecast());
+
+app.Run();
+
+// Service using primary constructor
+public interface IWeatherService { IEnumerable<WeatherForecast> GetForecast(); }
+
+public class WeatherService(IHttpClientFactory http) : IWeatherService   // primary constructor
+{
+    private readonly HttpClient _client = http.CreateClient();
+    public IEnumerable<WeatherForecast> GetForecast()
+    {
+        // call external API, deserialize, etc.
+        return Array.Empty<WeatherForecast>();
+    }
+}
+```
+
+**DN9** – Hard  
+Under high concurrency you see `ObjectDisposedException` on `DbContext`. Likely cause: the `DbContext` (registered as `Scoped`) is being resolved from a **singleton** or a **static** field, or the scope is disposed before all asynchronous operations finish (e.g., missing `await` on a background task). EF Core’s `DbContext` is not thread‑safe and must not be used after its scope ends.  
+
+Fix:  
+1. Register `DbContext` with `AddDbContext<…>(ServiceLifetime.Scoped)` (default).  
+2. Ensure every consumer (controllers, services, background workers) receives the context via DI **within the same scope**.  
+3. For background work, create an `IServiceScopeFactory` scope:  
+   ```csharp
+   using var scope = _scopeFactory.CreateScope();
+   var db = scope.ServiceProvider.GetRequiredService<MyDbContext>();
+   // use db, then scope disposes it
+   ```  
+4. Never store a `DbContext` in a static field or singleton.  
+5. Always `await` async EF operations; fire‑and‑forget leads to premature disposal.
+
+**DN10** – Medium  
+`record` is a reference type that provides value‑based equality, immutable properties (by default with `init` setters), and a concise `with` expression for nondestructive mutation. `class` is the traditional reference type with reference equality unless you override `Equals`. `record struct` is a value‑type record (similar to a struct but with record‑style equality and `with`).  
+
+Choose:  
+- `record` when you need reference semantics but want automatic value equality and immutability (DTOs, domain models).  
+- `class` when you need inheritance hierarchies, mutable state, or custom reference equality logic.  
+- `record struct` when you want a lightweight immutable value type with record features (e.g., geometric points) and want to avoid heap allocation.
+
+**DN11** – Easy  
+- `ref` – passes a variable by reference; the method can read and write the caller’s variable; the argument must be initialized before the call.  
+- `out` – also passes by reference, but the method must assign a value before returning; the caller may pass an uninitialized variable.  
+- `in` – passes by reference but is **read‑only** inside the method; avoids copying large value types while guaranteeing the callee won’t modify the argument.  
+Use `ref` for mutable updates, `out` for returning extra data via parameters, `in` for large structs where you only need read access.
+
+**DN12** – Easy  
+Nullable reference types (`string?`) are a compile‑time annotation; the CLR still treats them as normal references, but the compiler warns when you might dereference null. They help catch potential `NullReferenceException`s.  
+Nullable value types (`int?`) are actual struct wrappers (`Nullable<T>`) that hold a value or indicate null at runtime. They have real storage and support `HasValue`/`Value`.  
+The key difference: reference‑type nullability is a static analysis feature; value‑type nullability is a runtime type.
+
+**DN13** – Easy  
+LINQ (Language Integrated Query) provides a uniform query syntax over any `IEnumerable<T>` or `IQueryable<T>`.  
+- **Method syntax**: `list.Where(x => x > 0).Select(x => x*x)`.  
+- **Query syntax**: `from x in list where x > 0 select x*x`.  
+Both compile to the same method calls; query syntax is just syntactic sugar.  
+**Deferred execution**: the query is not executed when the LINQ expression is created; enumeration (e.g., `foreach`, `ToList()`) triggers the actual iteration. This enables composability but means side effects in the predicate happen at enumeration time.
+
+**DN14** – Easy  
+Generic constraints limit what types can substitute for a type parameter:  
+- `where T : class` – T must be a reference type.  
+- `where T : struct` – T must be a non‑nullable value type.  
+- `where T : new()` – T must have a public parameterless constructor (often used with factories).  
+- `where T : IComparable<T>` – T must implement the comparison interface, enabling sorting.  
+You can combine them, e.g., `where T : struct, IComparable<T>` for a value type that can be compared (like numeric types). Constraints guide the compiler to allow certain members (e.g., `new T()`) and prevent invalid substitutions.
+
+**DN15** – Easy  
+An **abstract class** can contain implementation (fields, methods) and may have abstract members; a class can inherit from only one base. An **interface** originally could only declare members (no state). C# 8 added **default interface methods**, allowing interfaces to provide implementation, making them more like abstract classes but still supporting multiple inheritance of interfaces.  
+Now the line blurs: use an abstract class when you want to share code and state among closely related types; use an interface (with default methods) when you need to add behavior to disparate types or want multiple inheritance. Prefer interfaces for contracts; abstract classes for shared base implementation.
+
+**DN16** – Medium  
+ASP.NET Core middleware builds a pipeline via `IApplicationBuilder`.  
+- `app.Use(next)` inserts a middleware that can process before and after the next delegate (`await next();`).  
+- `app.Map(path, branch)` creates a branch: requests matching `path` are handled by the supplied branch pipeline; non‑matches continue the main pipeline.  
+- `app.Run(terminal)` adds a terminal middleware that never calls `next`; it ends the pipeline.  
+Order matters: middleware added earlier sees the request first and can short‑circuit (e.g., authentication, static files). Exception handling middleware (`app.UseExceptionHandler` or `app.UseDeveloperExceptionPage`) should be placed **early** so it can catch exceptions from later components. It catches exceptions, logs them, and can re‑execute the pipeline to return an error response.
+
+**DN17** – Medium  
+`Channel<T>` (in `System.Threading.Channels`) is an async‑aware, producer/consumer queue with optional bounding and full async API (`WaitToReadAsync`, `WaitToWriteAsync`). Unlike `BlockingCollection<T>` (which blocks threads), channels avoid thread‑pool starvation by using `ValueTask`‑based waits.  
+
+Example bounded channel for back‑pressure:
+
+```csharp
+var channel = Channel.CreateBounded<int>(new BoundedChannelOptions(100)
+{
+    FullMode = BoundedChannelFullMode.Wait          // producers wait when full
+});
+
+// Producer
+Task.Run(async () =>
+{
+    for (int i = 0; i < 1000; i++)
+    {
+        await channel.Writer.WaitToWriteAsync();
+        channel.Writer.TryWrite(i);
+    }
+    channel.Writer.Complete();
+});
+
+// Consumer
+Task.Run(async () =>
+{
+    await foreach (var item in channel.Reader.ReadAllAsync())
+    {
+        Console.WriteLine(item);
+    }
+});
+```
+
+If the consumer lags, producers pause on `WaitToWriteAsync`, providing natural back‑pressure without busy‑spinning.
+
+**DN18** – Hard  
+Source Generators run during compilation, inspecting the `Compilation` object and emitting additional C# source files that are compiled into the assembly. Unlike reflection (runtime inspection, slower) or IL weaving (post‑compile IL modification, fragile), source generators produce plain C# that the compiler can optimize, yielding better performance and debuggability.  
+An **incremental generator** (`ISourceGenerator` implementing `IIncrementalGenerator`) uses the generator syntax‑receiver pipeline to only re‑run when relevant inputs change, drastically reducing rebuild times in large solutions. Prefer incremental generators for scalability.
+
+**DN19** – Hard  
+TPL Dataflow (`System.Threading.Tasks.Dataflow`) provides in‑process message‑passing blocks that form pipelines.  
+- `ActionBlock<T>`: executes an action for each received message (fire‑and‑forget).  
+- `TransformBlock<TInput,TOutput>`: asynchronously transforms each input to an output, buffering results.  
+- `BufferBlock<T>`: simple unbounded/bounded buffer for passing messages between blocks.  
+Blocks link via `LinkTo` with optional predicates; they propagate completion and handle back‑pressure automatically.  
+Compared to `System.Threading.Channels`, Dataflow offers richer built‑in block types (e.g., batching, broadcasting) and declarative pipeline wiring, but channels are lighter weight, have lower allocation overhead, and are the preferred primitive for simple producer/consumer scenarios. Use Dataflow when you need complex processing graphs (e.g., map‑reduce, fan‑out/fan‑in) with built‑in buffering and error propagation.
+
+**DN20** – Hard  
+Minimal APIs reduce boilerplate for small services: routes are defined directly on `WebApplication` using lambdas or method groups, without controllers, attribute routing, or separate classes.  
+Trade‑offs:  
+- **Testability**: controller classes are easy to instantiate and inject mocks; minimal API lambdas are harder to unit test unless you extract logic into separate services.  
+- **Middleware**: both support the same pipeline; minimal APIs still run through middleware, but you cannot apply controller‑specific filters (e.g., `[Authorize]`) without endpoint filters.  
+- **OpenAPI**: Swagger generation works for both; minimal APIs need explicit `[ProducesResponseType]` or `OpenApiOperationBuilder` for rich docs, whereas controllers can rely on attributes.  
+- **Route groups**: `app.MapGroup("/api/v1")` creates a prefix group; you can apply common policies or filters to the group.  
+- **Endpoint filters**: `app.MapGet(...).AddEndpointFilter<MyFilter>()` lets you inject cross‑cutting concerns (validation, logging) similar to controller filters.  
+Choose minimal APIs for microservices, prototypes, or when you want low ceremony; choose controllers for larger apps needing extensive feature sets, versioning, and familiar MVC patterns.
+
+---
+
+**P1** – Easy  
+- `list` is mutable, ordered, allows duplicates; `tuple` is immutable, ordered, fixed size, often used for heterogeneous data.  
+- `set` is mutable, unordered collection of unique hashable items; `frozenset` is its immutable counterpart (hashable, can be a set element or dict key).
+
+**P2** – Easy  
+The **Global Interpreter Lock (GIL)** ensures only one thread executes Python bytecode at a time, protecting interpreter internals. It limits CPU‑bound multithreaded performance (pure Python loops) but does not affect I/O‑bound work where threads release the GIL while waiting. Workarounds: use `multiprocessing` (separate processes, each with its own GIL), `concurrent.futures.ProcessPoolExecutor`, or C extensions/NumPy that release the GIL; alternatively, use asyncio for I/O‑bound concurrency.
+
+**P3** – Medium  
+`copy.copy()` performs a **shallow copy**: the new container holds references to the same inner objects. `copy.deepcopy()` recursively copies inner objects, producing a fully independent clone.  
+Example of shallow copy surprise:
+
+```python
+import copy
+a = [[1, 2], [3, 4]]
+b = copy.copy(a)          # shallow
+b[0][0] = 99
+print(a)   # [[99, 2], [3, 4]]  – inner list mutated!
+```
+
+**P4** – Medium  
+A decorator wraps a function, adding behavior before/after the call.
+
+```python
+import time, functools
+
+def timer(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        elapsed = time.perf_counter() - start
+        print(f"{func.__name__} took {elapsed:.4f}s")
+        return result
+    return wrapper
+
+@timer
+def compute():
+    sum(range(10_000_000))
+```
+
+**P5** – Medium  
+Generators use `yield` to produce values lazily, preserving state between calls. Returning a list builds the whole collection in memory up front. `yield from` delegates to another generator (or iterable), yielding each of its values directly.  
+Example:
+
+```python
+def gen():
+    yield 1
+    yield from [2, 3]
+    yield 4
+# produces 1,2,3,4
+```
+
+**P6** – Medium  
+`asyncio.run(coro)` creates a new event loop, runs the coroutine, and closes the loop (top‑level entry point). `asyncio.gather(*awaitables)` runs awaitables concurrently and returns a list of results in order. `asyncio.create_task(coro)` schedules a coroutine to run on the current loop and returns a `Task` object for later awaiting or cancellation.  
+Calling `time.sleep()` blocks the OS thread, which also blocks the event loop because only one coroutine runs at a time; use `await asyncio.sleep(seconds)` instead to yield control.
+
+**P7** – Hard  
+Python 3 uses **C3 linearization** for MRO. For the diamond:
+
+```
+A
+│\
+B C
+│/
+D
+```
+
+MRO of `D` is `[D, B, C, A]` (B before C because of the order in `(B, C)`). `D().who()` looks up `who` in D (none), then B (none), then C (found) → returns `"C"`.
+
+**P8** – Hard  
+A **metaclass** (`type` subclass) controls class creation (`__new__`, `__init__` of the class object). Use it when you need to alter the class itself (e.g., register classes, enforce interfaces, modify attributes) for *all* subclasses.  
+`__init_subclass__` is a simpler hook called on the *base* class whenever a subclass is defined; good for per‑family registration or setting defaults without metaclass overhead.  
+
+Practical use:  
+- Metaclass: ORM that automatically creates table definitions from class attributes (e.g., Django’s `ModelBase`).  
+- `__init_subclass__`: a plugin base that registers each subclass in a registry for discovery.
+
+**P9** – Hard  
+- `threading`: OS threads, share memory, GIL limits true parallelism; suited for I/O‑bound or when using C extensions that release the GIL.  
+- `multiprocessing`: spawns separate processes, each with its own interpreter and GIL; bypasses GIL for CPU‑bound work, but data must be pickled/unpickled for inter‑process communication (IPC).  
+- `concurrent.futures`: high‑level API (`ThreadPoolExecutor`, `ProcessPoolExecutor`) that returns `Future` objects; choose based on same criteria as threading vs multiprocessing.  
+Serialization implication: objects sent between processes must be picklable; functions, lambdas, and local references often fail unless defined at module top level or using `dill`/`cloudpickle`.
+
+**P10** – Medium  
+`__slots__` declares a fixed set of attribute names, replacing the per‑instance `__dict__` with a tuple‑like storage. It prevents accidental attribute creation (raises `AttributeError` for undefined names) and reduces memory usage (no dict, per‑instance overhead ~56 bytes saved on 64‑bit CPython). Use when you have many instances of a simple class and need memory efficiency; avoid when you need dynamic attributes or multiple inheritance with conflicting slots.
+
+**P11** – Easy  
+A **virtual environment** isolates a project’s Python interpreter and packages from the system Python, preventing version conflicts.  
+- `venv`: built‑in module (`python -m venv`) – lightweight, no external dependencies.  
+- `virtualenv`: older third‑party tool with extra features (e.g., `--always-copy`).  
+- `conda`: environment manager from Anaconda/Miniconda that also handles non‑Python packages and binary libraries; uses its own package format and solver.
+
+**P12** – Easy  
+List/dict/set comprehensions build containers in a single readable expression, e.g., `[x*2 for x in range(5)]`. They are syntactic sugar for `map` and `filter` but often clearer and faster because they avoid the function‑call overhead of `map`/`filter`. Prefer comprehensions for simple transformations; use `map`/`filter` when you already have a function and want to avoid lambda noise, or when working with lazy iterables (`map` returns an iterator).
+
+**P13** – Easy  
+`==` checks **value equality** (calls `__eq__`). `is` checks **object identity** (same memory address). Small integers (−5 to 256) and short strings are interned, so separate literals may refer to the same object, making `a is b` true coincidentally. Never rely on `is` for value comparison except with `None`.
+
+**P14** – Easy  
+`*args` collects remaining positional arguments into a tuple; `**kwargs` collects remaining keyword arguments into a dict.  
+Positional‑only parameters (`/`) appear before the `/` in the signature and cannot be passed by keyword.  
+Keyword‑only parameters (`*`) appear after a bare `*` (or after `*args`) and must be passed by keyword.  
+Example:
+
+```python
+def f(a, b, /, c, *, d, e=10):
+    pass
+# a,b positional-only; c can be either; d,e keyword-only
+```
+
+**P15** – Medium  
+A context manager defines `__enter__` (setup) and `__exit__` (teardown). The `with` statement calls them automatically, even if an exception occurs.  
+Using `@contextmanager` from `contextlib` turns a generator into a CM:
+
+```python
+from contextlib import contextmanager
+import threading
+
+@contextmanager
+def lock(lock_obj):
+    lock_obj.acquire()
+    try:
+        yield
+    finally:
+        lock_obj.release()
+
+# Usage
+my_lock = threading.Lock()
+with lock(my_lock):
+    # critical section
+```
+
+Beyond files, you can manage locks, timers, temporary directory changes, or database transactions.
+
+**P16** – Medium  
+Type hints enable static analysis.  
+- `Union[A, B]` – value can be either type.  
+- `Optional[T]` – shorthand for `Union[T, None]`.  
+- `Literal[1, "go", True]` – exact value(s).  
+- `TypeVar` – generic variable (`T = TypeVar('T')`).  
+- `Protocol` – structural subtyping (duck typing) for static checking.  
+Tools like `mypy` or `pyright` infer types, check consistency, and report violations before runtime.
+
+**P17** – Medium  
+- `__repr__` → unambiguous developer‑focused representation (ideally `eval(repr(obj)) == obj`).  
+- `__str__` → readable user‑oriented string.  
+- `__eq__` → defines equality; if you override it, you should also override `__hash__` to keep the hash‑consistent rule: objects that compare equal must have the same hash, otherwise they break set/dict semantics.  
+- `__getattr__` → called only for missing attributes (fallback).  
+- `__getattribute__` → called for *every* attribute access; use with care to avoid infinite recursion.  
+Defining `__eq__` without `__hash__` makes the object unhashable (`__hash__` set to `None`), preventing its use in sets or as dict keys.
+
+**P18** – Hard  
+The descriptor protocol consists of `__get__(self, obj, objtype)`, `__set__(self, obj, value)`, and `__delete__(self, obj)`.  
+- `property` implements a descriptor that stores getter/setter/deleter functions.  
+- `classmethod` returns a descriptor whose `__get__` binds the method to the class (`objtype`) rather than an instance.  
+- `staticmethod` returns a descriptor that ignores both `obj` and `objtype`, returning the raw function.  
+Thus, built‑in decorators are just special descriptors.
+
+**P19** – Hard  
+Python’s import system:  
+1. **Finder** locates a module (searches `sys.path` entries, built‑ins, frozen modules).  
+2. **Loader** loads the module’s code and creates a module object.  
+`sys.path` is initialized from the interpreter’s `-I` flag, `PYTHONPATH` environment variable, and the script’s directory.  
+`__init__.py` (can be empty) marks a directory as a regular package; namespace packages omit `__init__.py` and are assembled from multiple portions found on `sys.path`.  
+Relative imports use leading dots (`.module`, `..package`) and are resolved relative to the *current module’s* `__name__`; they only work inside a package. Absolute imports omit dots and are resolved from `sys.path`.  
+When a module is found, its code is executed, creating attributes in its module namespace; subsequent imports reuse the cached object in `sys.modules`.
+
+**P20** – Hard  
+`dataclasses` (stdlib) auto‑generates `__init__`, `__repr__`, `__eq__`, `__hash__`, etc., based on class annotations.  
+- `__post_init__` runs after the generated `__init__` for extra initialization.  
+- `field()` provides defaults, factories (`default_factory`), comparison/exclude flags.  
+- `frozen=True` makes instances immutable (generates `__setattr__` raising).  
+Inheritance works: fields are collected from base classes; a child can override or add fields.  
+
+`attrs` is a third‑party library with similar features but more configurability (e.g., converters, validators, slots).  
+`Pydantic` focuses on data validation, parsing, and serialization; it uses annotations (including complex types) and provides runtime coercion, rich error messages, and integration with FastAPI.  
+
+Choose:  
+- `dataclasses` for simple, lightweight data carriers with minimal dependencies.  
+- `attrs` when you need extra features (validators, converters, slots) without pulling in a heavy validation framework.  
+- `Pydantic` when you need automatic validation, serialization/deserialization (JSON, etc.), or are building APIs where input/output models must be strictly checked.
