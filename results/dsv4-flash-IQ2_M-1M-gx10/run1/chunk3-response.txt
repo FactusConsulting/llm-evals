@@ -1,0 +1,258 @@
+## OpenTofu / Terraform
+
+**T1 — Easy:** `tofu plan` performs a dry-run: it reads the state, compares it to the configuration, and shows what will be created, modified, or destroyed—without making any changes. `tofu apply` executes the changes proposed by the plan (or a saved plan file), creating/updating/destroying resources and updating the state. Plan is safe to run repeatedly; apply is the actual mutation step.
+
+**T2 — Easy:** State is OpenTofu's internal database of the resources it manages, mapping each resource to its real-world object (IDs, attributes, metadata). Remote state stores this file in a shared backend (S3, GCS, Azure Storage, etc.) instead of locally. Remote state is critical for team collaboration—multiple engineers can work on the same infrastructure without conflicting local state files—and it enables state locking, consistency, and disaster recovery.
+
+**T3 — Medium:** `count` creates a fixed number of instances from a list (indexed by number), while `for_each` iterates over a map or set, keying each instance by a meaningful identifier. `for_each` is preferred when resources have distinct keys or when you need to reference specific instances by name (e.g., `aws_instance.web["web2"]`), because it makes the state clearer, avoids index-shift problems when reordering, and supports deletion of individual items without recreating others. `count` is simpler for truly identical resources but brittle when the list changes.
+
+**T4 — Medium:** OpenTofu detects drift by comparing the state file to the actual cloud resource during `plan`. If you manually modify a VM (e.g., change its instance type in the console), `tofu plan` will show a diff: the configuration expects the original value, the state still holds the old value, but the real resource differs. OpenTofu will propose to update the resource back to the configuration (or, if the configuration changed, adopt the new value). It does not automatically reconcile—you must run `apply` to bring the resource back to the desired state. If the manual change is intentional, you can import it or update the configuration to match.
+
+**T5 — Medium:**
+```hcl
+resource "aws_instance" "web" {
+  for_each = toset(["web1", "web2", "web3"])
+  ami           = "ami-12345678"
+  instance_type = "t2.micro"
+  tags = {
+    Name = each.key
+  }
+}
+```
+This creates three EC2 instances named `web1`, `web2`, `web3`, each referenced as `aws_instance.web["web1"]`, etc.
+
+**T6 — Hard:** `terraform_remote_state` data source reads the raw state file of another root module directly from its backend, exposing all outputs (and sometimes internal attributes). It creates a hard dependency on the remote state's internal structure and requires the backend to be accessible. Output values are the cleaner, recommended alternative: the producer module exposes explicit `output` blocks, and the consumer uses `terraform_remote_state` only to fetch those outputs (or better, uses a shared data source like a database or object store). The recommended alternative is to use **output values** from the producer module (via `terraform_remote_state` or a data source) because they are versioned, documented, and decoupled from internal state. Even better, use a dedicated data source (e.g., `aws_vpc` to look up a VPC by tag) to avoid cross-module state coupling altogether.
+
+**T7 — Hard:** The issue is a dependency cycle/timing problem. The `null_resource` with a `remote-exec` provisioner runs during apply, but the `kubeconfig` output is computed *after* the provisioner completes. On the first apply, the cluster is being created, and the provisioner may run before the cluster is fully ready, or the output is evaluated before the provisioner finishes. The fix: add an explicit `depends_on` from the `null_resource` to the cluster resources (e.g., the RKE2 server module), and ensure the `remote-exec` provisioner waits for the cluster to be ready (e.g., using a `wait_for` command or a `timeout`). Also, use a `data` source (like `http` or `local_file`) that reads the kubeconfig only after the cluster is up, or make the output depend on the `null_resource` via `depends_on` in the output block.
+
+**T8 — Medium:** `tofu import` (or `terraform import`) binds an existing real-world resource to a resource address in the configuration, adding it to the state. Limitations: it requires you to know the resource ID/ARN, it only imports one resource at a time, and it doesn't automatically generate configuration—you must write the config yourself. The `import` block (introduced in Terraform 1.5/OpenTofu 1.6+) is declarative: you define `import` blocks in your configuration, and `tofu plan` generates the import operations automatically, making it repeatable and CI-friendly. It also supports generating configuration via `tofu plan -generate-config-out`.
+
+**T9 — Easy:** A `variable` (input variable) is a parameter you pass into a module or root configuration to customize behavior (e.g., `variable "instance_type" { default = "t2.micro" }`). An `output` is a value the module exposes to the caller (e.g., `output "instance_id" { value = aws_instance.web.id }`). Input variables are consumed; outputs are produced. They serve opposite purposes in the data flow.
+
+**T10 — Easy:** A provider is a plugin that translates OpenTofu's resource definitions into API calls for a specific cloud/service (e.g., `aws`, `azurerm`, `kubernetes`). If you run `tofu plan` without `tofu init` first, OpenTofu will fail with an error saying the provider plugins are not installed or the module dependencies are not initialized. `init` downloads the required providers and modules, creates the lock file, and prepares the working directory.
+
+**T11 — Easy:** `.terraform.lock.hcl` is the dependency lock file that records the exact provider and module versions (with checksums) used during `init`. It should be committed to version control to ensure that every team member and CI pipeline uses the exact same provider versions, preventing unexpected upgrades that could break infrastructure. It makes builds reproducible and auditable.
+
+**T12 — Easy:** `tofu destroy` removes all resources managed by the configuration (or a saved plan), updating state accordingly. To target a single resource, use `tofu destroy -target=resource_type.name` (e.g., `tofu destroy -target=aws_instance.web`). This destroys only that resource and its dependents, leaving others intact.
+
+**T13 — Easy:** A data source performs a read-only query to fetch information from the provider (e.g., `data "aws_ami" "ubuntu" { most_recent = true }`). You use it when you need to reference existing resources or look up values that are not managed by OpenTofu—like finding the latest AMI ID, an existing VPC, or a current IP—without creating or modifying anything. Managed resources create/update/delete; data sources only read.
+
+**T14 — Medium:** `locals` are computed values within a module (e.g., `locals { name_prefix = "${var.environment}-${var.project}" }`), evaluated at plan time and not user-configurable. `variable` blocks are inputs that users pass in. Use `locals` for derived values, transformations, or repeated expressions that shouldn't be exposed as inputs; use `variable` for parameters that vary per environment or caller. Locals reduce duplication and improve readability; variables define the module's interface.
+
+**T15 — Medium:** The `lifecycle` block controls resource lifecycle behavior:
+- `create_before_destroy`: creates a replacement before destroying the old one (e.g., for zero-downtime updates of a load balancer or VM).
+- `prevent_destroy`: blocks destruction of a resource (e.g., a database that must never be deleted accidentally).
+- `ignore_changes`: ignores specific attribute changes detected in the real world (e.g., `ignore_changes = [tags]` to prevent OpenTofu from reverting auto-scaling tags).
+Use cases: `create_before_destroy` for blue-green deployments; `prevent_destroy` for production databases; `ignore_changes` for resources with external mutators (like Kubernetes auto-scaling).
+
+**T16 — Medium:** A `moved` block (e.g., `moved { from = aws_instance.old to = aws_instance.new }`) tells OpenTofu to treat a resource as having been renamed or moved to a new address during refactoring. It updates the state to map the old address to the new one, so the resource is not destroyed and recreated. This is essential when restructuring modules (e.g., splitting a module or renaming resources) to preserve the underlying infrastructure.
+
+**T17 — Hard:** OpenTofu builds a dependency graph from resource references: if resource B references resource A (e.g., `aws_instance.web.id`), B depends on A implicitly. Explicit dependencies are declared via `depends_on`. The graph determines execution order: independent resources run in parallel, dependent ones wait. `depends_on` forces ordering even when there's no data reference, but it reduces parallelism because it creates a strict ordering. Use it sparingly because overusing it slows down applies and can mask implicit dependencies that would be clearer as data references. The graph also enables `-target` to plan/destroy subsets.
+
+**T18 — Hard:** Strategies to reduce plan time for 200+ resources:
+1. **Use `refresh=false`** (or `-refresh=false`): skips refreshing state from the cloud, saving API calls. Tradeoff: plan may be stale if real-world drift occurred.
+2. **Targeted planning** (`-target`): plan only affected resources. Tradeoff: you must know what changed; can miss dependencies.
+3. **Use `-parallelism` tuning**: increase parallelism for faster refresh, but API rate limits may be hit. Tradeoff: risk of throttling.
+4. **Refactor to fewer resources/modules**: consolidate resources (e.g., use `for_each` instead of many separate blocks) to reduce graph complexity. Tradeoff: refactoring effort and risk.
+5. **Use a faster backend** (e.g., local state vs. remote) or **state caching** (e.g., `-refresh=false` with periodic refresh). Tradeoff: consistency vs. speed.
+
+**T19 — Hard:** OpenTofu uses a lock on the state backend (e.g., DynamoDB for S3, or a lock file for local) to prevent concurrent applies. If a CI pipeline crashes mid-apply, the lock remains held until it expires (if TTL set) or is manually released. To break a lock, use `tofu force-unlock <lock-id>` (found via `tofu state list` or the backend's lock table). Risks: force-unlocking can cause concurrent applies if another process is actually running, leading to state corruption or conflicting changes. Always verify no other apply is in progress before force-unlocking.
+
+**T20 — Hard:** Migration steps:
+1. **Configure the backend** in `terraform.tf` (e.g., `backend "s3" { bucket = "my-bucket", key = "state.tfstate", region = "us-east-1", dynamodb_table = "lock-table" }`).
+2. **Run `tofu init -migrate-state`**: OpenTofu detects the backend change and prompts to copy the existing local state to the new remote backend. It uploads the state file to S3 and creates a DynamoDB lock table entry.
+3. **Verify**: Run `tofu plan` to confirm it reads from the remote backend (check `tofu state list` or `tofu state pull`). Also check the S3 bucket contains the state file and DynamoDB has the lock table.
+4. **Test locking**: Run `tofu apply` from two terminals to confirm locking works.
+5. **Clean up**: Remove the local `terraform.tfstate` file (or keep as backup) and update CI/CD to use the new backend.
+
+## Ansible
+
+**A1 — Easy:** A **task** is a single action (e.g., install a package, copy a file). A **playbook** is a YAML file containing one or more plays, each mapping hosts to a list of tasks. A **role** is a reusable, structured collection of tasks, handlers, variables, files, and templates organized by convention (e.g., `roles/nginx/tasks/main.yml`). Roles are the building blocks for playbooks; tasks are the smallest unit.
+
+**A2 — Easy:** `ansible_facts` (or `ansible_facts` gathered via `setup` module) are system information collected from target hosts (OS, IP, memory, etc.). To access the OS family, use `ansible_facts['ansible_os_family']` (or shorthand `ansible_os_family`). Example: `debug: var=ansible_facts['ansible_os_family']` returns `Debian` or `RedHat`.
+
+**A3 — Medium:** 
+- `command`: runs a command directly on the shell (no shell features like pipes/redirects), safe for simple commands.
+- `shell`: runs through the target's shell, supporting pipes, redirects, and variable expansion—use when you need shell features.
+- `raw`: runs a raw command without any module wrapper, useful for bootstrapping (e.g., installing Python) or when the target lacks Python. Use `command` for simple, safe commands; `shell` for complex shell logic; `raw` for minimal environments or emergency recovery.
+
+**A4 — Medium:** Ansible achieves idempotency by checking the current state before acting. For example, `apt: name=htop state=present` is idempotent—it only installs if htop is missing. A non-idempotent task: `command: echo "hello" >> /tmp/log.txt`—each run appends a line, changing the file every time. Idempotent tasks use modules with state management; non-idempotent tasks use `command`/`shell` without checks.
+
+**A5 — Medium:**
+```yaml
+- name: Install htop on Debian/RedHat
+  package:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ packages }}"
+  vars:
+    packages: "{{ 'htop' if ansible_os_family == 'Debian' else ['epel-release', 'htop'] }}"
+```
+Or with `when`:
+```yaml
+- name: Install htop on Debian
+  apt: name=htop state=present
+  when: ansible_os_family == "Debian"
+
+- name: Install epel-release and htop on RedHat
+  yum: name={{ item }} state=present
+  loop: [epel-release, htop]
+  when: ansible_os_family == "RedHat"
+```
+
+**A6 — Hard:** Variable precedence (lowest to highest):
+1. Role defaults (`roles/role/defaults/main.yml`)
+2. Inventory file variables (host/group vars)
+3. `group_vars` (e.g., `group_vars/all.yml`)
+4. `host_vars` (e.g., `host_vars/hostname.yml`)
+5. Playbook-level `vars`
+6. `set_fact` (runtime, per-host)
+7. `extra_vars` (command-line `-e`)—highest priority.
+So `extra_vars` override everything; `set_fact` overrides playbook vars but not `extra_vars`; `host_vars` override `group_vars`; role defaults are lowest.
+
+**A7 — Hard:** Structure:
+1. **Inventory groups**: Put the first 3 nodes in `group1` (e.g., `rke2_masters`) and the rest in `group2` (e.g., `rke2_agents`).
+2. **Play 1**: Target `rke2_masters` with `serial: 1` (or `serial: 3` to allow 3 at once) to ensure they complete sequentially.
+3. **Play 2**: Target `rke2_agents` with `serial: 10` (batches) and use `wait_for` to check that the masters are ready (e.g., `wait_for: host=master1 port=6443`).
+4. Use `run_once` for cluster init tasks (e.g., generating join tokens) and `delegate_to` for control-plane tasks.
+Example:
+```yaml
+- hosts: rke2_masters
+  serial: 1
+  tasks:
+    - name: Initialize cluster
+      command: rke2 server --cluster-init
+    - name: Get join token
+      command: cat /var/lib/rancher/rke2/server/node-token
+      register: token
+
+- hosts: rke2_agents
+  serial: 10
+  tasks:
+    - name: Wait for master API
+      wait_for: host={{ groups['rke2_masters'][0] }} port=6443
+    - name: Join cluster
+      command: rke2 agent --server https://{{ groups['rke2_masters'][0] }}:6443 --token {{ hostvars[groups['rke2_masters'][0]]['token']['stdout'] }}
+```
+
+**A8 — Medium:** `ansible-vault` encrypts sensitive data (passwords, keys) in files or variables. To encrypt a single variable inside a vars file without encrypting the whole file, use `ansible-vault encrypt_string`:
+```bash
+ansible-vault encrypt_string 'secret_password' --name 'db_password'
+```
+This outputs an encrypted string that you can paste into a vars file. At runtime, use `ansible-vault decrypt` or provide the vault password via `--vault-password-file` or `ANSIBLE_VAULT_PASSWORD_FILE`.
+
+**A9 — Easy:** An inventory file defines the hosts and groups Ansible manages (e.g., `[webservers] web1.example.com`). A **static inventory** is a plain text file (INI/YAML) with fixed hosts; a **dynamic inventory** is a script or plugin that queries a cloud provider (e.g., AWS EC2, GCP) or CMDB to generate the host list at runtime. Dynamic inventories are essential for auto-scaling environments.
+
+**A10 — Easy:** 
+```bash
+ansible webservers -m command -a "df -h"
+```
+Or with the `shell` module: `ansible webservers -m shell -a "df -h"`. This runs the `df -h` command on all hosts in the `webservers` group.
+
+**A11 — Easy:** A handler is a task that runs only when notified by another task (e.g., restart a service after a config change). It differs from a regular task because it runs once at the end of the play, only if notified. Trigger it with `notify: restart_nginx` in a task. Handlers are ideal for service restarts that should happen only when configuration changes.
+
+**A12 — Easy:** `ansible.cfg` is the configuration file for Ansible settings. Common settings:
+- `inventory`: path to the inventory file (e.g., `inventory = ./hosts`)
+- `forks`: number of parallel processes (e.g., `forks = 50`)
+- `remote_user`: default SSH user (e.g., `remote_user = ubuntu`)
+- `host_key_checking`: enable/disable SSH host key verification (e.g., `host_key_checking = False`)
+- `timeout`: SSH connection timeout.
+
+**A13 — Easy:** `register` captures the result of a task into a variable. Example:
+```yaml
+- name: Check if file exists
+  command: ls /tmp/foo
+  register: foo_result
+  ignore_errors: yes
+
+- name: Show result
+  debug: msg="File exists" 
+  when: foo_result.rc == 0
+```
+The registered variable contains `stdout`, `stderr`, `rc`, and other fields, usable in subsequent tasks with `when` or templating.
+
+**A14 — Medium:** `include_tasks` dynamically includes tasks at runtime (evaluated when the play reaches that point), allowing conditionals and loops to be evaluated per-host. `import_tasks` statically imports tasks at parse time (before execution), so conditionals are evaluated once for all hosts. Use `include_tasks` when the included tasks depend on host-specific facts or when you need to loop over includes; use `import_tasks` for static, reusable chunks where conditions don't vary per host. `include_tasks` supports `when` on the include itself; `import_tasks` does not (conditions apply to the imported tasks).
+
+**A15 — Medium:** Ansible Galaxy is a community hub for roles and collections. A `requirements.yml` file lists dependencies:
+```yaml
+roles:
+  - name: geerlingguy.nginx
+collections:
+  - name: community.docker
+```
+Install with `ansible-galaxy install -r requirements.yml`. This downloads roles/collections into the roles/collections directories, making them reusable across playbooks.
+
+**A16 — Medium:** Connection plugins define how Ansible communicates with targets. `ssh` (default) connects via SSH to remote hosts, using Python on the target. `local` runs tasks on the control node itself (no SSH), useful for localhost tasks or when managing the local machine. `network_cli` connects to network devices (routers/switches) via SSH/CLI, using a different execution model (no Python, uses CLI commands). Use `ssh` for standard servers, `local` for control-node tasks (e.g., generating files), and `network_cli` for network hardware.
+
+**A17 — Hard:** `delegate_to` runs a task on a different host than the target (e.g., `delegate_to: localhost`), while `run_once` ensures a task runs only once across all hosts (even with `serial`). Practical example: gather facts from all remote hosts, then generate a report on the control node:
+```yaml
+- hosts: webservers
+  tasks:
+    - name: Gather facts
+      setup:
+    - name: Generate report on control node
+      template: src=report.j2 dest=/tmp/report.txt
+      delegate_to: localhost
+      run_once: true
+```
+Here, facts from all hosts are collected (via `hostvars`), and the template runs once on localhost, using `hostvars` to access each host's facts.
+
+**A18 — Hard:** Strategies to improve performance for 500 hosts:
+1. **Increase `forks`** (e.g., `forks=50`): more parallel SSH connections. Tradeoff: higher CPU/memory on control node and potential SSH throttling.
+2. **Enable pipelining** (`pipelining=True`): reduces SSH round-trips by sending commands via a single connection. Tradeoff: requires `sudo` without `requiretty`; may break on some systems.
+3. **Use fact caching** (`gather_facts: no` or `fact_caching=jsonfile`): skip gathering facts on every run. Tradeoff: stale facts if hosts change; need periodic refresh.
+4. **Use Mitogen or async tasks**: Mitogen speeds up SSH by using a faster transport; async tasks run long operations in parallel. Tradeoff: Mitogen adds complexity; async requires polling and error handling.
+5. **Use `serial` batches** to avoid overwhelming the control node. Tradeoff: slower overall but more stable.
+
+**A19 — Hard:** Jinja2 templating in Ansible uses:
+- `{{ }}`: variable interpolation (e.g., `{{ ansible_os_family }}`)—outputs a value.
+- `{% %}`: logic/control structures (e.g., `{% for host in hosts %}`)—executes code.
+- `{# #}`: comments—ignored in output.
+Template snippet for nginx upstream:
+```jinja2
+upstream backend {
+{% for server in backend_servers %}
+    server {{ server }}:8080;
+    # health check for {{ server }}
+{% endfor %}
+}
+```
+This generates an upstream block with each server and a comment.
+
+**A20 — Hard:** Zero-downtime rolling deployment:
+1. **Inventory**: group `webapp` with 20 servers.
+2. **Play structure**:
+```yaml
+- hosts: webapp
+  serial: 5  # batches of 5
+  tasks:
+    - name: Pre-deploy - remove from LB
+      command: "curl -X POST https://lb.example.com/remove -d 'host={{ inventory_hostname }}'"
+      delegate_to: localhost
+      run_once: false
+    - name: Deploy app
+      block:
+        - name: Pull new version
+          git: repo=... dest=/app version={{ version }}
+        - name: Restart service
+          service: name=webapp state=restarted
+        - name: Health check
+          uri: url=http://{{ inventory_hostname }}/health
+          register: health
+          until: health.status == 200
+          retries: 10
+          delay: 5
+      rescue:
+        - name: Rollback
+          command: "curl -X POST https://lb.example.com/rollback -d 'host={{ inventory_hostname }}'"
+          delegate_to: localhost
+        - name: Revert to previous version
+          git: repo=... dest=/app version={{ previous_version }}
+        - name: Restart service
+          service: name=webapp state=restarted
+    - name: Post-deploy - add to LB
+      command: "curl -X POST https://lb.example.com/add -d 'host={{ inventory_hostname }}'"
+      delegate_to: localhost
+      when: health.status == 200
+```
+Use `serial: 5` to deploy 5 at a time, removing each from the LB before deploy, health-checking after, and re-adding only if healthy. The `block/rescue` handles rollback by reverting to the previous version and restarting.
