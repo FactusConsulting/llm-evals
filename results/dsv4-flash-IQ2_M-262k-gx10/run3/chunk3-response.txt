@@ -1,0 +1,1237 @@
+I'll answer all 40 questions systematically, labeling each with its question ID.
+
+---
+
+## OpenTofu / Terraform
+
+### T1 — Easy: What is the difference between tofu plan and tofu apply?
+
+**tofu plan** is a read-only dry-run that compares the current state against the desired configuration and shows what changes would be made (additions, modifications, deletions) without actually executing them. It's safe for review and CI/CD validation.
+
+**tofu apply** actually executes the changes computed during the plan phase—creating, modifying, or destroying resources—and updates the state file to reflect the new reality. It can be run with `-auto-approve` to skip interactive confirmation.
+
+Key difference: plan is a preview; apply makes real changes.
+
+### T2 — Easy: What is state in OpenTofu, and why is remote state important?
+
+**State** is OpenTofu's record of the current infrastructure. It maps configuration resources to real-world resources and stores metadata, attributes, and dependencies. It's stored in a JSON file (terraform.tfstate by default).
+
+**Remote state** is important because:
+- **Team collaboration**: Multiple team members can work on the same infrastructure without conflicts
+- **CI/CD integration**: Pipelines can access state from a central location
+- **State locking**: Prevents concurrent modifications
+- **Disaster recovery**: State survives local machine failures
+- **Consistency**: Ensures everyone works with the same source of truth
+
+Without remote state, each developer would have their own local state file, leading to drift and conflicts.
+
+### T3 — Medium: Explain the difference between count and for_each. When is for_each preferred?
+
+**count**:
+- Creates a fixed number of resources based on an integer
+- Resources are indexed numerically (0, 1, 2...)
+- Cannot be used with maps or sets of distinct keys
+- Each instance is identified by index
+
+**for_each**:
+- Creates resources based on a map or set
+- Resources are keyed by the map key or set element
+- Each instance has a distinct key, making it easier to reference
+- Better for managing resources with distinct identities
+
+**for_each is preferred when**:
+- You need to reference specific instances by name/key
+- You're iterating over a map or set of distinct values
+- You need to handle resources that have different configurations
+- You need to delete or modify specific instances without affecting others
+- You're working with resources that have unique identifiers (e.g., VM names, DNS records)
+
+Example: If you have a map of VM names to configurations, for_each lets you reference `vm["web1"]` directly, while count would require you to track index positions.
+
+### T4 — Medium: What happens if you manually change a resource outside of OpenTofu (e.g., modify a VM in the cloud console)? How does OpenTofu detect and handle this?
+
+When you manually change a resource outside of OpenTofu:
+
+1. **Detection**: OpenTofu detects the change during `tofu plan` by comparing the actual resource state (from the cloud provider API) with the state file. It shows a "drift"—the configuration differs from what's recorded in state.
+
+2. **Handling**: OpenTofu will propose to update the resource to match the configuration. This is called "reconciliation"—it brings the resource back to the desired state defined in your configuration.
+
+3. **Specific behaviors**:
+   - If the manual change matches the configuration, OpenTofu will update the state file to reflect the actual state (no changes needed)
+   - If the manual change differs from the configuration, OpenTofu will plan to revert it
+   - If the manual change is something OpenTofu doesn't manage (e.g., a tag added to a VM), it may be preserved or removed depending on the resource's attributes
+
+4. **Important**: OpenTofu doesn't automatically detect drift during apply—it only detects it during plan. You need to run `tofu plan` to see the drift.
+
+### T5 — Medium: Write a minimal OpenTofu snippet that creates 3 identical VMs using for_each over a toset(["web1", "web2", "web3"]).
+
+```hcl
+resource "aws_instance" "web" {
+  for_each = toset(["web1", "web2", "web3"])
+
+  ami           = "ami-0c55b159cbfafe1f0"
+  instance_type = "t2.micro"
+
+  tags = {
+    Name = each.key
+  }
+}
+```
+
+This creates 3 EC2 instances named web1, web2, and web3, each with the same AMI and instance type. The `each.key` variable contains the current key from the set.
+
+### T6 — Hard: Explain the difference between terraform_remote_state data source and output values when sharing data between root modules. What is the recommended alternative and why?
+
+**terraform_remote_state data source**:
+- Reads the entire state file of another OpenTofu/Terraform configuration
+- Provides access to all outputs from that configuration
+- Creates a hard dependency between the two configurations
+- Can cause issues with state locking and concurrent access
+- Exposes the entire state, which may contain sensitive data
+
+**Output values**:
+- Are explicitly defined in a module's output block
+- Can be selectively exposed (only what you want to share)
+- Can be marked as sensitive
+- Are the proper way to share data between modules
+
+**Recommended alternative**: Use **output values** from modules, not terraform_remote_state. When sharing data between root modules, the recommended approach is:
+
+1. **Module outputs**: Define outputs in your module and reference them in the parent configuration
+2. **Data sources**: Use cloud provider data sources (e.g., `aws_vpc`, `azurerm_subnet`) to look up existing resources
+3. **Consul/Terraform Cloud**: Use a service like Consul or Terraform Cloud's remote state storage
+
+**Why**: 
+- Output values are explicit and controlled
+- They don't create hidden dependencies
+- They're more secure (you control what's exposed)
+- They're more maintainable and testable
+- terraform_remote_state creates tight coupling and can cause issues with state locking
+
+### T7 — Hard: You have a module that provisions an RKE2 cluster. The kubeconfig output depends on a null_resource with a provisioner "remote-exec". The dependent resources fail because the output is empty on first apply. Explain why and how to fix it.
+
+**Why the output is empty on first apply**:
+
+The issue is with how OpenTofu handles provisioners and outputs:
+
+1. **Provisioners run after the resource is created**: The `null_resource` with a `remote-exec` provisioner runs after the resource is created, but the output value is computed during the plan phase.
+
+2. **Outputs are computed at plan time**: OpenTofu computes output values during the plan phase, before any resources are actually created or provisioners run.
+
+3. **The null_resource has no actual attributes**: Since `null_resource` has no real attributes, the output value is empty until the provisioner actually runs and produces data.
+
+4. **Dependency ordering**: The dependent resources are created before the provisioner completes because OpenTofu doesn't know about the provisioner's side effects.
+
+**How to fix it**:
+
+1. **Use a data source instead**: Create a `data` source that reads the kubeconfig file after it's been generated:
+```hcl
+data "local_file" "kubeconfig" {
+  depends_on = [null_resource.rke2_cluster]
+  filename   = "${path.module}/kubeconfig"
+}
+```
+
+2. **Use a script to generate the output**: Have the provisioner write the kubeconfig to a file, then read it with a `local_file` data source.
+
+3. **Use a `time_sleep` resource**: Add a `time_sleep` resource to ensure the provisioner completes before dependent resources are created.
+
+4. **Use a `terraform_data` resource**: In newer versions, use `terraform_data` with a `triggers_replace` to ensure proper ordering.
+
+5. **Use a `null_resource` with `triggers`**: Set triggers that force the provisioner to run before dependent resources.
+
+### T8 — Medium: What is terraform import (or tofu import), and what are its limitations? How does the import block (1.5+) improve on the CLI command?
+
+**tofu import**:
+- Imports existing infrastructure into OpenTofu state
+- Maps real-world resources to configuration resources
+- Syntax: `tofu import <address> <resource_id>`
+
+**Limitations**:
+- You must know the exact resource ID/ARN
+- Only imports into state, not configuration—you must write the configuration yourself
+- Imported resources may not match your configuration exactly
+- Some resources don't support import
+- Importing can be error-prone for complex resources
+- You need to manually verify the imported state matches your configuration
+
+**Import block (1.5+)**:
+```hcl
+import {
+  to = aws_instance.my_vm
+  id = "i-1234567890"
+}
+```
+
+**Improvements**:
+- Declarative import: You declare what to import in your configuration
+- Plan-time import: You can see what will be imported before applying
+- Better error handling: Failures are caught during plan
+- More maintainable: Import blocks are version-controlled
+- Can be used with `tofu plan` to preview imports
+- Supports importing multiple resources at once
+
+### T9 — Easy: What is a variable in OpenTofu, and what is the difference between variable (input) and output?
+
+**Input variables**:
+- Define parameters that can be passed to a module or configuration
+- Allow customization without changing the code
+- Can have defaults, types, and validation
+- Used to make configurations reusable
+
+```hcl
+variable "instance_type" {
+  description = "EC2 instance type"
+  type        = string
+  default     = "t2.micro"
+}
+```
+
+**Output values**:
+- Return values from a module or configuration
+- Expose information to the caller
+- Can be marked as sensitive
+- Used to share data between modules or with external systems
+
+```hcl
+output "instance_id" {
+  value = aws_instance.web.id
+}
+```
+
+**Key differences**:
+- Variables are inputs (what you pass in)
+- Outputs are outputs (what you get back)
+- Variables have defaults and validation
+- Outputs can be sensitive and are used for data sharing
+
+### T10 — Easy: What is a provider in OpenTofu? What happens if you run tofu plan without running tofu init first?
+
+**Provider**:
+- A plugin that allows OpenTofu to interact with a cloud provider or service
+- Contains the API client and resource definitions
+- Examples: AWS, Azure, GCP, Kubernetes, etc.
+- Configured via `provider` blocks in your configuration
+
+**Running `tofu plan` without `tofu init`**:
+- You'll get an error: "Provider not found" or "Module not found"
+- OpenTofu needs to download and install providers and modules before it can plan
+- The error message will tell you to run `tofu init` first
+- `tofu init` downloads providers, modules, and sets up the backend
+
+### T11 — Easy: What is the .terraform.lock.hcl file, and why should it be committed to version control?
+
+**`.terraform.lock.hcl`**:
+- Records the exact versions of providers and modules used
+- Contains hashes of the provider binaries
+- Ensures reproducibility across environments
+
+**Why commit it**:
+- **Reproducibility**: Ensures everyone uses the same provider versions
+- **Security**: Hashes verify provider integrity
+- **Consistency**: Prevents unexpected version changes
+- **Auditability**: You know exactly what versions were used
+- **CI/CD**: Pipelines can use the locked versions
+
+Without committing it, each developer might get different provider versions, leading to inconsistent behavior.
+
+### T12 — Easy: What does tofu destroy do, and how do you target a single resource for destruction?
+
+**`tofu destroy`**:
+- Removes all resources managed by the configuration
+- Destroys resources in reverse dependency order
+- Updates state to remove destroyed resources
+- Can be dangerous—it removes everything
+
+**Targeting a single resource**:
+```bash
+tofu destroy -target=aws_instance.web
+```
+
+This destroys only the specified resource and its dependencies. You can also use `-target` with `tofu apply` to only apply changes to specific resources.
+
+### T13 — Easy: What is a data source in OpenTofu? Give an example of when you would use one instead of a managed resource.
+
+**Data source**:
+- Reads information from an external system without creating or modifying resources
+- Used to look up existing resources or fetch data
+- Syntax: `data "provider_resource" "name" { ... }`
+
+**Example use case**:
+```hcl
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"]
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-focal-20.04-amd64-server-*"]
+  }
+}
+```
+
+**When to use a data source instead of a managed resource**:
+- When you need to reference an existing resource (e.g., an existing VPC, subnet, or AMI)
+- When you need to fetch configuration data (e.g., current AWS region, account ID)
+- When you need to look up values that change frequently (e.g., latest AMI)
+- When you want to avoid creating resources that already exist
+
+### T14 — Medium: Explain the difference between locals and variable blocks. When should you use locals instead of input variables?
+
+**Locals**:
+- Define local values within a module
+- Computed from other values
+- Cannot be overridden from outside
+- Used for intermediate calculations and readability
+
+```hcl
+locals {
+  common_tags = {
+    Environment = var.environment
+    Project     = "my-project"
+  }
+}
+```
+
+**Variables**:
+- Define inputs that can be passed from outside
+- Can have defaults, types, and validation
+- Used for configuration parameters
+
+```hcl
+variable "environment" {
+  type    = string
+  default = "dev"
+}
+```
+
+**When to use locals instead of variables**:
+- When the value is derived from other values (e.g., combining tags, computing names)
+- When you need to reuse a computed value multiple times
+- When the value is internal to the module and shouldn't be exposed
+- When you want to simplify complex expressions
+
+### T15 — Medium: What is the lifecycle block in a resource? Explain the create_before_destroy, prevent_destroy, and ignore_changes options with a use case for each.
+
+**Lifecycle block**:
+```hcl
+resource "aws_instance" "web" {
+  # ... configuration ...
+
+  lifecycle {
+    create_before_destroy = true
+    prevent_destroy       = false
+    ignore_changes        = [tags]
+  }
+}
+```
+
+**create_before_destroy**:
+- Creates a new resource before destroying the old one
+- Use case: Zero-downtime deployments where you need the new resource ready before removing the old one (e.g., replacing a load balancer)
+
+**prevent_destroy**:
+- Prevents the resource from being destroyed
+- Use case: Protecting critical resources like databases or stateful services from accidental deletion
+
+**ignore_changes**:
+- Ignores specific attributes when detecting drift
+- Use case: When you manage certain attributes outside of OpenTofu (e.g., auto-scaling groups that change instance count dynamically)
+
+### T16 — Medium: What is a moved block in OpenTofu, and how does it help when refactoring module structure without destroying and recreating resources?
+
+**Moved block**:
+```hcl
+moved {
+  from = aws_instance.web
+  to   = aws_instance.web_server
+}
+```
+
+**Purpose**:
+- Renames resources or moves them between modules
+- Updates state to reflect the new address
+- Prevents destruction and recreation of resources
+
+**How it helps with refactoring**:
+- When you restructure modules (e.g., splitting a large module into smaller ones), resources keep their identity
+- State is updated to reflect the new addresses
+- No downtime or data loss
+- OpenTofu knows the resource was moved, not deleted
+
+**Example**:
+```hcl
+# Before refactoring
+module "network" {
+  source = "./network"
+}
+
+# After refactoring
+module "network" {
+  source = "./network-v2"
+}
+
+moved {
+  from = module.network.aws_vpc.main
+  to   = module.network.aws_vpc.main_v2
+}
+```
+
+### T17 — Hard: Explain how OpenTofu's dependency graph works. What is the difference between implicit and explicit dependencies? How does depends_on affect parallelism, and why should it be used sparingly?
+
+**Dependency graph**:
+- OpenTofu builds a graph of resources based on dependencies
+- Resources are created in dependency order
+- Independent resources can be created in parallel
+
+**Implicit dependencies**:
+- Created automatically by OpenTofu based on references
+- Example: `aws_instance.web` depends on `aws_vpc.main` because it references `aws_vpc.main.id`
+- These are the primary way OpenTofu determines ordering
+
+**Explicit dependencies**:
+- Created using `depends_on` attribute
+- Used when there's no direct reference but ordering matters
+- Example: A resource that depends on a provisioner completing
+
+**How depends_on affects parallelism**:
+- Resources with `depends_on` are serialized—they wait for their dependencies
+- This reduces parallelism because dependent resources can't run in parallel
+- OpenTofu can only run independent resources in parallel
+
+**Why use depends_on sparingly**:
+- It reduces parallelism and slows down apply
+- It creates hidden dependencies that are hard to maintain
+- It can mask underlying issues in your configuration
+- It makes the graph harder to understand and debug
+- Prefer implicit dependencies (references) whenever possible
+
+### T18 — Hard: You have an OpenTofu codebase with 200+ resources and tofu plan takes over 10 minutes. Identify at least 4 strategies to reduce plan time and explain the tradeoffs of each.
+
+**Strategy 1: Use `-refresh=false` or `-refresh-only`**
+- Skips refreshing state from the cloud provider
+- Tradeoff: You might miss drift detection; state might be stale
+
+**Strategy 2: Use `-target` for focused planning**
+- Only plan resources you're changing
+- Tradeoff: You might miss dependencies; not suitable for full CI/CD
+
+**Strategy 3: Use `-parallelism` to control concurrency**
+- Increase parallelism for faster planning
+- Tradeoff: Higher API rate limits; potential for rate limiting
+
+**Strategy 4: Use `-no-color` and `-compact-warnings`**
+- Reduces output processing
+- Tradeoff: Less verbose output; harder to debug
+
+**Strategy 5: Use `-check-variable-constraints=false`**
+- Skips variable validation
+- Tradeoff: Less safety; might miss configuration errors
+
+**Strategy 6: Use `-detailed-exitcode`**
+- Returns exit code 0 for no changes, 2 for changes
+- Tradeoff: More complex CI/CD logic
+
+**Strategy 7: Use `-input=false`**
+- Skips interactive prompts
+- Tradeoff: Can't provide input interactively
+
+**Strategy 8: Use `-json` for machine-readable output**
+- Faster parsing for CI/CD
+- Tradeoff: Less human-readable
+
+### T19 — Hard: Explain the OpenTofu state locking mechanism. What happens if a lock is not released (e.g., a CI pipeline crashes mid-apply)? How do you manually break a lock, and what are the risks?
+
+**State locking mechanism**:
+- OpenTofu acquires a lock before modifying state
+- The lock prevents concurrent modifications
+- Lock is released after apply completes
+- For remote backends, locking is typically done via DynamoDB (AWS) or similar
+
+**What happens if a lock is not released**:
+- The lock remains in the backend (e.g., DynamoDB table)
+- Subsequent `tofu plan` or `tofu apply` commands fail with a "lock held" error
+- The lock persists until manually broken
+
+**How to manually break a lock**:
+```bash
+tofu force-unlock <LOCK_ID>
+```
+
+**Risks of breaking a lock**:
+- **Concurrent modifications**: Another process might be modifying state
+- **Data corruption**: If the lock holder is still running, you might corrupt state
+- **Inconsistent state**: The state might be partially updated
+- **Lost changes**: The lock holder might have made changes that are lost
+
+**Best practices**:
+- Only break locks when you're certain the holder is dead
+- Check the lock holder's PID and process
+- Use `tofu force-unlock` with the correct lock ID
+- Consider using a CI/CD pipeline that cleans up locks automatically
+
+### T20 — Hard: You need to migrate an existing OpenTofu project from a local state backend to an S3-compatible remote backend with state locking via DynamoDB. Describe the step-by-step process, including what happens to the existing state file and how to verify the migration succeeded.
+
+**Step-by-step migration process**:
+
+1. **Create the backend infrastructure**:
+   - Create an S3 bucket (or compatible object storage)
+   - Create a DynamoDB table for state locking
+   - Configure appropriate IAM permissions
+
+2. **Update the backend configuration**:
+   ```hcl
+   terraform {
+     backend "s3" {
+       bucket         = "my-terraform-state"
+       key            = "project/terraform.tfstate"
+       region         = "us-west-2"
+       dynamodb_table = "terraform-locks"
+       encrypt        = true
+     }
+   }
+   ```
+
+3. **Initialize with migration**:
+   ```bash
+   tofu init -migrate-state
+   ```
+   - OpenTofu detects the existing local state
+   - Prompts for confirmation
+   - Copies the state to the remote backend
+   - Updates the backend configuration
+
+4. **Verify the migration**:
+   ```bash
+   tofu plan
+   ```
+   - Should show no changes (state is consistent)
+   - Check the remote state file exists in S3
+   - Verify DynamoDB table has no lingering locks
+
+5. **Test locking**:
+   - Run `tofu plan` in one terminal
+   - Run `tofu plan` in another terminal
+   - The second should fail with a lock error
+
+6. **Clean up**:
+   - Remove the local state file (after confirming remote state works)
+   - Update CI/CD pipelines to use the new backend
+
+**What happens to the existing state file**:
+- During `tofu init -migrate-state`, OpenTofu copies the local state to the remote backend
+- The local state file is backed up (e.g., `terraform.tfstate.backup`)
+- After successful migration, the local file can be deleted
+
+**Verification steps**:
+- Run `tofu plan` and confirm no unexpected changes
+- Check S3 bucket for the state file
+- Verify DynamoDB table exists and is empty
+- Test concurrent access to ensure locking works
+
+---
+
+## Ansible
+
+### A1 — Easy: What is the difference between an Ansible playbook, a role, and a task?
+
+**Task**:
+- The smallest unit of work in Ansible
+- A single action (e.g., install a package, copy a file, run a command)
+- Defined in a play or role
+
+**Playbook**:
+- A collection of plays
+- Each play maps hosts to tasks
+- Defines the overall workflow
+- Can include variables, handlers, and other elements
+
+**Role**:
+- A reusable, organized collection of tasks, handlers, variables, and files
+- Provides a standard directory structure
+- Can be shared and reused across playbooks
+- Encapsulates related functionality (e.g., a "webserver" role)
+
+**Key differences**:
+- Tasks are individual actions
+- Playbooks are complete workflows
+- Roles are reusable components that contain tasks
+
+### A2 — Easy: What is ansible_facts and how do you access the OS family of a target host?
+
+**ansible_facts**:
+- System information gathered from target hosts
+- Collected by the `setup` module by default
+- Includes OS, hardware, network, and other system details
+- Stored in the `ansible_facts` variable
+
+**Accessing OS family**:
+```yaml
+- name: Show OS family
+  debug:
+    msg: "OS family is {{ ansible_facts['os_family'] }}"
+```
+
+Or using the shorthand:
+```yaml
+- name: Show OS family
+  debug:
+    msg: "OS family is {{ ansible_os_family }}"
+```
+
+Common values: Debian, RedHat, Suse, Windows, etc.
+
+### A3 — Medium: Explain the difference between command, shell, and raw modules. When would you use each?
+
+**command module**:
+- Executes a command on the remote host
+- Does NOT use a shell (no pipes, redirects, or variable expansion)
+- More secure—no shell injection risk
+- Example: `command: /usr/bin/uptime`
+
+**shell module**:
+- Executes a command through the shell
+- Supports pipes, redirects, and variable expansion
+- Less secure—shell injection risk
+- Example: `shell: uptime | grep -i "load"`
+
+**raw module**:
+- Executes a raw command without any processing
+- Bypasses the module system entirely
+- Used for bootstrapping or when modules aren't available
+- Example: `raw: apt-get update && apt-get install -y python3`
+
+**When to use each**:
+- Use `command` for simple commands without shell features
+- Use `shell` when you need pipes, redirects, or variable expansion
+- Use `raw` for bootstrapping (e.g., installing Python) or when modules aren't available
+
+### A4 — Medium: How does Ansible handle idempotency? Give an example of a task that is idempotent and one that is NOT.
+
+**Idempotency**:
+- Ansible modules are designed to be idempotent—running them multiple times produces the same result
+- Modules check the current state and only make changes if needed
+- This prevents errors and ensures consistent state
+
+**Idempotent task example**:
+```yaml
+- name: Install nginx
+  apt:
+    name: nginx
+    state: present
+```
+Running this multiple times will only install nginx once—subsequent runs will detect it's already installed.
+
+**Non-idempotent task example**:
+```yaml
+- name: Add line to file
+  shell: echo "new line" >> /etc/example.txt
+```
+Running this multiple times will append the line multiple times, creating duplicates.
+
+**How to make non-idempotent tasks idempotent**:
+- Use `lineinfile` module instead of `shell`
+- Use `creates` parameter to check for file existence
+- Use `register` and conditionals to check state
+
+### A5 — Medium: Write an Ansible task that installs htop only on Debian-based systems and epel-release + htop on RedHat-based systems using a single task file.
+
+```yaml
+- name: Install htop on Debian-based systems
+  apt:
+    name: htop
+    state: present
+  when: ansible_os_family == "Debian"
+
+- name: Install epel-release on RedHat-based systems
+  yum:
+    name: epel-release
+    state: present
+  when: ansible_os_family == "RedHat"
+
+- name: Install htop on RedHat-based systems
+  yum:
+    name: htop
+    state: present
+  when: ansible_os_family == "RedHat"
+```
+
+Or using a single task with a conditional:
+```yaml
+- name: Install htop
+  package:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ packages }}"
+  vars:
+    packages: "{{ ['htop'] if ansible_os_family == 'Debian' else ['epel-release', 'htop'] }}"
+```
+
+### A6 — Hard: Explain Ansible's variable precedence order. Where do group_vars, host_vars, extra_vars, role defaults, and set_fact land in priority?
+
+**Variable precedence order (highest to lowest)**:
+
+1. **extra_vars** (highest priority)—passed via `-e` or `--extra-vars`
+2. **set_fact**—set during play execution
+3. **host_vars**—defined in `host_vars/` directory
+4. **group_vars**—defined in `group_vars/` directory
+5. **role defaults**—defined in `defaults/main.yml` in roles
+6. **role vars**—defined in `vars/main.yml` in roles
+7. **play vars**—defined in the playbook
+8. **inventory variables**—defined in the inventory file
+9. **system facts**—gathered from the system
+
+**Key points**:
+- `extra_vars` always win—they override everything
+- `set_fact` is set during play execution and overrides most things
+- `host_vars` override `group_vars`
+- `role defaults` have the lowest priority within roles—they're meant to be overridden
+- `role vars` have higher priority than `role defaults`
+
+### A7 — Hard: You need to deploy an RKE2 agent on 50 nodes. The first 3 nodes must complete before the rest start. How do you structure this in Ansible? Cover: serial, inventory groups, and wait_for.
+
+**Structure**:
+
+1. **Inventory groups**:
+```ini
+[rke2_agents]
+agent1
+agent2
+agent3
+...
+agent50
+
+[first_three]
+agent1
+agent2
+agent3
+
+[remaining_agents]
+agent4
+agent5
+...
+agent50
+```
+
+2. **Playbook structure**:
+```yaml
+- name: Deploy RKE2 agents - first 3
+  hosts: first_three
+  serial: 1
+  tasks:
+    - name: Install RKE2 agent
+      shell: |
+        curl -sfL https://get.rke2.io | sh -
+        systemctl enable rke2-agent
+        systemctl start rke2-agent
+      register: rke2_install
+
+    - name: Wait for agent to be ready
+      wait_for:
+        path: /var/lib/rancher/rke2/agent/state
+        state: present
+      when: rke2_install.changed
+
+- name: Deploy RKE2 agents - remaining
+  hosts: remaining_agents
+  serial: 10
+  tasks:
+    - name: Install RKE2 agent
+      shell: |
+        curl -sfL https://get.rke2.io | sh -
+        systemctl enable rke2-agent
+        systemctl start rke2-agent
+
+    - name: Wait for agent to be ready
+      wait_for:
+        path: /var/lib/rancher/rke2/agent/state
+        state: present
+```
+
+3. **Key considerations**:
+- Use `serial: 1` for the first 3 nodes to ensure they complete one at a time
+- Use `serial: 10` for the remaining nodes to batch them
+- Use `wait_for` to ensure each node is ready before moving on
+- Consider using `run_once` for cluster initialization tasks
+
+### A8 — Medium: What is ansible-vault? How do you encrypt a single variable inside a vars file without encrypting the entire file?
+
+**ansible-vault**:
+- Encrypts sensitive data (passwords, keys, secrets)
+- Uses AES-256 encryption
+- Can encrypt files or individual variables
+- Requires a vault password to decrypt
+
+**Encrypting a single variable**:
+
+1. **Create a separate vault file**:
+```bash
+ansible-vault create vars/vault.yml
+```
+
+2. **Put the sensitive variable in the vault file**:
+```yaml
+db_password: "supersecret"
+```
+
+3. **Reference it in your main vars file**:
+```yaml
+# vars/main.yml
+db_user: "admin"
+db_password: "{{ vault_db_password }}"
+```
+
+4. **Include the vault file in your playbook**:
+```yaml
+- name: Deploy app
+  hosts: all
+  vars_files:
+    - vars/main.yml
+    - vars/vault.yml
+```
+
+**Alternative approach**:
+- Use `ansible-vault encrypt_string` to encrypt a single string:
+```bash
+ansible-vault encrypt_string 'supersecret' --name 'db_password'
+```
+
+### A9 — Easy: What is an Ansible inventory file? What is the difference between a static inventory and a dynamic inventory?
+
+**Inventory file**:
+- Defines the hosts and groups that Ansible manages
+- Can be in INI, YAML, or JSON format
+- Contains host addresses, connection details, and variables
+
+**Static inventory**:
+- A file that lists hosts and groups manually
+- Doesn't change unless you edit it
+- Simple and predictable
+- Example:
+```ini
+[webservers]
+web1.example.com
+web2.example.com
+
+[dbservers]
+db1.example.com
+```
+
+**Dynamic inventory**:
+- Generated programmatically from external sources
+- Pulls hosts from cloud providers, databases, or APIs
+- Updates automatically as infrastructure changes
+- Example: AWS EC2 dynamic inventory script
+
+**Key differences**:
+- Static: manual, fixed, simple
+- Dynamic: automated, current, complex
+- Dynamic is better for cloud environments where hosts change frequently
+
+### A10 — Easy: How do you run a single ad-hoc Ansible command to check disk space on all hosts in the webservers group?
+
+```bash
+ansible webservers -m command -a "df -h"
+```
+
+Or using the shell module:
+```bash
+ansible webservers -m shell -a "df -h"
+```
+
+Or using the built-in `command` module with a simpler syntax:
+```bash
+ansible webservers -a "df -h"
+```
+
+### A11 — Easy: What is a handler in Ansible, and how does it differ from a regular task? How do you trigger a handler?
+
+**Handler**:
+- A special type of task that runs only when notified
+- Used for actions that should happen at the end of a play (e.g., restarting services)
+- Defined in the `handlers` section of a play or role
+
+**Difference from regular tasks**:
+- Regular tasks always run (unless conditionals prevent them)
+- Handlers only run when notified by another task
+- Handlers run once, even if notified multiple times
+- Handlers run at the end of the play, not immediately
+
+**Triggering a handler**:
+```yaml
+- name: Install nginx
+  apt:
+    name: nginx
+    state: present
+  notify: restart nginx
+
+handlers:
+  - name: restart nginx
+    service:
+      name: nginx
+      state: restarted
+```
+
+The `notify` keyword triggers the handler. The handler runs at the end of the play.
+
+### A12 — Easy: What is the ansible.cfg file used for? Name at least 3 settings commonly configured there.
+
+**ansible.cfg**:
+- Configuration file for Ansible
+- Sets global defaults and preferences
+- Can be in the current directory, home directory, or system-wide
+
+**Common settings**:
+
+1. **inventory**:
+```ini
+[defaults]
+inventory = ./inventory
+```
+
+2. **forks**:
+```ini
+[defaults]
+forks = 50
+```
+
+3. **remote_user**:
+```ini
+[defaults]
+remote_user = ansible
+```
+
+4. **become**:
+```ini
+[privilege_escalation]
+become = True
+become_user = root
+```
+
+5. **timeout**:
+```ini
+[defaults]
+timeout = 30
+```
+
+6. **host_key_checking**:
+```ini
+[defaults]
+host_key_checking = False
+```
+
+### A13 — Easy: What is the register keyword in Ansible, and how do you use the registered variable in a subsequent task?
+
+**register**:
+- Captures the output of a task into a variable
+- Stores stdout, stderr, return code, and other data
+- Used to make decisions based on task results
+
+**Example**:
+```yaml
+- name: Check if file exists
+  command: ls /etc/example.conf
+  register: file_check
+  ignore_errors: yes
+
+- name: Show file check result
+  debug:
+    msg: "File exists: {{ file_check.rc == 0 }}"
+```
+
+**Using registered variables**:
+```yaml
+- name: Run a command
+  command: /usr/bin/uptime
+  register: uptime_result
+
+- name: Show uptime
+  debug:
+    msg: "Uptime output: {{ uptime_result.stdout }}"
+```
+
+Common attributes: `stdout`, `stderr`, `rc`, `changed`, `failed`
+
+### A14 — Medium: Explain the difference between include_tasks and import_tasks. When would you use one over the other, and how does this affect conditional evaluation?
+
+**include_tasks**:
+- Dynamically includes tasks at runtime
+- Tasks are evaluated when the include is reached
+- Can be used with conditionals and loops
+- Variables are evaluated at runtime
+
+**import_tasks**:
+- Statically imports tasks at parse time
+- Tasks are evaluated when the playbook is parsed
+- Cannot be used with conditionals or loops
+- Variables are evaluated at parse time
+
+**Key differences**:
+
+1. **Timing**: include_tasks is runtime, import_tasks is parse time
+2. **Conditionals**: include_tasks supports `when`, import_tasks doesn't
+3. **Loops**: include_tasks supports `loop`, import_tasks doesn't
+4. **Performance**: import_tasks is faster (no runtime overhead)
+5. **Debugging**: import_tasks is easier to debug (all tasks visible)
+
+**When to use each**:
+- Use `include_tasks` when you need conditionals or loops
+- Use `import_tasks` for static, predictable task lists
+- Use `include_tasks` for dynamic file inclusion (e.g., based on OS)
+
+### A15 — Medium: What is Ansible Galaxy, and how do you use a requirements.yml file to install roles and collections from it?
+
+**Ansible Galaxy**:
+- A community repository for Ansible roles and collections
+- Allows sharing and reusing roles
+- Provides a way to discover and install community-maintained content
+
+**Using requirements.yml**:
+
+1. **Create requirements.yml**:
+```yaml
+# requirements.yml
+roles:
+  - name: geerlingguy.nginx
+    version: 2.7.0
+
+  - name: my_custom_role
+    src: https://github.com/myorg/my_custom_role.git
+    version: v1.0.0
+
+collections:
+  - name: community.docker
+    version: 3.0.0
+
+  - name: my_namespace.my_collection
+    src: https://github.com/myorg/my_collection.git
+```
+
+2. **Install roles and collections**:
+```bash
+ansible-galaxy install -r requirements.yml
+```
+
+3. **Use the installed roles**:
+```yaml
+- name: Deploy nginx
+  hosts: webservers
+  roles:
+    - geerlingguy.nginx
+```
+
+### A16 — Medium: Explain how Ansible connection plugins work. What is the difference between ssh, local, and network_cli connection types? When would you use each?
+
+**Connection plugins**:
+- Define how Ansible connects to target hosts
+- Handle authentication, transport, and execution
+
+**ssh connection**:
+- Default connection type
+- Uses SSH to connect to remote hosts
+- Requires SSH access and credentials
+- Used for Linux/Unix hosts
+
+**local connection**:
+- Runs tasks on the control node (localhost)
+- No remote connection needed
+- Used for local operations or when running on the same host
+- Example: `connection: local`
+
+**network_cli connection**:
+- Used for network devices (routers, switches)
+- Uses SSH or other protocols to connect to network devices
+- Supports CLI-based interaction
+- Used for Cisco, Juniper, etc.
+
+**When to use each**:
+- Use `ssh` for standard Linux/Unix hosts
+- Use `local` for local operations or when the control node is the target
+- Use `network_cli` for network devices that don't support standard SSH modules
+
+### A17 — Hard: Explain how Ansible's delegate_to and run_once work. Give a practical example where you need to run a task on the control node (localhost) once, using data gathered from a remote host.
+
+**delegate_to**:
+- Runs a task on a different host than the one in the play
+- Useful for tasks that must run on a specific host (e.g., a database server)
+- Example: `delegate_to: localhost` runs on the control node
+
+**run_once**:
+- Runs a task only once, even if the play targets multiple hosts
+- Useful for tasks that should only run once (e.g., creating a shared resource)
+- Example: `run_once: true` runs the task on the first host only
+
+**Practical example**:
+
+```yaml
+- name: Gather facts from remote hosts
+  hosts: webservers
+  tasks:
+    - name: Collect web server IPs
+      setup:
+      register: web_facts
+
+- name: Update load balancer configuration
+  hosts: localhost
+  tasks:
+    - name: Generate load balancer config
+      template:
+        src: lb_config.j2
+        dest: /etc/nginx/nginx.conf
+      vars:
+        web_servers: "{{ groups['webservers'] }}"
+      delegate_to: localhost
+      run_once: true
+```
+
+In this example:
+- We gather facts from remote hosts
+- Then run a task on localhost once to generate a load balancer config
+- The task uses data from the remote hosts (web server IPs)
+
+### A18 — Hard: You need to manage a fleet of 500 hosts and Ansible playbook runs take over 30 minutes. Identify at least 4 strategies to improve performance and explain the tradeoffs (cover: forks, pipelining, fact caching, and mitogen or similar).
+
+**Strategy 1: Increase forks**
+- Set `forks = 50` or higher in ansible.cfg
+- More parallel connections to hosts
+- Tradeoff: Higher memory usage, potential SSH connection limits
+
+**Strategy 2: Enable pipelining**
+- Set `pipelining = True` in ansible.cfg
+- Reduces SSH connection overhead
+- Tradeoff: Requires sudo access without tty
+
+**Strategy 3: Enable fact caching**
+- Set `gather_facts = False` and use fact caching
+- Cache facts to avoid re-collecting them
+- Tradeoff: Facts might be stale; need to refresh periodically
+
+**Strategy 4: Use Mitogen or similar**
+- Mitogen is a faster connection plugin
+- Uses a different transport mechanism
+- Tradeoff: Requires installation, might have compatibility issues
+
+**Strategy 5: Use async tasks**
+- Run long-running tasks in the background
+- Check on them later
+- Tradeoff: More complex error handling
+
+**Strategy 6: Use serial batches**
+- Process hosts in batches
+- Tradeoff: Slower overall, but more controlled
+
+**Strategy 7: Use `gather_facts: false`**
+- Skip fact gathering when not needed
+- Tradeoff: You lose system information
+
+### A19 — Hard: Explain how Ansible Jinja2 templating works. What is the difference between {{ }}, {% %}, and {# #}? Write a template snippet that generates an nginx upstream block from a list of backend servers with health check comments.
+
+**Jinja2 templating**:
+- Ansible uses Jinja2 for templating
+- Templates are processed on the control node
+- Variables and expressions are replaced with actual values
+
+**{{ }} - Expression**:
+- Used for variable substitution
+- Outputs the value of the expression
+- Example: `{{ ansible_hostname }}`
+
+**{% %} - Statement**:
+- Used for control flow (loops, conditionals)
+- Doesn't output anything directly
+- Example: `{% for server in servers %}`
+
+**{# #} - Comment**:
+- Used for comments
+- Not output in the final result
+- Example: `{# This is a comment #}`
+
+**Template snippet for nginx upstream**:
+```nginx
+{# Generate nginx upstream block #}
+upstream backend {
+    {% for server in backend_servers %}
+    {# Add health check comment for each server #}
+    server {{ server.host }}:{{ server.port }};  # Health check: {{ server.health_check }}
+    {% endfor %}
+}
+```
+
+### A20 — Hard: Describe how to implement a zero-downtime rolling deployment of a web application across 20 servers using Ansible. Cover: serial batches, pre/post tasks for load balancer registration, health checks with uri module, and rollback strategy on failure using block/rescue.
+
+**Zero-downtime rolling deployment**:
+
+```yaml
+- name: Rolling deployment
+  hosts: webservers
+  serial: 5
+  tasks:
+    - name: Pre-deployment - Remove from load balancer
+      block:
+        - name: Remove server from load balancer
+          uri:
+            url: "http://lb.example.com/api/remove"
+            method: POST
+            body: "server={{ inventory_hostname }}"
+          delegate_to: localhost
+
+        - name: Deploy new version
+          block:
+            - name: Pull new version
+              git:
+                repo: https://github.com/example/app.git
+                dest: /var/www/app
+                version: "{{ app_version }}"
+
+            - name: Restart application
+              service:
+                name: app
+                state: restarted
+
+            - name: Health check
+              uri:
+                url: "http://localhost:8080/health"
+                status_code: 200
+              register: health_check
+
+            - name: Add back to load balancer
+              uri:
+                url: "http://lb.example.com/api/add"
+                method: POST
+                body: "server={{ inventory_hostname }}"
+              delegate_to: localhost
+          rescue:
+            - name: Rollback to previous version
+              git:
+                repo: https://github.com/example/app.git
+                dest: /var/www/app
+                version: "{{ previous_version }}"
+
+            - name: Restart application
+              service:
+                name: app
+                state: restarted
+
+            - name: Add back to load balancer
+              uri:
+                url: "http://lb.example.com/api/add"
+                method: POST
+                body: "server={{ inventory_hostname }}"
+              delegate_to: localhost
+```
+
+**Key components**:
+
+1. **serial: 5** - Process 5 servers at a time
+2. **Pre-deployment** - Remove from load balancer before deploying
+3. **Deployment** - Pull new version, restart, health check
+4. **Post-deployment** - Add back to load balancer after health check passes
+5. **Rollback** - If health check fails, revert to previous version
+6. **block/rescue** - Handle failures gracefully
+
+**Rollback strategy**:
+- Use `rescue` block to handle failures
+- Revert to previous version
+- Ensure server is added back to load balancer even on failure
+
+This ensures zero downtime because servers are removed from the load balancer before deployment and only added back after passing health checks.

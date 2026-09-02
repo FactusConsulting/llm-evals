@@ -25,7 +25,7 @@ API_KEY="${LLAMA_API_KEY:-}"
 SCENARIO=""          # If set, run only this scenario (e.g., LD3)
 JUDGE_URL=""         # If set, send each response to judge for rubric scoring
 VERBOSE=0
-MAX_TOKENS=4096
+MAX_TOKENS=32768   # must fit thinking + content for reasoning models; 4096 starved content (finish=length, empty answer) and the parser then silently saved the chain-of-thought, which the spiral check mis-flagged as looping. 20480 still truncated on heavy-reasoning scenarios (LD2/LD3) where thinking ran away — bumped to 32768 and the scenario loop made fault-tolerant so one truncation no longer aborts the whole pass
 TEMPERATURE=0.1
 PARALLEL=0           # Run all scenarios in parallel (default: sequential)
 DELAY_BETWEEN=0      # Seconds to sleep between scenarios (courtesy gap for shared server)
@@ -106,7 +106,17 @@ import json, sys
 raw = sys.stdin.read()
 try:
     data = json.loads(raw)
-    content = data['choices'][0]['message'].get('content') or data['choices'][0]['message'].get('reasoning_content', '')
+    ch = data['choices'][0]
+    msg = ch['message']
+    content = msg.get('content') or ''
+    # Reasoning models: if the budget was spent thinking, content is empty and
+    # finish_reason=length. Do NOT silently fall back to reasoning_content — that
+    # chain-of-thought then gets scored as the answer (and flagged as a spiral).
+    if not content.strip() and ch.get('finish_reason') == 'length':
+        print('ERROR: truncated (finish_reason=length, empty content — raise --max-tokens)', file=sys.stderr)
+        sys.exit(1)
+    if not content.strip():
+        content = msg.get('reasoning_content', '')
     print(content)
 except Exception as e:
     print(f'ERROR parsing response: {e}', file=sys.stderr)
@@ -427,7 +437,7 @@ else
       echo "  (waiting ${DELAY_BETWEEN}s before next scenario...)"
       sleep "$DELAY_BETWEEN"
     fi
-    run_scenario "$prompt_file"
+    run_scenario "$prompt_file" || echo "  (scenario errored — recorded, continuing to next)"
     first=0
   done
 fi

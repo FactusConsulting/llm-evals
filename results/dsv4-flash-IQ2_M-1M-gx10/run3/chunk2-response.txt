@@ -1,0 +1,392 @@
+## Kubernetes (20 questions)
+
+### K1 — Easy: What is the difference between a Deployment and a StatefulSet?
+
+A **Deployment** is for stateless applications. Pods are interchangeable, have random names, share volumes (if any), and can be scaled/rolled out freely. A **StatefulSet** is for stateful applications. Pods have stable network identity (e.g., `pod-0`, `pod-1`), stable persistent storage (each pod gets its own PVC), and are created/terminated in order. StatefulSets are used for databases, Kafka, etc., where identity and ordering matter.
+
+### K2 — Easy: How does a Kubernetes Service of type ClusterIP route traffic to pods?
+
+A ClusterIP Service has a stable virtual IP. It uses a label selector to match pods. `kube-proxy` watches the API server for the Service's Endpoints (the list of pod IPs matching the selector) and programs iptables/IPVS rules on each node. When traffic hits the ClusterIP, it is DNAT'd to one of the pod IPs (typically random or round-robin). The Service IP is stable, while pod IPs change.
+
+### K3 — Medium: Explain the difference between a PersistentVolume, a PersistentVolumeClaim, and a StorageClass. How do they relate?
+
+- **PersistentVolume (PV)**: A cluster-level storage resource, provisioned by an admin or dynamically. It's like a node for storage.
+- **PersistentVolumeClaim (PVC)**: A user request for storage. It binds to a PV that satisfies its size/access mode requirements.
+- **StorageClass**: Defines the storage type (e.g., SSD, network storage) and the provisioner. It enables dynamic provisioning — a PVC can request a StorageClass, and the provisioner creates a PV automatically.
+
+**Relationship**: PVC → binds to PV → uses StorageClass to determine how the PV is provisioned (dynamic or static).
+
+### K4 — Medium: A pod is stuck in CrashLoopBackOff. Describe your troubleshooting steps (at least 4 distinct checks).
+
+1. **Check pod logs**: `kubectl logs <pod>` — look for application errors, panics, or missing dependencies.
+2. **Check pod events**: `kubectl describe pod <pod>` — look for ImagePullBackOff, OOMKilled, liveness probe failures, etc.
+3. **Check container exit code and restart count**: `kubectl get pod -o yaml` — exit code 137 = OOM, 1 = app error, etc.
+4. **Check resource limits**: If the container is OOM-killed, verify memory limits vs. actual usage.
+5. **Check configuration**: Verify env vars, ConfigMaps, Secrets are correct.
+6. **Check dependencies**: Is the app failing because it can't connect to a DB, service, or external endpoint?
+
+### K5 — Medium: What is the role of CoreDNS in a Kubernetes cluster? What happens to DNS resolution if the CoreDNS pods are down?
+
+CoreDNS is the cluster DNS server. It provides DNS resolution for Services and Pods within the cluster (e.g., `my-service.my-namespace.svc.cluster.local`). It implements the cluster's DNS service (typically named `kube-dns` or `coredns`).
+
+If CoreDNS is down: Pods can't resolve internal service names. External DNS resolution may also fail because the pod's `resolv.conf` points to CoreDNS as the nameserver. Existing connections may continue, but new connections to services by name will fail.
+
+### K6 — Hard: Explain how the Kubernetes scheduler decides which node to place a pod on. Cover: filtering, scoring, and at least 3 specific factors it considers.
+
+The scheduler uses a two-phase process:
+
+1. **Filtering (feasibility)**: Find nodes that can accommodate the pod. It checks:
+   - Resource requests (CPU, memory, GPU) vs. node allocatable
+   - Node affinity/anti-affinity rules
+   - Taints and tolerations
+   - Node conditions (e.g., disk pressure, memory pressure)
+   - Pod anti-affinity (e.g., don't co-locate with other pods)
+   - Volume zone/region constraints
+   - Custom scheduler plugins
+
+2. **Scoring (preference)**: Rank the feasible nodes. It applies scoring algorithms:
+   - Least requested (spread pods) vs. most requested (bin-pack)
+   - Node affinity weights
+   - Inter-pod affinity weights
+   - Node age, locality (e.g., data locality for volumes)
+   - Balanced resource usage (CPU vs. memory)
+
+**Specific factors**: resource requests, node affinity, taints/tolerations, pod anti-affinity, data locality (volume zones), node conditions.
+
+### K7 — Hard: You have a pod with requests.memory: 256Mi and limits.memory: 512Mi. The node has 4GB RAM with 3.5GB already requested. Will the pod be scheduled? What happens if it actually uses 600Mi at runtime?
+
+**Scheduling**: The node has 4GB total, 3.5GB already requested (allocated). Available for scheduling = 4GB - 3.5GB = 0.5GB = 512Mi. The pod requests 256Mi, so it fits (512Mi >= 256Mi). **Yes, it will be scheduled.**
+
+**Runtime**: The pod's limit is 512Mi. If it uses 600Mi, the kernel OOM killer will kill the container (or the kubelet will enforce the limit). The container will be terminated (OOMKilled) and restarted (depending on restart policy). The pod's actual usage can't exceed the limit — cgroups enforce it.
+
+### K8 — Hard: Explain the full lifecycle of a request hitting a Kubernetes Ingress backed by an NGINX ingress controller, all the way to the application pod. Include at least: external LB, ingress controller, Service, Endpoints, kube-proxy/iptables.
+
+1. **External LB**: The cloud LB (or MetalLB) forwards traffic to the NGINX ingress controller's NodePort or LoadBalancer service.
+2. **Ingress Controller**: The NGINX pod receives the request. It looks at the Ingress resource (host, path) to determine which backend Service to route to.
+3. **Service**: The NGINX controller resolves the Service name to a ClusterIP (via DNS or API) and sends the request to that ClusterIP.
+4. **Endpoints**: The Service has Endpoints (list of pod IPs) matching the selector. `kube-proxy` watches these and programs iptables rules.
+5. **kube-proxy/iptables**: When the request hits the ClusterIP, iptables DNAT rules forward it to one of the pod IPs (random or round-robin).
+6. **Application Pod**: The pod receives the request on its container port.
+
+### K9 — Medium: What is a NetworkPolicy? If no NetworkPolicy exists in a namespace, what is the default behavior? What happens when you apply one that selects certain pods?
+
+A **NetworkPolicy** controls traffic between pods, namespaces, and external endpoints. It uses labels to select pods and defines ingress/egress rules.
+
+**Default behavior**: If no NetworkPolicy exists, all pods can communicate freely (allow-all).
+
+**When you apply one that selects certain pods**: The selected pods get the policy applied. For those pods, traffic is restricted to what the policy allows. Unselected pods remain allow-all. Note: If a policy selects a pod and has no ingress rules, all ingress is denied (default-deny). Same for egress.
+
+### K10 — Medium: Explain the difference between RollingUpdate and Recreate deployment strategies. When would you choose Recreate?
+
+- **RollingUpdate**: The default. It gradually replaces old pods with new ones, ensuring zero or minimal downtime. It has parameters like `maxUnavailable` and `maxSurge`. It waits for readiness probes before continuing.
+- **Recreate**: It kills all old pods first, then creates new ones. This causes downtime but is simpler and avoids issues with multiple versions running simultaneously.
+
+**Choose Recreate when**: You need to ensure only one version is running at a time (e.g., for stateful apps that can't have two versions running), or when the app doesn't support rolling updates (e.g., it holds a lock or uses a shared volume that can't be mounted by multiple pods).
+
+### K11 — Easy: What is a Kubernetes namespace, and what are the default namespaces created in a new cluster?
+
+A **namespace** is a virtual cluster within a cluster. It provides isolation, resource quotas, and access control. It's used to separate environments (dev, prod), teams, or applications.
+
+**Default namespaces**: `default`, `kube-system`, `kube-public`, `kube-node-lease`.
+
+### K12 — Easy: What is `kubectl describe pod <name>` used for? Name at least 3 pieces of information it shows that `kubectl get pod` does not.
+
+`kubectl describe` gives detailed info about a resource. It shows:
+1. **Events** (recent events like pulling image, starting container, etc.)
+2. **Detailed container info** (image, ports, env, resource requests/limits, liveness/readiness probes)
+3. **Labels, annotations, owner references**
+4. **Node name, scheduled time, tolerations, QoS class**
+5. **Volume mounts and volumes**
+
+`kubectl get pod` only shows basic info (name, ready, status, restarts, age).
+
+### K13 — Easy: What is a ConfigMap, and how can a pod consume it? Name at least two different methods.
+
+A **ConfigMap** stores configuration data as key-value pairs. It decouples configuration from container images.
+
+**Consumption methods**:
+1. **As environment variables**: `envFrom` or `env` with `valueFrom: configMapKeyRef`.
+2. **As files in a volume**: Mount the ConfigMap as a volume; files appear in the mount path.
+3. **As command-line arguments** (via env vars or files).
+
+### K14 — Easy: What is the difference between a Service of type ClusterIP, NodePort, and LoadBalancer?
+
+- **ClusterIP**: Internal-only virtual IP. Accessible only within the cluster. Default type.
+- **NodePort**: Exposes the service on a static port on each node's IP. Accessible from outside via `nodeIP:nodePort`. It builds on ClusterIP.
+- **LoadBalancer**: Uses the cloud provider's load balancer to expose the service externally. It builds on NodePort (or ClusterIP). The cloud LB routes traffic to the node ports.
+
+### K15 — Easy: What is a DaemonSet, and when would you use one instead of a Deployment?
+
+A **DaemonSet** ensures that a copy of a pod runs on every node (or a subset). It's used for node-level infrastructure like monitoring agents, log collectors, network plugins, and kube-proxy.
+
+**Use DaemonSet instead of Deployment when**: You need a pod on every node (or specific nodes) — e.g., a metrics agent, log shipper, or security agent. Deployments scale based on replicas, not nodes.
+
+### K16 — Medium: What are taints and tolerations? How do they differ from node affinity, and give a practical use case for each?
+
+**Taints and tolerations**: Taints are applied to nodes to repel pods. Tolerations are applied to pods to allow them to schedule on tainted nodes. They work together — a pod needs a toleration for a node's taint to be scheduled there.
+
+**Node affinity**: Attracts pods to nodes based on labels. It's a preference or requirement.
+
+**Difference**: Taints/tolerations are "repel" (don't schedule unless tolerated), while affinity is "attract" (prefer or require). Taints can prevent pods from scheduling on a node, while affinity can't prevent — it only attracts.
+
+**Use cases**:
+- **Taints/tolerations**: Dedicate nodes to specific workloads (e.g., GPU nodes tainted so only GPU workloads tolerate them). Or prevent workloads from scheduling on master nodes.
+- **Node affinity**: Prefer to schedule a pod on a node with SSD storage, or require a pod to be on a node in a specific region/zone.
+
+### K17 — Medium: Explain what a Kubernetes Operator is. How does it differ from a standard controller, and what problems does the Operator pattern solve?
+
+An **Operator** extends Kubernetes with custom resources and controllers that manage complex applications. It encodes domain knowledge (operational procedures) into software. It watches the cluster state and reconciles it to the desired state.
+
+**Difference from a standard controller**: A standard controller (e.g., Deployment controller) manages built-in resources. An Operator manages custom resources (CRDs) and often manages the application lifecycle (backup, upgrade, scaling, recovery).
+
+**Problems solved**: Automating operational tasks (backups, upgrades, failover), managing stateful apps (databases, message queues), reducing manual intervention, and providing domain-specific automation.
+
+### K18 — Hard: Explain the etcd consistency model used by Kubernetes. What happens to the cluster if the etcd quorum is lost? How do you recover from a situation where 2 out of 3 etcd nodes are permanently lost?
+
+etcd uses **Raft consensus**. It requires a quorum (majority) of nodes to agree on writes. For a 3-node cluster, quorum is 2. For 5-node, quorum is 3.
+
+**If quorum is lost**: The cluster can't accept writes (no new resources, no updates). Reads may still work (if using serializable reads), but the API server may reject writes. The cluster becomes effectively read-only. If the API server can't reach etcd, it may fail entirely.
+
+**Recovery from 2/3 lost**: You need to restore from a snapshot or rebuild the cluster. Steps:
+1. Stop the remaining etcd node.
+2. Restore from a snapshot (`etcdctl snapshot restore`) on a new node.
+3. Start a new single-node etcd cluster (or add new members).
+4. Update the API server to point to the new etcd.
+5. If you have a snapshot, you can restore the cluster to a consistent state. If not, you may lose data.
+
+### K19 — Hard: Describe how Kubernetes RBAC works. Explain the relationship between Role, ClusterRole, RoleBinding, and ClusterRoleBinding. A developer needs read-only access to pods and logs in a single namespace — write the RBAC manifests.
+
+RBAC uses:
+- **Role**: Defines permissions (verbs on resources) within a namespace.
+- **ClusterRole**: Same as Role but cluster-wide (can also define permissions for cluster-scoped resources).
+- **RoleBinding**: Binds a Role to a user/group/service account within a namespace.
+- **ClusterRoleBinding**: Binds a ClusterRole to a user/group/service account cluster-wide.
+
+**Relationship**: A RoleBinding can reference a Role or a ClusterRole (if you want to reuse cluster-wide permissions in a namespace). A ClusterRoleBinding can only reference a ClusterRole.
+
+**Manifests for developer read-only access to pods and logs in namespace `dev`**:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: dev
+  name: pod-reader
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  namespace: dev
+  name: dev-pod-reader
+subjects:
+- kind: User
+  name: developer
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### K20 — Hard: You notice pod DNS resolution is slow (>5s) for external domains. Explain how ndots in /etc/resolv.conf inside a pod causes excessive DNS queries, and how you would fix it using dnsConfig in the pod spec.
+
+`ndots` is the number of dots a domain name must have before the resolver tries the absolute name first (with trailing dot) vs. searching the search domains. Default `ndots` is 5. For a domain like `example.com` (1 dot), the resolver tries `example.com.<search-domain>` first (e.g., `example.com.default.svc.cluster.local`), then `example.com.svc.cluster.local`, then `example.com.cluster.local`, then `example.com` (absolute). Each failed query adds latency.
+
+**Fix**: Set `ndots: 1` in `dnsConfig` so that domains with 1 dot are tried as absolute first. Also, you can set `search` to empty or minimal. Example:
+
+```yaml
+dnsConfig:
+  options:
+  - name: ndots
+    value: "1"
+```
+
+This reduces the number of DNS queries for external domains.
+
+## Development (20 questions)
+
+### D1 — Easy: What is the difference between git rebase and git merge? When should you avoid rebasing?
+
+- **Merge**: Creates a merge commit that combines branches. Preserves history (all commits from both branches). Non-destructive.
+- **Rebase**: Replays commits from one branch onto another, creating a linear history. It rewrites commit history (changes commit SHAs).
+
+**Avoid rebasing**: When the branch has been shared/pushed to a remote and others have based work on it. Rebasing shared branches causes conflicts and confusion. Also, avoid rebasing if you don't want to rewrite history.
+
+### D2 — Easy: Explain the difference between TCP and UDP. Name 2 protocols that use each.
+
+- **TCP**: Connection-oriented, reliable, ordered, flow control, error checking. Used for HTTP, FTP, SMTP.
+- **UDP**: Connectionless, unreliable, no ordering, no error checking (beyond checksum). Used for DNS, DHCP, VoIP, video streaming.
+
+### D3 — Medium: What is a race condition? Give a concrete example in any language.
+
+A **race condition** occurs when multiple threads/processes access shared data concurrently, and the outcome depends on the timing of their execution. It leads to inconsistent or incorrect results.
+
+**Example (Python)**:
+```python
+import threading
+counter = 0
+def increment():
+    global counter
+    for _ in range(1000):
+        counter += 1
+threads = [threading.Thread(target=increment) for _ in range(10)]
+for t in threads: t.start()
+for t in threads: t.join()
+print(counter)  # Not 10000, due to race condition
+```
+
+### D4 — Medium: Explain the difference between symmetric and asymmetric encryption. How are both used together in TLS?
+
+- **Symmetric**: Same key for encryption and decryption. Fast, but key distribution is a problem.
+- **Asymmetric**: Public/private key pair. Public encrypts, private decrypts (or vice versa). Slower, but solves key distribution.
+
+**TLS**: Uses asymmetric encryption for key exchange (e.g., RSA, ECDHE) to securely establish a shared session key. Then uses symmetric encryption (AES) for the actual data transfer. This combines the security of asymmetric with the speed of symmetric.
+
+### D5 — Medium: What is a container image layer? How does layer caching affect Dockerfile best practices?
+
+A **container image layer** is created by each instruction in a Dockerfile. Layers are read-only and stacked, representing changes to the filesystem. Layers are cached and reused across builds.
+
+**Layer caching**: If a layer hasn't changed, Docker reuses the cached layer, speeding up builds. **Best practices**:
+- Order instructions from least likely to change to most likely (e.g., copy source code last).
+- Combine `RUN` commands to reduce layers.
+- Use `.dockerignore` to avoid copying unnecessary files.
+- Use multi-stage builds to reduce image size.
+
+### D6 — Medium: You have a REST API returning HTTP 503 intermittently. Describe at least 4 things you would check, and in what order.
+
+1. **Check server logs** for errors (application-level).
+2. **Check server load** (CPU, memory, disk I/O) — is it overloaded?
+3. **Check dependencies** (database, cache, external services) — are they healthy?
+4. **Check load balancer / proxy configuration** — is it routing correctly?
+5. **Check for rate limiting or throttling**.
+6. **Check network connectivity** (DNS, firewall).
+
+**Order**: Start with logs, then resource usage, then dependencies, then infrastructure.
+
+### D7 — Hard: Explain the CAP theorem. Give a real-world example of a system that chooses CP over AP, and one that chooses AP over CP.
+
+**CAP theorem**: In a distributed system, you can only guarantee two of three: Consistency (all nodes see the same data), Availability (every request gets a response), Partition tolerance (system continues to operate despite network partitions).
+
+- **CP**: Choose consistency and partition tolerance, sacrifice availability. Example: Traditional relational databases (e.g., PostgreSQL with synchronous replication) — during a partition, they may refuse requests to maintain consistency.
+- **AP**: Choose availability and partition tolerance, sacrifice consistency. Example: Cassandra or DynamoDB — during a partition, they accept writes and reconcile later (eventual consistency).
+
+### D8 — Medium: What is the difference between horizontal and vertical scaling? What architectural patterns enable horizontal scaling?
+
+- **Vertical scaling**: Add more resources (CPU, RAM) to a single machine. Limited by hardware limits.
+- **Horizontal scaling**: Add more machines/nodes. Requires the application to be designed for distribution.
+
+**Architectural patterns for horizontal scaling**: Stateless services (store state elsewhere), load balancing, distributed databases, message queues, microservices, auto-scaling, sharding.
+
+### D9 — Easy: What is an environment variable? How do you set one that persists across shell sessions on Linux?
+
+An **environment variable** is a variable available to processes in the shell environment. It's used for configuration (e.g., PATH, HOME).
+
+**To persist across sessions**: Add `export VAR=value` to `~/.bashrc` (or `~/.profile`, `~/.zshrc`). Then source it or restart the shell.
+
+### D10 — Easy: What is JSON, and how does it differ from YAML? Name one advantage of each format.
+
+**JSON** (JavaScript Object Notation) is a text-based data format using key-value pairs and arrays. It's strict (no comments, requires quotes).
+
+**YAML** (YAML Ain't Markup Language) is a human-readable data format that uses indentation. It supports comments and is more concise.
+
+**Advantages**:
+- **JSON**: Widely supported, strict parsing, good for machine-to-machine communication.
+- **YAML**: More human-readable, supports comments, less verbose.
+
+### D11 — Easy: What is a REST API? Explain the difference between GET, POST, PUT, and DELETE HTTP methods.
+
+A **REST API** is an architectural style for building APIs that use HTTP. It uses resources (URIs) and HTTP methods.
+
+- **GET**: Retrieve a resource (read-only, safe).
+- **POST**: Create a new resource (or trigger a process). Not idempotent.
+- **PUT**: Update/replace a resource (idempotent).
+- **DELETE**: Remove a resource.
+
+### D12 — Easy: What is version pinning in dependency management, and why is it important for reproducible builds?
+
+**Version pinning** specifies exact versions of dependencies (e.g., `package.json` with exact versions, `requirements.txt` with `==`). It ensures that builds use the same versions.
+
+**Importance**: Reproducible builds — the same code produces the same result. Without pinning, a dependency update could break the build or introduce bugs.
+
+### D13 — Easy: What is the difference between a compiled language and an interpreted language? Give two examples of each.
+
+- **Compiled**: Source code is translated to machine code before execution. Examples: C, Rust, Go.
+- **Interpreted**: Source code is executed line-by-line by an interpreter at runtime. Examples: Python, JavaScript, Ruby.
+
+### D14 — Medium: Explain what a reverse proxy is and how it differs from a forward proxy. Name two common reverse proxy servers and a use case for each.
+
+- **Forward proxy**: Sits between a client and the internet. It forwards client requests to servers. Used for anonymity, content filtering, bypassing geo-restrictions.
+- **Reverse proxy**: Sits in front of backend servers. It forwards client requests to the appropriate backend. Used for load balancing, caching, SSL termination, security.
+
+**Common reverse proxies**: Nginx (load balancing, static file serving), HAProxy (high-availability load balancing), Traefik (Kubernetes ingress).
+
+### D15 — Medium: What is a deadlock? What four conditions (Coffman conditions) must hold simultaneously for a deadlock to occur?
+
+A **deadlock** is a situation where two or more processes are blocked, each waiting for the other to release a resource.
+
+**Coffman conditions**:
+1. **Mutual exclusion**: At least one resource is held exclusively.
+2. **Hold and wait**: A process holds a resource and waits for another.
+3. **No preemption**: Resources can't be forcibly taken.
+4. **Circular wait**: A cycle of processes waiting for each other.
+
+### D16 — Hard: Explain the concept of eventual consistency. How do distributed databases like Cassandra handle read-after-write consistency, and what tunable consistency levels exist?
+
+**Eventual consistency** is a consistency model where updates propagate to all replicas eventually, but not immediately. Reads may return stale data.
+
+**Cassandra**: Uses tunable consistency levels for reads and writes. You can specify `ONE`, `QUORUM`, `ALL`, etc. For read-after-write consistency, you can use `QUORUM` for both reads and writes (so that a read sees the latest write). Or use `QUORUM` for writes and `ONE` for reads (may be stale). **Consistency levels**: `ANY`, `ONE`, `TWO`, `THREE`, `QUORUM`, `LOCAL_QUORUM`, `EACH_QUORUM`, `ALL`, `LOCAL_ONE`, `LOCAL_QUORUM`, `SERIAL`, `LOCAL_SERIAL`.
+
+### D17 — Hard: What is mTLS (mutual TLS)? Explain the full handshake process, including how both client and server authenticate each other. Where is mTLS commonly used in infrastructure?
+
+**mTLS** (mutual TLS) is a TLS variant where both client and server authenticate each other using certificates.
+
+**Handshake**:
+1. Client sends a `ClientHello` with supported ciphers.
+2. Server responds with `ServerHello`, its certificate, and requests a client certificate.
+3. Client verifies the server's certificate (against a CA).
+4. Client sends its certificate and a `CertificateVerify` message (proving it has the private key).
+5. Server verifies the client's certificate.
+6. Both exchange key exchange messages (e.g., ECDHE) to derive a shared session key.
+7. Both send `Finished` messages.
+
+**Common uses**: Service-to-service communication in microservices (e.g., Istio), Kubernetes API server authentication, database connections (e.g., PostgreSQL with client certs), cloud infrastructure.
+
+### D18 — Hard: Explain how a hash table works internally, including collision resolution strategies (chaining vs. open addressing). What is the time complexity for insertion, lookup, and deletion in average and worst cases?
+
+A **hash table** uses a hash function to map keys to indices in an array. Collisions occur when two keys hash to the same index.
+
+**Collision resolution**:
+- **Chaining**: Each bucket is a linked list (or tree). Collisions are stored in the same bucket.
+- **Open addressing**: When a collision occurs, probe for the next empty slot (linear probing, quadratic probing, double hashing).
+
+**Time complexity**:
+- **Average**: O(1) for insertion, lookup, deletion.
+- **Worst case**: O(n) for all (when many collisions, e.g., all keys hash to the same bucket).
+
+### D19 — Hard: What is a circuit breaker pattern in microservices? Explain its three states (closed, open, half-open) and how it prevents cascade failures. How does it relate to retry policies and exponential backoff?
+
+A **circuit breaker** is a pattern that prevents a service from being overwhelmed by failing dependencies. It wraps calls to a remote service and monitors failures.
+
+**States**:
+- **Closed**: Normal operation. Calls pass through. If failures exceed a threshold, it opens.
+- **Open**: Calls fail fast (without hitting the service). After a timeout, it goes to half-open.
+- **Half-open**: Allows a few trial calls. If they succeed, it closes. If they fail, it reopens.
+
+It **prevents cascade failures** by failing fast and giving the failing service time to recover. It relates to retry policies: retries should be limited and use exponential backoff to avoid overwhelming the service. The circuit breaker is a higher-level pattern that stops retries when the service is failing.
+
+### D20 — Hard: Explain the difference between optimistic and pessimistic concurrency control in databases. When would you choose each? Give a concrete example using database features (e.g., row versioning, SELECT FOR UPDATE).
+
+- **Pessimistic**: Locks resources before accessing them. Prevents conflicts by blocking other transactions. Example: `SELECT FOR UPDATE` locks rows until the transaction commits.
+- **Optimistic**: Assumes conflicts are rare. It doesn't lock; instead, it checks for conflicts at commit time (e.g., using a version number or timestamp). If a conflict is detected, the transaction fails and retries.
+
+**When to choose**:
+- **Pessimistic**: High contention, when conflicts are frequent, or when you need to guarantee no conflicts (e.g., financial transactions).
+- **Optimistic**: Low contention, when conflicts are rare, and you want to avoid lock overhead.
+
+**Example**:
+- **Pessimistic**: `SELECT * FROM accounts WHERE id = 1 FOR UPDATE;` — locks the row, other transactions can't modify it until commit.
+- **Optimistic**: `UPDATE accounts SET balance = balance - 100, version = version + 1 WHERE id = 1 AND version = 5;` — if version doesn't match, no rows updated, indicating a conflict.

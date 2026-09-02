@@ -1,0 +1,199 @@
+Here's a thinking process:
+
+1.  **Analyze User Input:**
+   - **Scenario:** LD3 — Large Code Review
+   - **Category:** open-ended-code-review
+   - **Difficulty:** high
+   - **Task:** Review a Go package adding a caching layer.
+   - **Constraints:**
+     - State approval status (approve, request changes, or block).
+     - List concrete issues (bugs, security, correctness) with specific file names and line numbers.
+     - List at most 3 nits/style issues.
+     - Stop after the review. No summaries, no repeating concerns.
+   - **Code Provided:** `cache/cache.go` and `cache/cache_test.go`
+
+2.  **Analyze the Code (Mental Walkthrough & Issue Identification):**
+   - `cache.go`:
+     - `entry` struct: `value interface{}`, `expiresAt time.Time`. Fine.
+     - `Cache` struct: `mu sync.Mutex`, `entries map[string]entry`, `ttl time.Duration`. Fine.
+     - `New(ttl time.Duration) *Cache`: Creates cache, starts `go c.evict()`. Fine.
+     - `Set(key string, val interface{})`: Locks, sets entry, unlocks. Fine.
+     - `Get(key string) (interface{}, bool)`: Locks, gets entry, unlocks. Checks expiry *after* unlocking. **BUG/CONCURRENCY ISSUE**: If the entry expires between unlock and check, it's fine, but there's a race condition with the evict goroutine? Actually, `evict` holds the lock while iterating and deleting. `Get` unlocks before checking expiry. This is generally okay for a simple cache, but checking expiry outside the lock means the entry could be deleted by `evict` concurrently, but `Get` already has a copy of `e`. Wait, `e` is a value copy of `entry`, so it's safe. However, checking expiry after unlocking is a minor correctness issue but not a crash. Let's look closer.
+     - Actually, `Get` checks `time.Now().After(e.expiresAt)` *after* releasing the lock. This is fine for correctness, but `evict` might delete it concurrently. Not a major bug.
+     - `Delete(key string)`: Locks, deletes, unlocks. Fine.
+     - `evict()`: Infinite loop, sleeps 1 minute, locks, iterates, deletes expired, unlocks. **BUG/ISSUE**: `time.Sleep` blocks the goroutine. If the program exits or needs graceful shutdown, this goroutine leaks. Also, `time.Sleep` is not precise for eviction timing. Better to use `time.NewTicker`.
+     - **Concurrency Bug in `Get`**: `c.mu.Lock()`, `e, ok := c.entries[key]`, `c.mu.Unlock()`, then checks expiry. If `evict` deletes the key concurrently, `Get` still has the value in `e`. That's fine. But what if `Set` updates the key concurrently? `Get` has a stale copy. That's expected for a cache.
+     - **Wait, look at `Get` again**: It checks expiry *after* unlocking. This is actually a correctness issue if we want strict consistency, but more importantly, `evict` runs every minute. If TTL is 100ms, the key might be accessed after TTL but before eviction, which is handled by the check. That's fine.
+     - **Major Issue**: `Get` checks `time.Now().After(e.expiresAt)` but `e` is a value copy. That's fine.
+     - **Another Issue**: `evict` uses `time.Sleep(time.Minute)`. This is a hardcoded sleep. Not configurable. Also, if `ttl` is less than a minute, keys might linger up to a minute past expiry. Not a bug, but a design flaw.
+     - **Concurrency Bug in `Get`**: Actually, there's a subtle race: `Get` reads `c.entries[key]` under lock, unlocks, then checks time. If `evict` deletes it concurrently, no problem. But what if `Set` updates it concurrently? `Get` gets the old value. That's fine.
+     - **Wait, look at `Get` line 44-46**: `c.mu.Lock()`, `e, ok := c.entries[key]`, `c.mu.Unlock()`. Then `if !ok || time.Now().After(e.expiresAt)`. This is fine.
+     - **Let's check `evict` again**: `for { time.Sleep(time.Minute); ... }`. This is a classic anti-pattern. Should use `time.NewTicker`. Also, no way to stop it. Graceful shutdown is impossible.
+     - **Security/Correctness**: `interface{}` allows any type. Not a bug, but limits type safety. Not a major issue for a cache.
+     - **Bug in `Get`**: Actually, `Get` checks expiry *after* unlocking. If `evict` deletes the entry concurrently, `Get` still returns the value. That's acceptable for a cache. But there's a race condition in `evict`: `for k, e := range c.entries { if now.After(e.expiresAt) { delete(c.entries, k) } }`. Modifying a map while ranging over it in Go is a **PANIC**. `delete(c.entries, k)` inside `range c.entries` is illegal in Go and will cause a runtime panic. **CRITICAL BUG**.
+     - Let's verify: In Go, you cannot delete from a map while ranging over it. You must collect keys to delete first, or use a separate map. This will definitely crash.
+     - Line reference: `cache/cache.go` line 63-66 (approx). Let's count lines in the provided code.
+       ```go
+       func (c *Cache) evict() {
+           for {
+               time.Sleep(time.Minute)
+               now := time.Now()
+               c.mu.Lock()
+               for k, e := range c.entries { // line ~63
+                   if now.After(e.expiresAt) { // line ~64
+                       delete(c.entries, k)    // line ~65
+                   }
+               }
+               c.mu.Unlock()
+           }
+       }
+       ```
+       Yes, modifying map during range is a panic. This is a critical bug.
+     - Another issue: `Get` checks expiry after unlocking. While not a panic, it's better to check inside the lock or at least acknowledge it. But the map modification during range is the killer.
+     - Also, `evict` goroutine leaks. No context or stop channel.
+     - `Get` returns `nil, false` on expiry. Fine.
+     - `New` starts goroutine without context. Fine for now, but should be noted.
+     - Let's list concrete issues with file/line numbers. I'll approximate line numbers based on the provided snippet, but I'll be precise.
+       - `cache/cache.go:65`: `delete(c.entries, k)` inside `range c.entries` causes a runtime panic. Must collect keys first.
+       - `cache/cache.go:58-68`: `evict()` goroutine cannot be stopped, causing a goroutine leak on program exit. Needs a `context.Context` or stop channel.
+       - `cache/cache.go:44-46`: `Get` checks expiration after releasing the lock. While not a panic, it allows stale reads past TTL until eviction runs. Better to check inside the lock or use a ticker for eviction.
+       - `cache/cache.go:59`: Hardcoded `time.Sleep(time.Minute)` ignores the configured `ttl`. Eviction granularity is fixed regardless of TTL.
+     - I need to pick the most critical ones for the "concrete issues" section. The map modification during range is #1. Goroutine leak is #2. Hardcoded sleep/ignoring TTL is #3.
+     - Let's verify line numbers carefully from the prompt:
+       ```go
+       // cache/cache.go
+       package cache
+       ...
+       1  package cache
+       2
+       3  import (
+       4      "context"
+       5      "sync"
+       6      "time"
+       7  )
+       8
+       9  type entry struct {
+      10      value     interface{}
+      11      expiresAt time.Time
+      12  }
+      13
+      14  type Cache struct {
+      15      mu      sync.Mutex
+      16      entries map[string]entry
+      17      ttl     time.Duration
+      18  }
+      19
+      20  func New(ttl time.Duration) *Cache {
+      21      c := &Cache{
+      22          entries: make(map[string]entry),
+      23          ttl:     ttl,
+      24      }
+      25      go c.evict()
+      26      return c
+      27  }
+      28
+      29  func (c *Cache) Set(key string, val interface{}) {
+      30      c.mu.Lock()
+      31      c.entries[key] = entry{value: val, expiresAt: time.Now().Add(c.ttl)}
+      32      c.mu.Unlock()
+      33  }
+      34
+      35  func (c *Cache) Get(key string) (interface{}, bool) {
+      36      c.mu.Lock()
+      37      e, ok := c.entries[key]
+      38      c.mu.Unlock()
+      39      if !ok || time.Now().After(e.expiresAt) {
+      40          return nil, false
+      41      }
+      42      return e.value, true
+      43  }
+      44
+      45  func (c *Cache) Delete(key string) {
+      46      c.mu.Lock()
+      47      delete(c.entries, key)
+      48      c.mu.Unlock()
+      49  }
+      50
+      51  func (c *Cache) evict() {
+      52      for {
+      53          time.Sleep(time.Minute)
+      54          now := time.Now()
+      55          c.mu.Lock()
+      56          for k, e := range c.entries {
+      57              if now.After(e.expiresAt) {
+      58                  delete(c.entries, k)
+      59              }
+      60          }
+      61          c.mu.Unlock()
+      62      }
+      63  }
+       ```
+       Line numbers match my mental count. I'll reference them accurately.
+     - Concrete Issues:
+       1. `cache/cache.go:58`: `delete(c.entries, k)` is called while ranging over `c.entries`. This violates Go's map iteration rules and will cause a fatal runtime panic. Keys must be collected first, then deleted.
+       2. `cache/cache.go:51-63`: The `evict` goroutine has no shutdown mechanism. It will leak indefinitely, preventing clean program termination. It should accept a `context.Context` or a stop channel.
+       3. `cache/cache.go:53`: `time.Sleep(time.Minute)` is hardcoded and ignores the `ttl` field. Eviction granularity will be fixed at 1 minute regardless of cache TTL, leading to unnecessary memory retention for short-lived entries.
+     - Nits/Style (max 3):
+       1. `cache/cache.go:10`: `value interface{}` lacks documentation. Consider adding a comment or using a type parameter if Go 1.18+ is supported, or at least document the expected types.
+       2. `cache/cache.go:35`: `Get` checks expiration after releasing the lock. While not a crash, it's better practice to evaluate `time.Now().After(e.expiresAt)` inside the critical section to ensure atomicity with the map read.
+       3. `cache/cache_test.go:10`: `time.Sleep(200 * time.Millisecond)` in tests is flaky depending on system load. Consider using `time.AfterFunc` or a mock clock, or at least acknowledge the flakiness. Actually, for a nit, I'll stick to code style: `cache/cache.go:16`: `entries map[string]entry` should be initialized in `New` but it's fine. Let's pick something else. `cache/cache.go:4`: `"context"` is imported but unused in `cache.go`. Wait, `context` is imported but not used. That's a compile error! Let's check: `import "context"` is there, but `context` is never used in `cache.go`. That's a bug/compile error. I'll list it as a concrete issue or nit? It's a compile error. I'll put it in concrete issues or nits. Actually, it's a compile error. I'll move it to concrete issues or just note it. Wait, the prompt says "List concrete issues (bugs, security, correctness)". Unused import is a bug. I'll add it.
+       Let's re-evaluate nits:
+       1. `cache/cache.go:4`: `"context"` is imported but never used, causing a compilation failure.
+       2. `cache/cache.go:10`: `value interface{}` should be documented or typed for better API safety.
+       3. `cache/cache_test.go:10`: Hardcoded `time.Sleep` in tests is fragile; consider using a mock time or `time.After` for deterministic testing.
+       Actually, I'll keep nits to exactly 3, and concrete issues to the critical ones. I'll adjust to ensure I meet constraints.
+       Let's stick to:
+       Concrete:
+       - `cache/cache.go:58`: Map modification during range causes panic.
+       - `cache/cache.go:51-63`: Goroutine leak (no shutdown mechanism).
+       - `cache/cache.go:53`: Hardcoded sleep ignores TTL.
+       Nits:
+       - `cache/cache.go:4`: Unused `"context"` import causes compile error.
+       - `cache/cache.go:35-38`: Expiry check outside lock allows stale reads past TTL.
+       - `cache/cache_test.go:10`: `time.Sleep` in tests is flaky; prefer deterministic timing or mock clocks.
+       Wait, I need to be careful with line numbers. I'll reference them precisely.
+       Let's verify the unused import: `import "context"` is on line 4. It's unused. That's a compile error. I'll list it as a concrete issue or nit? I'll put it in nits/style, or concrete. The prompt says "bugs, security, correctness". Unused import is a bug. I'll put it in concrete issues. But I already have 3 concrete issues. I can combine or replace one. Actually, I'll keep it as a nit since it's trivial, or just list it as a concrete issue and drop the hardcoded sleep. I'll stick to the 3 concrete issues I identified, and make the unused import a nit. Or I'll just list 3 concrete and 3 nits as requested.
+       Let's refine:
+       **Status**: Request Changes
+       **Concrete Issues**:
+       - `cache/cache.go:58`: `delete(c.entries, k)` is executed while ranging over `c.entries`. This violates Go's map iteration rules and will trigger a fatal runtime panic. Collect keys to delete first, then delete them.
+       - `cache/cache.go:51-63`: The `evict` goroutine lacks a shutdown mechanism. It will run indefinitely, causing a goroutine leak and preventing clean application termination. Accept a `context.Context` or stop channel to allow graceful shutdown.
+       - `cache/cache.go:53`: `time.Sleep(time.Minute)` is hardcoded and ignores the configured `ttl`. Eviction granularity will be fixed at 1 minute, causing short-lived entries to linger unnecessarily. Use `time.NewTicker` with a dynamic or configurable interval.
+       **Nits/Style**:
+       - `cache/cache.go:4`: `"context"` is imported but never used, resulting in a compilation error. Remove it or implement context-based eviction.
+       - `cache/cache.go:35-38`: `Get` checks expiration after releasing the mutex. This allows stale reads past the TTL until the next eviction cycle. Evaluate `time.Now().After(e.expiresAt)` inside the critical section for strict consistency.
+       - `cache/cache_test.go:10`: `time.Sleep(200 * time.Millisecond)` in tests is susceptible to flakiness under load. Consider using a mock clock or `time.After` for deterministic behavior.
+
+       Check constraints:
+       - State whether you approve, request changes, or block. -> "Request Changes"
+       - List concrete issues (bugs, security, correctness). Be specific: file name and line. -> Done.
+       - List at most 3 nits/style issues. -> Done (exactly 3).
+       - Stop after your review. Do not re-summarize, do not repeat concerns already listed. -> Will ensure strict compliance.
+       - No explanatory sections after finishing. -> Will output only the review.
+
+       One minor thing: `cache/cache.go:58` line number might be off by a few depending on how the prompt renders it, but I'll use the exact line from the provided block. I'll count carefully:
+       1: package cache
+       2: (blank)
+       3: import (
+       4:     "context"
+       5:     "sync"
+       6:     "time"
+       7: )
+       8: (blank)
+       9: type entry struct {
+       10:     value     interface{}
+       11:     expiresAt time.Time
+       12: }
+       13: (blank)
+       14: type Cache struct {
+       15:     mu      sync.Mutex
+       16:     entries map[string]entry
+       17:     ttl     time.Duration
+       18: }
+       19: (blank)
+       20: func New(ttl time.Duration) *Cache {
+       21:     c := &Cache{
+       22:         entries: make(map[string]entry),
+       23:         ttl:     ttl,
+       24:     }
+       2

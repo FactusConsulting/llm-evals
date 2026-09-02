@@ -1,0 +1,28 @@
+**Key Risks & Prerequisites**
+- Major version upgrades on DigitalOcean DBaaS require cluster recreation, necessitating a controlled downtime window.
+- psycopg2 2.9.3 supports Postgres 16, but driver-level protocol shifts may expose latent query failures or connection pool exhaustion.
+- Replica attachment during cutover risks temporary lag or sync failure, threatening data consistency.
+- Unvalidated configuration drift between staging and production may break payment idempotency or transaction routing.
+- Prerequisites: Verified full backup with successful point-in-time recovery test in staging; staging environment provisioned with identical K8s manifests and PG 16 cluster; maintenance window approved by engineering and product stakeholders; rollback procedure documented and tested against PG 14.
+
+**Migration Plan**
+1. Provision a staging DigitalOcean DBaaS cluster running Postgres 16 with identical sizing, extensions, and VPC network rules.
+2. Deploy the payments service K8s manifests to staging, pointing to the PG 16 cluster, and run full integration tests against psycopg2 2.9.3.
+3. Verify all payment-critical queries, connection pool configurations, and transaction isolation levels execute without errors in staging.
+4. Schedule a maintenance window and obtain explicit approval from the engineering lead and product owner for the upgrade window. [Requires human approval]
+5. Execute a full logical backup of the production Postgres 14 cluster using DigitalOcean’s backup API and confirm restore integrity via a dry-run.
+6. Initiate the major version upgrade on the production DigitalOcean DBaaS cluster, selecting the “recreate cluster” option to migrate to Postgres 16. [Requires external coordination with DigitalOcean support if API rate limits or quota constraints block automation]
+7. Monitor the cluster recreation process until the new Postgres 16 instance reaches the “active” state and accepts TCP connections.
+8. Update the K8s ConfigMap and Secret containing the database connection string to point to the new Postgres 16 endpoint, ensuring SSL mode is set to verify-full.
+9. Perform a rolling restart of the payments service pods to establish new connections against the upgraded cluster, monitoring pod readiness probes.
+10. Validate replica synchronization by confirming the existing replica has successfully detached from PG 14 and attached to the new Postgres 16 primary, verifying replication lag is under 500ms.
+11. Run a smoke test suite covering transaction creation, idempotency checks, and webhook delivery to confirm payment processing integrity.
+12. If smoke tests pass, remove the maintenance window flag, scale pods to production capacity, and notify stakeholders of successful completion.
+13. If smoke tests fail, revert the K8s connection string to the original Postgres 14 endpoint, restart pods, and trigger the documented rollback procedure.
+14. Adjust the K8s deployment resource requests and psycopg2 connection pool parameters to accommodate Postgres 16 defaults, preventing socket exhaustion during peak load.
+15. Enable DigitalOcean DBaaS audit logging and route logs to the central monitoring stack for the first 24 hours of production traffic to track query plan changes.
+16. Execute a controlled traffic shift using the K8s ingress controller to route 10% of production requests to the new cluster for load validation.
+17. Monitor application error rates, database CPU utilization, and replication lag for 30 minutes before proceeding.
+18. Gradually increase traffic to 100% while verifying payment reconciliation reports match pre-upgrade baselines.
+19. Disable the legacy Postgres 14 cluster after 48 hours of stable operation and confirm no orphaned connections remain.
+20. Archive the migration runbook, update internal documentation, and close the associated change request ticket.

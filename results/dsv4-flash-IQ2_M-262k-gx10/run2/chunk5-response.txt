@@ -1,0 +1,259 @@
+## .NET / C#
+
+**DN1 — class vs struct:**
+A `class` is a reference type stored on the heap; it supports inheritance, can be `null`, and is garbage-collected. A `struct` is a value type stored inline (often on the stack); it is copied on assignment, cannot be `null` (unless nullable), and does not support inheritance (except interfaces). Use a `struct` for small, immutable, logically single-value data (e.g., `Point`, `Complex`, `Guid`) where copying is cheaper than heap allocation and where identity semantics are not needed.
+
+**DN2 — IEnumerable<T> vs IQueryable<T>:**
+`IEnumerable<T>` represents an in-memory sequence and uses LINQ-to-Objects; operations execute on the client side after fetching all data. `IQueryable<T>` represents a query against an external data source (e.g., SQL) and stores an expression tree; the provider translates it into the target query language (e.g., SQL) and executes it on the server. For database queries, `IQueryable` enables deferred server-side filtering, projection, and pagination, avoiding loading unnecessary rows into memory. `IEnumerable` would fetch the entire result set first.
+
+**DN3 — async/await:**
+`async`/`await` compiles into a state machine that yields control when awaiting an incomplete operation, then resumes on the captured synchronization context (or thread pool). `Task` is a heap-allocated reference type representing an async operation; `ValueTask` is a value type that avoids allocation when the operation often completes synchronously or is hot-path. Use `ValueTask` for high-performance APIs where the result is frequently available synchronously (e.g., `ReadAsync` on a buffered stream) or where allocation pressure matters; otherwise, use `Task` for simplicity and broader compatibility.
+
+**DN4 — Dependency injection lifetimes:**
+- **Transient**: created each time requested; lightweight, stateless services.
+- **Scoped**: created once per scope (e.g., per HTTP request); ideal for `DbContext`.
+- **Singleton**: created once for the app lifetime; shared, thread-safe services.
+Common bug: injecting a `Scoped` service into a `Singleton` creates a *captive dependency*—the scoped service is captured and lives for the app lifetime, causing stale state, memory leaks, or `ObjectDisposedException` if the original scope is disposed. Fix: never inject scoped services into singletons; instead, inject `IServiceProvider` or `IServiceScopeFactory` and create a scope explicitly.
+
+**DN5 — string vs ReadOnlySpan<char>:**
+`string` is immutable, heap-allocated, UTF-16, and incurs allocation on every operation (e.g., `Substring`, `Replace`). `ReadOnlySpan<char>` is a stack-allocated (or ref-like) view over existing memory—it can point to a string, array, or stack buffer—and supports slicing without allocation. Use `Span<T>`/`ReadOnlySpan<T>` for performance-critical string processing (e.g., parsing, searching, JSON) where you want zero-allocation slicing and avoid copying. It is especially useful in hot paths, but it cannot be stored in fields, captured in lambdas, or used across `async` boundaries.
+
+**DN6 — .NET GC:**
+The GC uses a generational, mark-and-compact (mostly) collector. **Gen 0** holds short-lived objects (e.g., locals); **Gen 1** holds objects that survived one collection; **Gen 2** holds long-lived objects. The **Large Object Heap (LOH)** stores objects ≥ 85 KB; it is not compacted by default (to avoid moving large memory blocks) and is collected only during Gen 2 collections. `IDisposable` is needed for unmanaged resources (file handles, sockets, COM) because the GC only tracks managed memory; without `Dispose`, unmanaged resources leak until finalizers run (non-deterministically). Use `using` or `await using` to deterministically release them.
+
+**DN7 — ConfigureAwait:**
+By default, `await` captures the current `SynchronizationContext` (or `TaskScheduler`) and resumes on it—important for UI threads (WinForms/WPF) to update controls. `ConfigureAwait(false)` tells the continuation not to capture the context, resuming on the thread pool instead. Use `ConfigureAwait(false)` in library code (no UI) to avoid deadlocks and improve performance. Do **not** use it in UI code or where you need the synchronization context (e.g., ASP.NET Core controllers, where the context is not needed but the request scope is—actually in ASP.NET Core, `ConfigureAwait(false)` is safe because there is no UI context, but it is unnecessary). The rule: use `false` in general-purpose library code; omit it in application/UI code.
+
+**DN8 — .NET 8/9 features:**
+- **Primary constructors**: `public class MyService(ILogger<MyService> logger)`—the constructor parameters are in scope for the class body, simplifying DI.
+- **Collection expressions**: `int[] arr = [1, 2, 3];` or `List<int> list = [.. existing];`—concise, allocation-friendly.
+- **FrozenDictionary**: immutable, read-optimized dictionary from `System.Collections.Frozen`; ideal for static lookup tables.
+Example with DI:
+```csharp
+public class OrderService(ILogger<OrderService> logger, IOrderRepository repo)
+{
+    public async Task<Order> GetAsync(int id)
+    {
+        logger.LogInformation("Fetching order {Id}", id);
+        return await repo.GetByIdAsync(id);
+    }
+}
+```
+
+**DN9 — ObjectDisposedException on DbContext:**
+Under high concurrency, the likely cause is a `DbContext` registered as **Scoped** but injected into a **Singleton** (captive dependency) or stored in a static/field. The singleton captures the scoped `DbContext`, and when the original request scope is disposed, the `DbContext` is disposed; subsequent concurrent calls try to use it, throwing `ObjectDisposedException`. Fix: ensure `DbContext` is resolved within the request scope (e.g., inject `IDbContextFactory<T>` for Blazor/background tasks, or use `IServiceScopeFactory` to create a scope per operation). EF Core's `DbContext` is designed for a single unit of work; it is not thread-safe and must not be shared across threads or scopes.
+
+**DN10 — record vs class:**
+A `record` is a reference type with value equality (based on all public properties), `with` expressions for non-destructive mutation, and synthesized `ToString`, `GetHashCode`, and `Equality` members. A `class` uses reference equality by default. `record struct` is a value-type record with similar semantics. Choose `record` for immutable data models (DTOs, events, configuration) where equality by value matters; choose `class` for entities with identity, mutable state, or inheritance hierarchies.
+
+**DN11 — ref, out, in:**
+- `ref`: parameter is read/write; the caller must initialize the variable before passing.
+- `out`: parameter is write-only; the method must assign it before returning; caller need not initialize.
+- `in`: parameter is read-only reference; the method cannot modify it; avoids copying for large structs.
+Use `ref` when you need to modify the caller's variable; `out` for return-by-reference patterns (e.g., `TryParse`); `in` for passing large structs by reference without copying (e.g., `Vector3`).
+
+**DN12 — Nullable reference types:**
+With `#nullable enable`, reference types are non-nullable by default; `string?` indicates a nullable reference. This is a compile-time annotation only—no runtime change. Nullable value types (`int?`) are `Nullable<T>` structs with runtime support (e.g., `HasValue`, `Value`). The difference: `int?` is a real value type that can be checked at runtime; `string?` is just a contract enforced by the compiler (with warnings) and can still be `null` at runtime.
+
+**DN13 — LINQ:**
+LINQ (Language Integrated Query) provides querying over collections and external data. **Method syntax** uses extension methods and lambdas: `list.Where(x => x > 5).Select(x => x * 2)`. **Query syntax** is SQL-like: `from x in list where x > 5 select x * 2`; it is translated to method syntax at compile time. **Deferred execution** means the query is not executed until enumerated (e.g., `foreach` or `.ToList()`); each enumeration re-executes the query, which is useful for fresh data but can cause repeated database hits if not materialized.
+
+**DN14 — Generic constraints:**
+- `where T : class` — T must be a reference type.
+- `where T : struct` — T must be a value type.
+- `where T : new()` — T must have a parameterless constructor.
+- `where T : IComparable<T>` — T must implement the interface.
+Combine multiple constraints with commas: `where T : class, IComparable<T>, new()`. Use constraints to enable operations (e.g., `new T()`, `CompareTo`) and to enforce compile-time contracts.
+
+**DN15 — abstract class vs interface:**
+An `abstract class` can have fields, constructors, method implementations, and state; supports single inheritance. An `interface` historically had only declarations; since C# 8, it can have default implementations, static members, and properties, but no fields or constructors. Default interface methods allow adding members without breaking existing implementers, but they do not make interfaces equivalent to abstract classes—interfaces still cannot have state. Choose abstract class for shared implementation/state; interface for capability contracts and multiple inheritance.
+
+**DN16 — Middleware pipeline:**
+ASP.NET Core uses a request delegate pipeline. `app.Use()` adds middleware that can call the next delegate or short-circuit; `app.Map()` branches the pipeline (e.g., `Map("/admin", ...)`); `app.Run()` adds terminal middleware that never calls next. Ordering matters: exception-handling middleware must be early (outermost) to catch exceptions from later middleware; `UseExceptionHandler` should be near the top. Middleware runs in registration order for the request, and reverse order for the response.
+
+**DN17 — Channel<T>:**
+`Channel<T>` is a modern, async-first producer-consumer queue. It supports bounded channels with backpressure: when the channel is full, producers `await WriteAsync` until space is available. `BlockingCollection<T>` is synchronous and uses `Add`/`Take` (blocking). Example:
+```csharp
+var channel = Channel.CreateBounded<int>(10);
+var producer = Task.Run(async () => {
+    for (int i = 0; i < 100; i++) await channel.Writer.WriteAsync(i);
+    channel.Writer.Complete();
+});
+var consumer = Task.Run(async () => {
+    await foreach (var item in channel.Reader.ReadAllAsync()) Console.WriteLine(item);
+});
+```
+Use `Channel<T>` for async pipelines and backpressure; `BlockingCollection<T>` for synchronous, CPU-bound scenarios.
+
+**DN18 — Source Generators:**
+Source generators run at compile time, inspecting the syntax tree and generating C# code (e.g., `INotifyPropertyChanged`, serializers, DI registration). They differ from reflection (runtime, slower, no compile-time safety) and IL weaving (post-compilation, modifies IL, harder to debug). An **incremental generator** (`IIncrementalGenerator`) caches inputs and only re-runs when relevant nodes change, improving build performance; `ISourceGenerator` re-runs on every compilation. Prefer incremental generators for large projects.
+
+**DN19 — TPL Dataflow:**
+`System.Threading.Tasks.Dataflow` provides building blocks for message-passing pipelines:
+- `ActionBlock<T>`: processes each message with an async delegate.
+- `TransformBlock<TIn, TOut>`: transforms each input into an output.
+- `BufferBlock<T>`: buffers messages for consumption.
+It supports bounded capacity, parallelism, and completion propagation. Compared to `Channel<T>`, Dataflow is higher-level (handles parallelism, linking, and complex topologies) but heavier; `Channel<T>` is simpler and more lightweight for basic producer-consumer. Use Dataflow for complex pipelines (e.g., fan-out/fan-in, multi-stage processing); use `Channel<T>` for simple queues.
+
+**DN20 — Minimal APIs:**
+Minimal APIs (introduced in .NET 6) use top-level statements and lambdas for endpoints: `app.MapGet("/", () => "Hello")`. They differ from controller-based APIs by having less boilerplate, no class hierarchy, and implicit parameter binding. Trade-offs: minimal APIs are more concise but less structured; testability is via `HttpClient` or `WebApplicationFactory` (no controller class to unit-test); middleware is the same; OpenAPI support is via `AddEndpointsApiExplorer` (works, but less automatic than controllers). **Route groups** (`app.MapGroup("/api")`) organize endpoints; **endpoint filters** (`AddFilter`) run before/after the handler for cross-cutting concerns (e.g., validation, auth).
+
+## Python
+
+**P1 — list vs tuple vs set vs frozenset:**
+- `list`: mutable, ordered, resizable.
+- `tuple`: immutable, ordered, fixed size; can be used as dict keys.
+- `set`: mutable, unordered, unique elements; supports O(1) membership.
+- `frozenset`: immutable set; hashable, usable as dict keys or set elements.
+Use `tuple` for fixed records, `list` for dynamic sequences, `set` for deduplication/membership, `frozenset` for immutable sets.
+
+**P2 — GIL:**
+The Global Interpreter Lock is a mutex in CPython that serializes execution of Python bytecode—only one thread runs Python code at a time. It affects CPU-bound multi-threaded programs (no speedup) but not I/O-bound programs (threads release the GIL during I/O). Workarounds: use `multiprocessing` (separate processes), use C extensions (e.g., NumPy releases the GIL), or use `asyncio` for I/O concurrency.
+
+**P3 — deepcopy vs copy:**
+`copy.copy(x)` creates a shallow copy: the object is new, but nested objects are shared. `copy.deepcopy(x)` recursively copies all nested objects. Shallow copy bug:
+```python
+a = [[1], [2]]
+b = copy.copy(a)
+b[0].append(3)  # a[0] is also [1, 3] because the inner list is shared
+```
+Use `deepcopy` when you need independent nested structures.
+
+**P4 — Decorators:**
+A decorator is a function that wraps another function, adding functionality. Example timing decorator:
+```python
+import time
+def timer(func):
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        print(f"{func.__name__} took {time.perf_counter() - start:.4f}s")
+        return result
+    return wrapper
+
+@timer
+def slow_func():
+    time.sleep(1)
+```
+Decorators are applied at definition time and can be stacked.
+
+**P5 — Generators and yield:**
+Generators use `yield` to produce values lazily, one at a time, preserving state between calls. They differ from returning a list by not building the entire sequence in memory—useful for large/infinite data. `yield from` delegates to another iterable/generator:
+```python
+def chain(*iterables):
+    for it in iterables:
+        yield from it
+```
+Generators are memory-efficient and support early termination.
+
+**P6 — asyncio:**
+`asyncio` uses an event loop to manage coroutines. `asyncio.run(coro)` creates and runs the loop for the top-level coroutine. `asyncio.gather(*coros)` schedules multiple coroutines concurrently and waits for all results. `asyncio.create_task(coro)` schedules a coroutine as a task without blocking. You cannot call `time.sleep()` because it blocks the entire event loop; use `await asyncio.sleep()` which yields control to the loop.
+
+**P7 — MRO:**
+Python 3 uses the **C3 linearization** algorithm for Method Resolution Order. For diamond inheritance `class D(B, C)` where `B` and `C` inherit from `A`, the MRO is `D → B → C → A → object`. The output of `D().who()` is `"C"` because `C` overrides `who()`, and C3 preserves the order of bases (`B` before `C`) but respects overrides in subclasses. The MRO is computed by merging the linearizations of the parents, ensuring monotonicity and consistency.
+
+**P8 — Metaclass vs __init_subclass__:**
+A metaclass is a class that creates classes; it can modify class creation (e.g., register classes, add methods). `__init_subclass__` is a hook on the parent class that runs when a subclass is created—simpler for subclass customization. Use a metaclass for class-level transformations (e.g., ORM models, abstract base classes with custom behavior); use `__init_subclass__` for simple hooks like auto-registration:
+```python
+class Base:
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        cls.registry.append(cls)
+```
+Metaclass example: enforce method signatures or auto-document classes.
+
+**P9 — multiprocessing vs threading vs concurrent.futures:**
+- `threading`: threads share memory but are GIL-bound; best for I/O-bound tasks (network, file).
+- `multiprocessing`: separate processes, bypasses GIL; best for CPU-bound tasks; requires pickling of arguments/returns.
+- `concurrent.futures`: high-level API (`ThreadPoolExecutor`, `ProcessPoolExecutor`) for both.
+Use threading for I/O, multiprocessing for CPU, and `concurrent.futures` for simpler code. Multiprocessing serialization implications: all arguments and return values must be picklable; lambdas, local functions, and some objects (e.g., open files) cannot be pickled.
+
+**P10 — __slots__:**
+`__slots__` prevents the creation of a `__dict__` per instance, fixing the set of attributes. It saves memory (significant for millions of instances) and improves attribute access speed. It prevents adding new attributes dynamically. Use it for classes with many instances and fixed attributes (e.g., data records, vector types). Example:
+```python
+class Point:
+    __slots__ = ('x', 'y')
+```
+
+**P11 — Virtual environments:**
+A virtual environment isolates Python dependencies per project, preventing version conflicts. `venv` is built-in and minimal; `virtualenv` is third-party, faster, and more feature-rich (e.g., can create environments for other Python versions); `conda` is a package manager + environment manager that handles non-Python dependencies (e.g., C libraries). Use `venv` for simple projects, `conda` for scientific/data projects.
+
+**P12 — Comprehensions vs map/filter:**
+List/dict/set comprehensions are concise, readable, and Pythonic:
+```python
+[x*2 for x in range(10) if x % 2 == 0]
+{x: x**2 for x in range(5)}
+{x % 3 for x in range(10)}
+```
+`map()` and `filter()` are functional alternatives: `list(map(lambda x: x*2, filter(lambda x: x%2==0, range(10))))`. Prefer comprehensions for readability and performance (they are faster in most cases); use `map`/`filter` when you have a callable and want to avoid lambdas or when chaining with other functional tools.
+
+**P13 — == vs is:**
+`==` compares values (calls `__eq__`); `is` compares identity (memory address). Object interning: CPython caches small integers (-5 to 256) and some strings, so `a is b` can return `True` for these even if created separately. Example:
+```python
+a = 5; b = 5
+a is b  # True (interned)
+a = 257; b = 257
+a is b  # False (not interned)
+```
+Use `is` for `None` and singletons; use `==` for value comparison.
+
+**P14 — *args, **kwargs and parameter markers:**
+`*args` collects extra positional arguments into a tuple; `**kwargs` collects extra keyword arguments into a dict. Positional-only parameters are marked with `/` (before it): `def f(x, /, y):`—`x` cannot be passed as keyword. Keyword-only parameters are marked with `*` (after it): `def f(x, *, y):`—`y` must be passed as keyword. Example:
+```python
+def f(a, /, b, *, c):
+    ...
+f(1, 2, c=3)  # OK
+f(1, b=2, c=3)  # OK
+f(a=1, b=2, c=3)  # TypeError: a is positional-only
+```
+
+**P15 — Context managers:**
+The `with` statement ensures setup/cleanup. Write with `__enter__`/`__exit__`:
+```python
+class Timer:
+    def __enter__(self):
+        self.start = time.perf_counter()
+        return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        print(f"Elapsed: {time.perf_counter() - self.start}")
+```
+Or with `@contextmanager`:
+```python
+from contextlib import contextmanager
+@contextmanager
+def timer():
+    start = time.perf_counter()
+    yield
+    print(f"Elapsed: {time.perf_counter() - start}")
+```
+Example beyond files: database transactions, locks, redirecting output, temporarily changing settings.
+
+**P16 — Type hinting:**
+Type hints enable static analysis. `typing.Union[int, str]` (or `int | str`), `Optional[int]` (or `int | None`), `Literal["a", "b"]` for exact values, `TypeVar` for generics, `Protocol` for structural typing (duck typing). Mypy/pyright use these to catch type errors, verify contracts, and infer types. Example:
+```python
+from typing import Protocol, TypeVar, Literal, Optional
+T = TypeVar('T')
+class Drawable(Protocol):
+    def draw(self) -> None: ...
+def render(x: Drawable) -> None: ...
+```
+
+**P17 — Data model (dunder methods):**
+- `__repr__`: unambiguous representation for debugging; `__str__`: readable for `print()`.
+- `__eq__` defines equality; `__hash__` defines hashability. If you define `__eq__` but not `__hash__`, Python sets `__hash__ = None`, making instances unhashable (cannot be dict keys/set members). Fix: define both or use `functools.total_ordering`.
+- `__getattr__` is called only when attribute lookup fails; `__getattribute__` is called for every attribute access (can intercept all). Use `__getattr__` for delegation/fallback; `__getattribute__` for security/validation.
+
+**P18 — Descriptors:**
+Descriptors implement `__get__`, `__set__`, `__delete__` to control attribute access. `property` is a descriptor that wraps a getter/setter; `classmethod` is a descriptor that binds the method to the class; `staticmethod` is a descriptor that returns the raw function. Example:
+```python
+class Property:
+    def __get__(self, obj, objtype=None): ...
+    def __set__(self, obj, value): ...
+```
+Under the hood, `property` uses `__get__`/`__set__` to call the getter/setter; `classmethod` uses `__get__` to bind `cls` as the first argument.
+
+**P19 — Import system:**
+Python's import system uses `sys.path` (list of directories) and `PYTHONPATH` (env var) to find modules. `__init__.py` marks a directory as a package (can be empty). **Namespace packages** (PEP 420) allow packages without `__init__.py` by merging directories. **Absolute imports** use the full path (`import package.module`); **relative imports** use dots (`from . import module`) and require a package context. A **finder** locates the module (e.g., `PathFinder` for filesystem), and a **loader** loads it (e.g., `SourceFileLoader`). The import system caches modules in `sys.modules`.
+
+**P20 — dataclasses vs attrs vs Pydantic:**
+`dataclasses` (built-in) generates `__init__`, `__repr__`, `__eq__` from class annotations. `attrs` (third-party) adds more features: validators, converters, slots, and is faster. `Pydantic` focuses on validation, serialization, and schema generation (JSON Schema), with runtime type checking and coercion. `__post_init__` runs after `__init__` for custom logic; `field(default_factory=...)` for mutable defaults; `frozen=True` makes instances immutable (and hashable if `eq=True`). Dataclasses handle inheritance by merging fields from base classes. Choose `Pydantic` when you need robust validation, JSON serialization, or API schemas; choose `dataclasses` for simple internal data containers; `attrs` for advanced features without Pydantic's validation overhead.

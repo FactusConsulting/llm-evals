@@ -1,0 +1,166 @@
+Here's a thinking process:
+
+1.  **Analyze User Input:**
+   - **Scenario:** LD3 — Large Code Review
+   - **Category:** open-ended-code-review
+   - **Difficulty:** high
+   - **Task:** Review the provided Go package (cache/cache.go and cache/cache_test.go) which adds a new caching layer.
+   - **Constraints:**
+     - State approval status (approve, request changes, or block).
+     - List concrete issues (bugs, security, correctness) with specific file names and line numbers.
+     - List at most 3 nits/style issues.
+     - Stop after the review. No summaries, no repeating concerns.
+   - **Code Provided:** `cache/cache.go` and `cache/cache_test.go`
+
+2.  **Analyze the Code (Mental Walkthrough & Issue Identification):**
+   - *cache.go:*
+     - `entry` struct: `value interface{}`, `expiresAt time.Time`. Fine.
+     - `Cache` struct: `mu sync.Mutex`, `entries map[string]entry`, `ttl time.Duration`. Fine.
+     - `New(ttl time.Duration) *Cache`: Creates cache, starts `go c.evict()`. Fine.
+     - `Set(key string, val interface{})`: Locks, sets entry with `time.Now().Add(c.ttl)`, unlocks. Fine.
+     - `Get(key string) (interface{}, bool)`: Locks, gets entry, unlocks. Checks expiry *outside* the lock. **BUG/CONCURRENCY ISSUE**: If the entry expires while unlocked, it returns `nil, false`. But what if another goroutine deletes it or modifies it? Actually, the map is accessed outside the lock. This is a race condition. The `e` is a copy of the struct, so modifying the map concurrently won't affect `e`, but reading from the map concurrently without a lock is a data race in Go. Wait, `e` is copied, so `e.value` and `e.expiresAt` are safe, but the map access itself is fine since it's already unlocked. However, the check `time.Now().After(e.expiresAt)` happens after unlock. That's okay for correctness, but there's a subtle issue: if the entry is deleted by `Delete` or `evict` between unlock and the check, it doesn't matter because `e` is already copied. But wait, `Get` returns `nil, false` on expiry. That's fine.
+     - Actually, the bigger issue: `Get` reads `c.entries[key]` under lock, copies it, unlocks, then checks expiry. This is generally okay, but there's a race condition if `Delete` or `evict` modifies the map concurrently? No, map access is protected by the lock in `Set`, `Delete`, and `evict`. `Get` releases the lock before checking expiry, which is fine. But wait, `Get` doesn't hold the lock during the expiry check, so it's safe from map races.
+     - Let's look closer at `Get`: `c.mu.Lock(); e, ok := c.entries[key]; c.mu.Unlock(); if !ok || time.Now().After(e.expiresAt) { return nil, false }`. This is actually safe because `e` is a value copy. However, it's slightly inefficient to unlock before checking, but not a bug.
+     - Wait, `evict()` runs in a loop with `time.Sleep(time.Minute)`. It locks, iterates, deletes, unlocks. This is fine.
+     - **Critical Bug/Issue**: `Get` returns `nil, false` for expired entries. But what if the value itself is `nil`? The API `(interface{}, bool)` handles this correctly with the bool return.
+     - **Concurrency Issue**: `Get` reads the map without a lock after the initial read. Actually, it reads once under lock, copies to `e`, then unlocks. So no concurrent map read issue.
+     - **Missing Context/Shutdown**: `evict()` runs forever. There's no way to stop it. If the `Cache` is garbage collected or needs to be shut down, the goroutine leaks. This is a correctness/architectural issue.
+     - **TTL Handling**: `Set` uses `time.Now().Add(c.ttl)`. If `ttl` is 0 or negative, it expires immediately or in the past. Not necessarily a bug, but worth noting.
+     - **Map Iteration during Eviction**: `evict` iterates over `c.entries` while holding the lock. This is fine.
+     - **Race Condition in `Get`**: Actually, there's a subtle race: `Get` reads `c.entries[key]` under lock, copies `e`, unlocks, then checks `time.Now().After(e.expiresAt)`. If the entry expires exactly between unlock and the check, it returns `nil, false`. That's acceptable for a cache.
+     - Wait, look at `Get` again: `c.mu.Lock(); e, ok := c.entries[key]; c.mu.Unlock(); if !ok || time.Now().After(e.expiresAt) { return nil, false }`. This is fine.
+     - Let's check `evict()`: `for { time.Sleep(time.Minute); now := time.Now(); c.mu.Lock(); for k, e := range c.entries { if now.After(e.expiresAt) { delete(c.entries, k) } } c.mu.Unlock() }`. This is a background goroutine. It will never exit. Goroutine leak.
+     - **Security/Correctness**: `interface{}` for values means no type safety. Not a bug, but a design choice.
+     - **Bug in `Get`**: The expiry check happens *after* unlocking. If another goroutine calls `Set` with the same key between the unlock and the expiry check, `Get` might return the old value or `nil` incorrectly? Actually, `e` is a copy, so it's fine. But what if `Delete` is called? `e` is already copied. So it's fine.
+     - Wait, there's a classic cache bug here: `Get` does not refresh the TTL on access. That's standard for caches, so fine.
+     - Let's look at `evict()` again. It sleeps for 1 minute. If `ttl` is 100ms, entries might expire but not be cleaned up for up to a minute. That's acceptable for a simple cache.
+     - **Major Issue**: `Get` returns `nil, false` for expired entries. But what if the cached value is legitimately `nil`? The bool return handles it, so it's fine.
+     - **Concurrency Bug**: `Get` reads `c.entries[key]` under lock, copies `e`, unlocks. Then checks expiry. This is fine.
+     - Wait, `evict()` uses `time.Sleep(time.Minute)`. This is a hardcoded sleep. Not a bug, but inflexible.
+     - Let's look at `cache_test.go`:
+       - `TestSetGet`: Creates cache with 100ms TTL. Sets "k"="v". Gets it. Sleeps 200ms. Gets it, expects false. This test will likely fail or be flaky because `evict()` runs every minute. The entry will expire, but `Get` checks expiry on access. So `Get` will return `nil, false` after 100ms regardless of `evict()`. The test should pass.
+       - `TestDelete`: Sets, deletes, gets. Expects false. Should pass.
+     - **Real Bug**: `Get` checks `time.Now().After(e.expiresAt)`. If `e.expiresAt` is exactly now, it returns false. That's fine.
+     - **Concurrency Issue in `Get`**: Actually, there's a race condition if `Get` is called concurrently with `Set` or `Delete`? No, `Get` only reads the map once under lock.
+     - Wait! `Get` does:
+       ```go
+       c.mu.Lock()
+       e, ok := c.entries[key]
+       c.mu.Unlock()
+       if !ok || time.Now().After(e.expiresAt) {
+           return nil, false
+       }
+       return e.value, true
+       ```
+       This is safe.
+     - Let's reconsider `evict()`. It holds the lock while iterating and deleting. This is fine.
+     - **Goroutine Leak**: `evict()` runs forever. No context or stop channel. This is a correctness/architectural issue.
+     - **Missing Error Handling/Validation**: `New` doesn't validate `ttl`. If `ttl <= 0`, entries expire immediately or never? `time.Now().Add(negative)` is in the past, so they expire immediately. That's fine.
+     - **Interface{} Usage**: Not a bug, but a nit.
+     - **Test Flakiness**: `TestSetGet` sleeps for 200ms. On a busy CI, this might be flaky, but generally okay.
+     - **Wait, there's a subtle bug in `Get`**: The expiry check happens *outside* the lock. If the entry expires, it returns `nil, false`. But what if another goroutine calls `Set` with the same key right after `Get` unlocks but before `Get` returns? `Get` already copied `e`, so it returns the old value or `nil`. That's fine.
+     - Actually, I see a **data race** potential: `Get` reads `c.entries[key]` under lock, copies `e`, unlocks. Then accesses `e.expiresAt`. `e` is a local variable, so no race.
+     - Let's look at `evict()` again. It uses `time.Sleep(time.Minute)`. This blocks the goroutine. Fine.
+     - **Major Issue**: `Get` does not handle the case where `e.value` is `nil` correctly? It returns `nil, false` if expired, but if `e.value` is `nil` and not expired, it returns `nil, true`. That's correct.
+     - Wait, `Get` returns `nil, false` for expired. But what if the cache is used for caching `nil` results? The bool return handles it.
+     - Let's look at `cache.go` line 48-55 (`evict`):
+       ```go
+       func (c *Cache) evict() {
+           for {
+               time.Sleep(time.Minute)
+               now := time.Now()
+               c.mu.Lock()
+               for k, e := range c.entries {
+                   if now.After(e.expiresAt) {
+                       delete(c.entries, k)
+                   }
+               }
+               c.mu.Unlock()
+           }
+       }
+       ```
+       This goroutine will never be stopped. If `Cache` is embedded in a struct or used in a long-running process, it's a goroutine leak. Also, `time.Minute` is hardcoded.
+     - **Another Issue**: `Get` checks expiry after unlocking. This means the lock is held for a shorter time, which is good for performance, but it means `Get` might return a value that is *already expired* if the check fails? No, it checks `time.Now().After(e.expiresAt)`. If true, returns `nil, false`. So it's correct.
+     - **Wait, there's a bug in `Get`**: `e, ok := c.entries[key]` copies the struct. `e.expiresAt` is copied. `time.Now().After(e.expiresAt)` is checked. This is fine.
+     - Let's check `cache_test.go` line 10: `c := New(100 * time.Millisecond)`. Then `time.Sleep(200 * time.Millisecond)`. This test relies on wall-clock time. It's fine.
+     - **Concurrency Bug in `Get`**: Actually, there's a classic issue: `Get` reads the map, unlocks, then checks expiry. If the entry expires, it returns `nil, false`. But what if `Delete` is called concurrently? `Delete` removes it from the map. `Get` already has a copy. So `Get` returns `nil, false` due to expiry, which is correct.
+     - **Missing Context/Shutdown**: I'll list this as a correctness issue.
+     - **Hardcoded Sleep**: `time.Sleep(time.Minute)` in `evict()`. I'll list this as a correctness/architectural issue.
+     - **Interface{}**: I'll list as a nit.
+     - **Test Flakiness**: `time.Sleep` in tests is generally discouraged, but acceptable for simple TTL tests. I'll skip unless necessary.
+     - **Wait, look at `Get` again**:
+       ```go
+       func (c *Cache) Get(key string) (interface{}, bool) {
+           c.mu.Lock()
+           e, ok := c.entries[key]
+           c.mu.Unlock()
+           if !ok || time.Now().After(e.expiresAt) {
+               return nil, false
+           }
+           return e.value, true
+       }
+       ```
+       This is actually safe. But there's a subtle race: if `Get` is called concurrently with `Set`, `Set` updates the map. `Get` reads the old value. That's fine.
+     - **Actually, there's a bug in `Get`**: It returns `nil, false` for expired entries. But what if the value is `nil`? The bool return handles it. So it's fine.
+     - Let's think about **concurrency safety of `map`**: In Go, concurrent map reads are safe, concurrent map writes are not. `Get` reads under lock. `Set`, `Delete`, `evict` write under lock. So map access is safe.
+     - **What about `evict()` holding the lock while iterating?** It's fine, but it blocks `Get`/`Set`/`Delete` for the duration of the eviction sweep. If the cache is large, this could cause latency spikes. I'll list this as a performance/correctness issue.
+     - **Goroutine Leak**: `evict()` runs forever. No way to stop it. This is a correctness issue.
+     - **Hardcoded TTL check interval**: `time.Sleep(time.Minute)` is hardcoded. Should be configurable or use a ticker.
+     - **Test Issue**: `TestSetGet` uses `time.Sleep`. It's fine, but I'll note it as a nit if needed. I only need up to 3 nits.
+     - Let's structure the review:
+       - **Status**: Request Changes
+       - **Concrete Issues**:
+         1. Goroutine leak in `evict()` (cache.go:48) - runs forever, no shutdown mechanism.
+         2. Hardcoded eviction interval (cache.go:50) - `time.Sleep(time.Minute)` should be configurable or use a ticker.
+         3. Lock contention during eviction (cache.go:52-57) - holds `mu` while iterating/deleting, blocking all reads/writes. Consider using a read lock for iteration or a separate eviction lock, or at least document the blocking behavior. Actually, holding the lock during eviction is a correctness/performance issue. I'll frame it as a correctness/performance issue.
+         4. Wait, is there a bug in `Get`? `time.Now().After(e.expiresAt)` checks expiry. If it's expired, returns `nil, false`. But what if `e.value` is `nil`? The bool return handles it. So it's fine.
+         5. Actually, `Get` has a race condition? No.
+         6. Let's check `cache_test.go` line 10-18: `TestSetGet` sleeps 200ms. This is fine.
+         7. I'll stick to the goroutine leak, hardcoded sleep, and lock contention.
+         8. Wait, `evict()` uses `time.Sleep(time.Minute)`. If `ttl` is 100ms, entries expire but aren't cleaned up for up to a minute. That's acceptable for a simple cache, but the hardcoded value is bad.
+         9. Another issue: `Get` returns `nil, false` for expired entries. But if the cache is used to cache `nil` results, it's fine.
+         10. Let's look at `cache.go` line 38: `c.mu.Lock(); e, ok := c.entries[key]; c.mu.Unlock();`. This is fine.
+         11. I'll list:
+             - Goroutine leak (cache.go:48)
+             - Hardcoded eviction interval (cache.go:50)
+             - Blocking eviction sweep (cache.go:52-57)
+         12. Nits (max 3):
+             - `interface{}` for value (cache.go:10) - consider generics or a typed value.
+             - `time.Sleep` in tests (cache_test.go:16) - consider using `time.After` or a mock clock for deterministic tests.
+             - Missing package documentation/comments.
+         13. Check constraints: "List concrete issues (bugs, security, correctness). Be specific: file name and line." "List at most 3 nits/style issues." "Stop after your review."
+         14. I need to be precise with line numbers. Let's count lines in the provided code.
+             ```
+             1  // cache/cache.go
+             2  package cache
+             3
+             4  import (
+             5      "context"
+             6      "sync"
+             7      "time"
+             8  )
+             9
+             10 type entry struct {
+             11     value     interface{}
+             12     expiresAt time.Time
+             13 }
+             14
+             15 type Cache struct {
+             16     mu      sync.Mutex
+             17     entries map[string]entry
+             18     ttl     time.Duration
+             19 }
+             20
+             21 func New(ttl time.Duration) *Cache {
+             22     c := &Cache{
+             23         entries: make(map[string]entry),
+             24         ttl:     ttl,
+             25     }
+             26     go c.evict()
+             27     return c
+             28 }
+             29
+             30 func (c *Cache) Set(key string, val interface{}) {
+             31     c.mu.Lock()
+             32     c.entries[key] = entry{value: val, expiresAt: time.Now().Add(c.ttl)}
+             33     c

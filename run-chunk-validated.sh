@@ -10,6 +10,31 @@ API_KEY="$4"
 MODEL_NAME="$5"
 MAX_RETRIES=2
 
+# Request timeout. Was hard-coded to 1800s, which silently contradicted the
+# max_tokens: 49152 below: a model generating at ~17 tok/s (DeepSeek-V4-Flash
+# UD-IQ3_XXS on the GX10) can only reach ~30k tokens in 1800s, so the token
+# budget was unreachable and long chunks were killed mid-generation. That is
+# not a soft failure — curl returns nothing, the response is discarded, and
+# the 30 minutes of compute are lost. Observed on chunk3 (OpenTofu/Ansible,
+# 40 questions): released at n_tokens=30817 after exactly 1800s.
+#
+# 3600s covers the full 49152-token budget down to ~14 tok/s, so the two
+# limits are now consistent. Thinking models are the ones that need it:
+# reasoning_content counts against max_tokens.
+#
+# Override per-run with EVAL_MAX_TIME when a model is faster and you want
+# failures surfaced sooner.
+MAX_TIME="${EVAL_MAX_TIME:-3600}"
+
+# Output-token budget. Default matches the campaign standard (49152) so runs
+# stay comparable. Override with EVAL_MAX_TOKENS for thinking models that burn
+# the whole budget on reasoning and never emit content (observed: DeepSeek-V4-
+# Flash IQ3_XXS on chunk3 — 3 attempts, ~3175s each, all 49152 tokens spent in
+# reasoning_content, empty content). A raised budget only affects runs that
+# would otherwise be truncated; completed answers are identical under any cap.
+# Keep EVAL_MAX_TIME consistent: budget/gen-speed + prefill must fit inside it.
+MAX_TOKENS="${EVAL_MAX_TOKENS:-49152}"
+
 # Extract ALL section headers (not just the first), all question ID prefixes,
 # and the total question count. The old version only grabbed the first `## `
 # header which caused a real bug: on chunks like chunk1 (Networking+Linux) or
@@ -61,6 +86,7 @@ for attempt in $(seq 0 "$MAX_RETRIES"); do
     --arg nonce "$NONCE" \
     --arg sections "$ALL_SECTIONS" \
     --arg total "$TOTAL_Q" \
+    --argjson max_tokens "$MAX_TOKENS" \
     '{
       "model": $model,
       "messages": [
@@ -69,12 +95,12 @@ for attempt in $(seq 0 "$MAX_RETRIES"); do
       ],
       "temperature": 0.1,
       "top_p": 0.95,
-      "max_tokens": 49152
+      "max_tokens": $max_tokens
     }')
 
   echo "Sending to $MODEL_NAME [nonce=$NONCE] (attempt $((attempt+1)))..." >&2
   START=$(date +%s)
-  RESPONSE=$(curl -s --max-time 1800 "$API_URL" \
+  RESPONSE=$(curl -s --max-time "$MAX_TIME" "$API_URL" \
     -H 'Content-Type: application/json' \
     -H "Authorization: Bearer $API_KEY" \
     -d "$PAYLOAD" 2>/dev/null)
@@ -128,3 +154,11 @@ except Exception as e:
   echo "Saved to $OUTPUT_FILE ($(wc -l < "$OUTPUT_FILE") lines)" >&2
   exit 0
 done
+
+# All attempts exhausted via `continue` (parse/too-short failures land here, unlike
+# validation failures which exit 1 inside the loop). Without this, falling off the
+# loop returned the last echo's status 0 — a silently "successful" run with no
+# output file. Observed: IQ3_XXS run2/chunk3 burned the whole 49152-token budget
+# on reasoning 3× (~3175s each), produced empty content, and reported rc=0.
+echo "GIVING UP after $((MAX_RETRIES+1)) attempts (no parsable content)" >&2
+exit 1

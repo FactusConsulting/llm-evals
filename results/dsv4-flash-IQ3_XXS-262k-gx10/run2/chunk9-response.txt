@@ -1,0 +1,596 @@
+## SC1 — Medium — Broken Deployments After Cluster Upgrade
+
+### SC1-A
+The failure occurs because the cluster now enforces the **Restricted** Pod Security Standard, which requires that containers **must not run as root**. The affected pods set `securityContext.runAsNonRoot: true` but do **not** set an explicit `runAsUser`. When `runAsNonRoot` is true, the kubelet checks the image's `USER` directive. The newly rebuilt images (based on `cgr.dev/chainguard/static:latest`) default `USER` to `root`. Since no `runAsUser` is provided, the kubelet refuses to start the container, resulting in `CrashLoopBackOff`. Under the previous **Baseline** standard, `runAsNonRoot` was not required, so the same configuration was accepted. The upgrade to Restricted made this a hard failure.
+
+### SC1-B
+```bash
+kubectl get pods -A -o json | jq -r '
+  .items[] |
+  select(.status.containerStatuses[]?.state.waiting.reason == "CrashLoopBackOff") |
+  {namespace: .metadata.namespace, name: .metadata.name, securityContext: .spec.containers[].securityContext}
+'
+```
+
+### SC1-C
+**Immediate fix:** Rebuild the affected images with a non‑root `USER` (e.g., `USER 65532:65532`) and push new tags.  
+**Manifest fix:** Add explicit `runAsUser: 65532` (or any non‑zero UID) to the pod securityContext, or remove `runAsNonRoot` if the image is already non‑root.  
+**CI pipeline gate:** Add a step that inspects the image manifest (e.g., `docker inspect --format='{{.Config.User}}'`) and fails the build if the USER is root or missing. Also validate that Kubernetes manifests set `runAsUser` when `runAsNonRoot` is true.  
+**Rollout:** Use a rolling update with `maxSurge: 1` and `maxUnavailable: 0` to avoid downtime. Deploy the fixed images to a canary namespace first, then gradually roll out to production.
+
+---
+
+## SC2 — Hard — Cross-Region Database Failover Gone Wrong
+
+### SC2-A
+The stale data is caused by **asynchronous replication lag**. The promoted replica in eu‑west‑1 was not fully caught up with the primary in us‑east‑1 at the moment of promotion. Any transactions committed on the old primary after the last WAL position received by the replica are lost. Queries against the new primary return data as of the last replayed WAL, which is behind the old primary’s state. To quantify the loss window, check `pg_stat_replication` on the old primary (if still accessible) for `replay_lag` or `write_lag`, and on the replica check `pg_last_wal_replay_lsn` vs. the primary’s `pg_current_wal_lsn`. Also inspect the replica’s `pg_control` for the last checkpoint.
+
+### SC2-B
+1. **Import the promoted replica** into Terraform state:
+   ```bash
+   terraform import aws_db_instance.new_primary <new_instance_arn>
+   ```
+2. **Remove the old instance** from state:
+   ```bash
+   terraform state rm aws_db_instance.old_primary
+   ```
+3. **Update all references** in the Terraform code (security groups, Route53, parameter groups) to point to the new instance ID/ARN.
+4. Run `terraform plan` to verify that no resources are marked for destruction or recreation. If any are, adjust the code to use `lifecycle { ignore_changes = [...] }` or `prevent_destroy` as needed.
+
+### SC2-C
+**Recommended architecture:** Use **Aurora Global Database** instead of standard RDS. Aurora Global Database provides a primary cluster in one region and up to five secondary clusters in other regions with **typical replication lag under 1 second**. It supports automatic failover and promotes a secondary with minimal data loss.  
+**Connection management:** Use **RDS Proxy** (or PgBouncer) in each region to pool connections and handle failover transparently.  
+**DNS failover:** Use Route53 health checks on the primary endpoint and a failover routing policy to redirect traffic to the secondary region.  
+**Application retry:** Implement retry logic with exponential backoff for transient connection errors.  
+**RPO < 1 second:** Aurora Global Database’s synchronous replication (within the global cluster) meets this requirement. For standard RDS, you would need to use synchronous replication (e.g., `synchronous_commit = on` and `synchronous_standby_names`), but cross‑region synchronous replication is not supported by RDS.
+
+---
+
+## SC3 — Medium — Container Image Supply Chain Compromise
+
+### SC3-A
+**Immediate response:**
+1. **Isolate** the affected pods by scaling the deployment to zero or adding a network policy that blocks egress.
+2. **Capture forensic evidence** before termination:
+   - Process tree: `kubectl exec <pod> -- ps aux`
+   - Network connections: `kubectl exec <pod> -- netstat -tulpn` or `ss -tulpn`
+   - Filesystem diff: `kubectl exec <pod> -- find / -newer /etc/hostname` (or use `diff` against a known baseline)
+   - Also capture the container image digest and the running container ID.
+3. **Preserve the pod** by using `kubectl get pod <pod> -o yaml` and saving the logs.
+
+### SC3-B
+```bash
+#!/bin/bash
+# Compare build-time digest with current upstream digest
+BUILD_DIGEST=$(grep -o 'node:20-slim@sha256:[a-f0-9]*' CI_BUILD_LOG | head -1 | cut -d@ -f2)
+CURRENT_DIGEST=$(docker manifest inspect node:20-slim | jq -r '.manifests[0].digest')
+if [ "$BUILD_DIGEST" != "$CURRENT_DIGEST" ]; then
+  echo "Base image digest mismatch!"
+fi
+
+# List layers of api-gateway:v2.4.1 and flag unknown layers
+docker image inspect api-gateway:v2.4.1 | jq -r '.[0].RootFS.Layers[]' > /tmp/layers.txt
+# Compare against known-good build (e.g., from a trusted registry)
+# Flag any layer not in the known-good list
+```
+
+### SC3-C
+**Hardened CI/CD pipeline:**
+- **Image signing:** Use `cosign` to sign images with a private key. Store the public key in the cluster.
+- **Admission control:** Deploy **Kyverno** or **OPA Gatekeeper** with a policy that verifies the image signature using the public key and rejects unsigned images.
+- **Base image pinning:** Pin base images by digest (e.g., `node:20-slim@sha256:...`) rather than tag.
+- **SBOM generation:** Generate an SBOM (e.g., with `syft`) and store it in the registry. Use it for vulnerability scanning and provenance.
+- **Notary v2 (Notation):** Notary v2 is a standard for signing and verifying artifacts. It works with OCI registries and can be integrated with cosign or used as an alternative. It provides a trust policy that can be enforced by admission controllers.
+
+---
+
+## SC4 — Hard — Migrating a Stateful Monolith to Kubernetes
+
+### SC4-A
+**Top 5 blockers and solutions:**
+1. **Sticky sessions (local memory):** Kubernetes pods are ephemeral and can be rescheduled. Solution: Externalize sessions to Redis or use a session affinity with a load balancer, but better to use a distributed cache.
+2. **Local NFS mount (`/data/uploads`):** Pods need shared, persistent storage. Solution: Use an NFS CSI driver (e.g., `nfs.csi.k8s.io`) with a `ReadWriteMany` PersistentVolume.
+3. **Oracle 19c database:** Running a stateful database in Kubernetes is complex. Solution: Use a managed Oracle service (e.g., Oracle Cloud or RDS for Oracle) or run Oracle in a StatefulSet with persistent storage and proper backups.
+4. **IBM MQ integration:** The monolith communicates with a mainframe via MQ. Solution: Run an MQ client as a sidecar container or use a Kubernetes-native MQ integration (e.g., IBM MQ on Kubernetes).
+5. **Stateful application logic:** The monolith may rely on local filesystem state. Solution: Refactor to use external storage (S3, NFS) and make the application stateless.
+
+### SC4-B
+```hcl
+# OpenTofu module: nfs-storage
+variable "nfs_server" {}
+variable "export_path" {}
+variable "storage_capacity" {}
+
+resource "kubernetes_storage_class_v1" "nfs" {
+  metadata {
+    name = "nfs-csi"
+  }
+  storage_provisioner = "nfs.csi.k8s.io"
+  parameters = {
+    server = var.nfs_server
+    share  = var.export_path
+  }
+  reclaim_policy = "Retain"
+  volume_binding_mode = "Immediate"
+}
+
+resource "kubernetes_persistent_volume_v1" "nfs_pv" {
+  metadata {
+    name = "nfs-pv"
+  }
+  spec {
+    capacity = {
+      storage = var.storage_capacity
+    }
+    access_modes = ["ReadWriteMany"]
+    persistent_volume_source {
+      nfs {
+        server = var.nfs_server
+        path   = var.export_path
+      }
+    }
+    storage_class_name = kubernetes_storage_class_v1.nfs.metadata[0].name
+  }
+}
+
+resource "kubernetes_persistent_volume_claim_v1" "nfs_pvc" {
+  metadata {
+    name = "nfs-pvc"
+  }
+  spec {
+    access_modes = ["ReadWriteMany"]
+    storage_class_name = kubernetes_storage_class_v1.nfs.metadata[0].name
+    resources {
+      requests = {
+        storage = var.storage_capacity
+      }
+    }
+  }
+}
+```
+**Why ReadWriteMany?** The monolith writes uploaded files to a shared mount. Multiple replicas (or pods) must be able to read/write the same files concurrently, which requires `ReadWriteMany` access mode.
+
+### SC4-C
+**Phased migration (Strangler Fig):**
+- **Phase 1:** Move static assets (e.g., CSS, JS) to an object store (S3) and serve via CDN. No downtime.
+- **Phase 2:** Move session storage to Redis (external). Update the monolith to use Redis instead of local memory. Keep F5 routing to the monolith.
+- **Phase 3:** Deploy the monolith to Kubernetes behind an Ingress. Use F5 to route a small percentage of traffic (e.g., 5%) to the Kubernetes Ingress, gradually increasing. Monitor latency and errors.
+- **Phase 4:** Once stable, cut over fully and decommission the F5.
+
+**Traffic splitting:** Use F5’s ratio or weighted pools to send a percentage of requests to the Kubernetes Ingress.  
+**IBM MQ:** Run an MQ client sidecar in the Kubernetes pod, or use a Kubernetes-native MQ deployment.  
+**Rollback:** Keep the legacy environment running until the new one is proven stable. If a phase fails, revert the traffic split to 100% legacy.  
+**Go/no-go metrics:** p99 latency < 2s, error rate < 0.1%, CPU/memory within limits, and successful completion of business transactions.
+
+---
+
+## SC5 — Medium — Mysterious Latency Spike in Microservices
+
+### SC5-A
+**Systematic debugging:**
+1. **Istio metrics:** Check `istio_request_duration_milliseconds` for the checkout-service to inventory-service call. Look at `istio_requests_total` for error codes.
+2. **Envoy metrics:** Examine `envoy_http_downstream_rq_time` and `envoy_cluster_upstream_rq_time` for the sidecar. Specifically, `envoy_cluster_upstream_rq_time` (upstream response time) vs. `envoy_cluster_upstream_connection_time` (connection establishment). If upstream response time is high, the latency is in the inventory-service; if connection time is high, it’s network/proxy.
+3. **Distributed tracing:** Use Jaeger to trace a request from checkout-service to inventory-service. Look at span durations for each hop. If the client span shows high duration but the server span is low, the latency is in the network or proxy. If both are high, the inventory-service is slow.
+4. **Application logs:** Check inventory-service logs for slow queries, lock waits, or GC pauses.
+
+### SC5-B
+**SQL diagnostic query for PostgreSQL:**
+```sql
+SELECT
+  blocked.pid AS blocked_pid,
+  blocked.query AS blocked_query,
+  blocking.pid AS blocking_pid,
+  blocking.query AS blocking_query,
+  blocking.state AS blocking_state
+FROM pg_stat_activity AS blocked
+JOIN pg_stat_activity AS blocking ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
+WHERE blocked.state = 'active' AND blocked.wait_event_type = 'lock';
+```
+
+**Go circuit breaker using sony/gobreaker:**
+```go
+import (
+    "github.com/sony/gobreaker"
+    "net/http"
+    "time"
+)
+
+func main() {
+    cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+        Name:        "inventory-service",
+        MaxRequests: 5,
+        Interval:    10 * time.Second,
+        Timeout:     30 * time.Second,
+        ReadyToTrip: func(counts gobreaker.Counts) bool {
+            return counts.ConsecutiveFailures > 3
+        },
+    })
+
+    client := &http.Client{Timeout: 2 * time.Second}
+    // Wrap the HTTP call
+    resp, err := cb.Execute(func() (interface{}, error) {
+        return client.Get("http://inventory-service/api/stock")
+    })
+    if err != nil {
+        // fallback logic
+    }
+}
+```
+
+### SC5-C
+**Architectural solution:**
+- **CQRS:** Separate the read path (serving queries) from the write/reconciliation path. Use a read replica for the reconciliation job.
+- **Read replica:** Point the CronJob to a read replica to avoid lock contention on the primary.
+- **Bulkhead isolation:** Use separate connection pools for the reconciliation job and the serving path (e.g., HikariCP with different pool sizes).
+- **CronJob scheduling:** Move the reconciliation to off-peak hours (e.g., 02:00 UTC) or use a Kubernetes `CronJob` with a `startingDeadlineSeconds` and `concurrencyPolicy: Forbid`.
+- **PodDisruptionBudget:** Create a PDB for the serving pods to prevent voluntary disruptions during the CronJob.
+- **Resource quotas:** Set resource requests/limits for the CronJob pods to prevent them from consuming all CPU/memory.
+
+---
+
+## SC6 — Hard — Zero-Trust Network Overhaul for a Hybrid Environment
+
+### SC6-A
+**Identity and access layer:**
+- **Workload identity:** Deploy **SPIFFE/SPIRE** in each environment (on-prem, AWS, Azure). Each workload gets a SPIFFE ID (e.g., `spiffe://trust-domain/workload/name`).
+- **AWS IAM roles:** Use IAM roles for EKS pods (IRSA) to grant AWS permissions. Map the SPIFFE ID to an IAM role via OIDC.
+- **Azure Managed Identities:** Use Azure AD Workload Identity for AKS pods, mapping SPIFFE IDs to Azure identities.
+- **On-prem PKI:** Use SPIRE’s built-in CA or integrate with an existing PKI to issue short-lived certificates.
+- **Federation:** Establish trust between SPIFFE trust domains (e.g., `spiffe://aws-prod`, `spiffe://on-prem`). Use SPIRE federation to allow workloads in AWS to authenticate to on-prem services via mTLS without shared secrets.
+
+### SC6-B
+```hcl
+# OpenTofu: AWS zero-trust networking
+variable "vpc_cidr" { default = "10.0.0.0/16" }
+variable "private_subnet_cidrs" { default = ["10.0.1.0/24", "10.0.2.0/24"] }
+variable "private_link_services" { default = ["s3", "rds", "ecr"] }
+
+resource "aws_ec2_transit_gateway" "tgw" {
+  description = "Transit Gateway for hybrid connectivity"
+}
+
+resource "aws_vpc" "main" {
+  cidr_block = var.vpc_cidr
+  enable_dns_support = true
+  enable_dns_hostnames = true
+}
+
+resource "aws_subnet" "private" {
+  count = length(var.private_subnet_cidrs)
+  vpc_id = aws_vpc.main.id
+  cidr_block = var.private_subnet_cidrs[count.index]
+  map_public_ip_on_launch = false
+}
+
+resource "aws_security_group" "default_deny" {
+  name        = "default-deny"
+  description = "Default deny all traffic"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = []
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = []
+  }
+}
+
+resource "aws_vpc_endpoint" "private_link" {
+  for_each = toset(var.private_link_services)
+  vpc_id            = aws_vpc.main.id
+  service_name      = "com.amazonaws.${data.aws_region.current.name}.${each.key}"
+  vpc_endpoint_type = "Interface"
+  subnet_ids        = aws_subnet.private[*].id
+  security_group_ids = [aws_security_group.default_deny.id]
+}
+```
+
+### SC6-C
+**Comparison of connectivity options:**
+- **AWS Direct Connect:** Dedicated 1 Gbps or 10 Gbps connection, lower latency, higher cost (monthly fee). Encryption requires IPsec over the connection. Failover requires a second connection.
+- **Second VPN with ECMP:** Two VPN tunnels with equal-cost multipath routing, doubling bandwidth to 2 Gbps. Cost is per-hour, encryption is native IPsec. Failover is automatic if one tunnel fails.
+- **Hybrid mesh (Tailscale/Netbird):** Overlay network using WireGuard, encrypted, can use existing internet. Bandwidth limited by internet, but can be scaled with multiple endpoints. Cost is per-user/per-device. Fits zero-trust by providing identity-based access.
+
+**Routing changes:**
+- Direct Connect: Update BGP routes to advertise VPC CIDRs over the DX connection.
+- Second VPN: Configure both tunnels in a VPN connection and enable ECMP on the CGW.
+- Mesh: Install agents on all workloads and use the mesh’s routing.
+
+---
+
+## SC7 — Medium — CI/CD Pipeline Causing Production Drift
+
+### SC7-A
+**Drift sources:**
+1. **Manual `tofu apply` from laptops:** Bypasses CI/CD, no review, no audit trail. Can introduce untested changes.
+2. **Helm values divergence:** Staging and production values files were edited directly, not tracked in Git, leading to configuration drift.
+3. **`kubectl edit` on ConfigMaps:** Direct edits bypass GitOps, making it impossible to reconcile.
+
+**Dangers of no state locking:** If two engineers run `tofu apply` simultaneously, they can corrupt the state file, causing lost resources or duplicate resources. Without locking, the state can be overwritten, leading to inconsistent infrastructure.
+
+### SC7-B
+```yaml
+# .gitlab-ci.yml
+stages:
+  - validate
+  - plan
+  - apply
+
+variables:
+  TF_STATE_BUCKET: "my-tf-state"
+  TF_LOCK_TABLE: "tf-lock"
+
+before_script:
+  - apk add --no-cache terraform
+  - tofu init -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="key=prod/terraform.tfstate" -backend-config="region=us-east-1" -backend-config="dynamodb_table=$TF_LOCK_TABLE"
+
+tofu-validate:
+  stage: validate
+  script:
+    - tofu fmt -check
+    - tofu validate
+  only:
+    - merge_requests
+
+tofu-plan:
+  stage: plan
+  script:
+    - tofu plan -out=plan.tfplan
+  artifacts:
+    paths: [plan.tfplan]
+  only:
+    - merge_requests
+
+tofu-apply:
+  stage: apply
+  script:
+    - tofu apply plan.tfplan
+  environment:
+    name: production
+  when: manual
+  only:
+    - main
+```
+
+### SC7-C
+**Drift detection and reconciliation:**
+- **Scheduled `tofu plan`:** Run a GitLab CI job on a schedule (e.g., daily) that runs `tofu plan` and posts the diff to a Slack channel. If drift is detected, alert.
+- **OPA Gatekeeper:** Create a policy that denies `kubectl edit` on ConfigMaps and Secrets in production namespaces. Use `K8sRequiredLabels` or a custom constraint.
+- **Helm values:** Use **Helmfile** or **Kustomize** to define a common base and per-environment overlays. Store all values in Git.
+- **RBAC:** In Kubernetes, restrict `kubectl edit` to the CI service account. In AWS, use IAM policies to allow `tofu apply` only from the CI role.
+
+---
+
+## SC8 — Hard — Observability Stack Scaling Failure
+
+### SC8-A
+**Diagnosis:**
+- **Prometheus OOM:** High cardinality (8.2M active series) exceeds memory capacity. Each series consumes memory for labels and samples. Check `prometheus_tsdb_head_series` and `prometheus_tsdb_head_samples`. Identify top metrics by series count.
+- **Loki drops:** Ingester pods are overwhelmed by log volume. Check `loki_ingester_bytes_received_total` and `loki_ingester_streams`. Likely due to insufficient replicas or high log volume.
+- **Tempo timeouts:** Queries for traces older than 2 hours time out because the backend is local storage (likely disk) and cannot handle large trace spans. Check `tempo_querier_*` metrics.
+- **Thanos compactor lag:** S3 bucket is growing 500GB/week, and the compactor is 3 days behind. Check `thanos_compact_*` metrics and S3 bucket size. Likely due to insufficient compaction resources or too many blocks.
+
+### SC8-B
+```bash
+#!/bin/bash
+PROM_URL="http://prometheus:9090"
+
+# Total unique metric names
+total_metrics=$(curl -s "$PROM_URL/api/v1/label/__name__/values" | jq '.data | length')
+
+# Top 20 metrics by series count
+top_metrics=$(curl -s "$PROM_URL/api/v1/query" --data-urlencode 'query=topk(20, count by (__name__) ({__name__=~".+"}))' | jq -r '.data.result[] | "\(.metric.__name__) \(.value[1])"')
+
+# For the highest-cardinality metric, find label with most unique values
+highest_metric=$(echo "$top_metrics" | head -1 | awk '{print $1}')
+label_query="count by (label) (${highest_metric})"
+top_labels=$(curl -s "$PROM_URL/api/v1/query" --data-urlencode "query=$label_query" | jq -r '.data.result[] | "\(.metric.label) \(.value[1])"' | sort -k2 -rn | head -1)
+
+# Output table
+echo "Total unique metrics: $total_metrics"
+echo "Top 20 metrics by series count:"
+echo "$top_metrics"
+echo "Highest-cardinality metric: $highest_metric"
+echo "Label with most unique values: $top_labels"
+```
+
+### SC8-C
+**Redesigned architecture:**
+- **Metrics:** Replace Prometheus with **Mimir** or **VictoriaMetrics** cluster, which can handle millions of series with horizontal scaling.
+- **Logs:** Deploy Loki in **microservices mode** with separate read/write paths and multiple ingesters.
+- **Traces:** Use Tempo with **S3-backed storage** instead of local disk, and enable trace compression.
+- **Governance:** Enforce cardinality limits per team using recording rules and relabeling configs. Use `metric_relabel_configs` to drop high-cardinality labels.
+- **Chargeback:** Use a metrics usage system (e.g., Thanos or Mimir’s cost attribution) to track per-team series count and storage usage, and bill accordingly.
+
+---
+
+## SC9 — Medium — Securing a Public-Facing API After a Breach
+
+### SC9-A
+**Vulnerabilities and fixes:**
+1. **BOLA (OWASP API1: Broken Object Level Authorization):** Users can access other users’ records by changing IDs. Fix: Implement object-level permissions in the view. Use `get_object` to check ownership.
+2. **Over-fetching (OWASP API3: Excessive Data Exposure):** API returns internal fields. Fix: Use serializers that only expose necessary fields.
+3. **No rate limiting (OWASP API4: Lack of Resource & Rate Limiting):** Attacker extracted 100k records. Fix: Add rate limiting at the API gateway or application level.
+4. **API keys in URL (OWASP API2: Broken Authentication):** Keys are logged. Fix: Move keys to headers, rotate compromised keys, and use short-lived tokens.
+
+**Django REST Framework code for BOLA:**
+```python
+from rest_framework import generics, permissions
+from rest_framework.exceptions import PermissionDenied
+
+class UserDetailView(generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = UserSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_object(self):
+        obj = super().get_object()
+        if obj.id != self.request.user.id:
+            raise PermissionDenied("You do not have access to this resource.")
+        return obj
+```
+
+### SC9-B
+```hcl
+# OpenTofu: WAFv2 ACL
+variable "allowed_countries" { default = ["US", "CA"] }
+
+resource "aws_wafv2_web_acl" "api_acl" {
+  name        = "api-web-acl"
+  scope       = "REGIONAL"
+  default_action { allow {} }
+
+  rule {
+    name     = "rate-limit"
+    priority = 1
+    action   { block {} }
+    statement {
+      rate_based_statement {
+        limit              = 100
+        aggregate_key_type = "IP"
+      }
+    }
+  }
+
+  rule {
+    name     = "block-api-key-in-query"
+    priority = 2
+    action   { block {} }
+    statement {
+      byte_match_statement {
+        field_to_match {
+          query_string {}
+        }
+        positional_constraint = "CONTAINS"
+        search_string         = "api_key="
+        text_transformation {
+          priority = 1
+          type     = "LOWERCASE"
+        }
+      }
+    }
+  }
+
+  rule {
+    name     = "aws-managed-rules"
+    priority = 3
+    override_action { none {} }
+    statement {
+      managed_rule_group_statement {
+        vendor_name = "AWS"
+        name        = "AWSManagedRulesCommonRuleSet"
+      }
+    }
+  }
+
+  rule {
+    name     = "geo-block"
+    priority = 4
+    action   { block {} }
+    statement {
+      geo_match_statement {
+        country_codes = var.allowed_countries
+      }
+    }
+  }
+}
+```
+
+### SC9-C
+**Defense-in-depth architecture:**
+- **Authentication:** Move API keys to headers, rotate all compromised keys. Implement OAuth2 with short-lived JWTs (e.g., 15 minutes) and refresh tokens.
+- **API Gateway:** Place **Kong** or **AWS API Gateway** in front of the ALB to centralize auth, rate limiting, and request transformation.
+- **Auditing:** Enable CloudTrail data events for S3 and API calls.
+- **Field-level encryption:** Encrypt PII fields in the database using application-level encryption (e.g., Django `Fernet` or AWS KMS).
+- **Migration:** Provide a grace period where both API keys and OAuth2 are accepted. Use a header like `Authorization: Bearer <JWT>` and fallback to `X-API-Key` for legacy clients. Update documentation and deprecate keys after a set date.
+
+---
+
+## SC10 — Hard — Designing a Multi-Cluster Disaster Recovery Platform
+
+### SC10-A
+**Multi-cluster architecture comparison:**
+- **Active-passive with Velero:** Backup and restore to DR. RPO depends on backup frequency (e.g., hourly backups) and RTO on restore time. With 200TB of MinIO, restoring could take hours, exceeding RTO. Not suitable.
+- **Active-active with service mesh (Istio multi-cluster or Cilium Cluster Mesh):** Both clusters serve traffic, with data replication. RPO can be near-zero if synchronous replication is used, but cross-site latency (12ms) may impact performance. For PostgreSQL, use synchronous replication (Patroni with `synchronous_commit`). For Redis, use Sentinel with cross-site replication. For RabbitMQ, use federation or quorum queues. For MinIO, use site replication (continuous sync). This approach can meet RPO=15min and RTO=1h if failover is automated.
+
+**Replication strategies:**
+- **PostgreSQL:** Patroni with synchronous replication (synchronous_standby_names) to ensure zero data loss.
+- **Redis:** Sentinel with cross-site replication (master-replica) and automatic failover.
+- **RabbitMQ:** Use quorum queues and federation to replicate messages across sites.
+- **MinIO:** Use site replication to continuously sync objects between sites.
+
+### SC10-B
+```yaml
+# Ansible playbook: patroni-replication.yml
+- hosts: dr_standby
+  become: yes
+  tasks:
+    - name: Install Patroni and dependencies
+      apt:
+        name: ['patroni', 'python3-psycopg2', 'etcd']
+        state: present
+
+    - name: Template patroni.yml
+      template:
+        src: patroni.yml.j2
+        dest: /etc/patroni/patroni.yml
+        owner: postgres
+        group: postgres
+        mode: '0644'
+      notify: restart patroni
+
+    - name: Configure etcd
+      template:
+        src: etcd.yml.j2
+        dest: /etc/etcd/etcd.yml
+      notify: restart etcd
+
+  handlers:
+    - name: restart patroni
+      systemd:
+        name: patroni
+        state: restarted
+    - name: restart etcd
+      systemd:
+        name: etcd
+        state: restarted
+```
+
+**patroni.yml.j2** (excerpt):
+```yaml
+scope: postgres
+namespace: /postgres/
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: {{ inventory_hostname }}:8008
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: {{ inventory_hostname }}:5432
+  data_dir: /var/lib/postgresql/14/main
+  parameters:
+    synchronous_commit: 'on'
+    synchronous_standby_names: 'dr-standby'
+  pg_hba:
+    - host replication all {{ dr_standby_ip }}/32 trust
+etcd:
+  hosts: "{{ etcd_hosts }}"
+```
+
+### SC10-C
+**Automated failover orchestration:**
+1. **Failure detection:** Use health checks (e.g., Route53 health checks, Prometheus alerts) to detect site down. Define a threshold (e.g., 3 failed checks) to avoid false positives.
+2. **DNS failover:** Update GSLB/DNS to point to Dallas endpoints.
+3. **Patroni promotion:** Patroni automatically promotes the standby to primary when the primary fails.
+4. **Redis Sentinel:** Sentinel promotes a replica to master.
+5. **RabbitMQ:** Use quorum queues and federation; the DR site takes over.
+6. **MinIO:** Site replication catches up; ensure the DR site is promoted to active.
+7. **OpenTofu state:** Update the state to reflect the new primary (e.g., change the RDS instance ID or Patroni endpoint).
+
+**Split-brain prevention:** Use a quorum-based system (e.g., etcd) and fencing mechanisms. Ensure only one site is active at a time.
+
+**Failback:** Once Chicago recovers, reverse the replication direction, sync data, and switch back during a maintenance window. Update DNS and Terraform state accordingly.

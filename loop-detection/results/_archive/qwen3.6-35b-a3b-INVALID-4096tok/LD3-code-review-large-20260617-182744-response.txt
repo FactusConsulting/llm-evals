@@ -1,0 +1,219 @@
+Here's a thinking process:
+
+1.  **Analyze User Input:**
+   - **Scenario:** LD3 — Large Code Review
+   - **Category:** open-ended-code-review
+   - **Difficulty:** high
+   - **Task:** Review the provided Go package (cache/cache.go and cache/cache_test.go) which adds a new caching layer.
+   - **Constraints:**
+     - State approval status: approve, request changes, or block.
+     - List concrete issues (bugs, security, correctness) with specific file name and line.
+     - List at most 3 nits/style issues.
+     - Stop after the review. No summaries, no repeating concerns.
+   - **Code Provided:** `cache/cache.go` and `cache/cache_test.go`
+
+2.  **Analyze the Code (Mental Walkthrough & Issue Identification):**
+   - *cache.go:*
+     - `entry` struct: `value interface{}`, `expiresAt time.Time`. Fine.
+     - `Cache` struct: `mu sync.Mutex`, `entries map[string]entry`, `ttl time.Duration`. Fine.
+     - `New(ttl time.Duration) *Cache`: Creates cache, starts `go c.evict()`. Returns immediately.
+     - `Set(key string, val interface{})`: Locks, sets entry with `time.Now().Add(c.ttl)`, unlocks. Fine.
+     - `Get(key string) (interface{}, bool)`: Locks, gets entry, unlocks. Checks expiry *outside* the lock. **Issue 1:** Race condition. The entry could be deleted or modified by `evict()` or `Set()` between unlocking and checking expiry. Also, `evict()` modifies the map while `Get` might be reading it concurrently if not careful, but here `Get` unlocks before checking expiry, which is fine for correctness but means the returned value might be stale/expired. Actually, the bigger issue is that `Get` checks expiry *after* releasing the lock. If `evict()` deletes it, `Get` returns an expired value. This is a correctness bug.
+     - `Delete(key string)`: Locks, deletes, unlocks. Fine.
+     - `evict()`: Infinite loop, sleeps 1 min, locks, iterates map, deletes expired, unlocks. **Issue 2:** No way to stop the goroutine. Memory leak / goroutine leak. The cache has no `Close()` or `Stop()` method.
+     - **Issue 3:** `evict()` iterates over the map while holding the lock. This is fine for correctness but blocks `Set`/`Get`/`Delete` for the duration of the eviction sweep. Not a bug, but a performance concern. I'll stick to concrete bugs/correctness.
+     - **Issue 4:** `Get` returns `nil, false` for expired entries, but it already fetched the entry. It should probably delete it or just return it as expired. The current logic is okay but the race condition is the main problem.
+     - Let's check line numbers for concrete issues:
+       - `cache.go` line 44-46: `Get` checks expiry after `c.mu.Unlock()`. Race condition.
+       - `cache.go` line 58-66: `evict()` goroutine never terminates. Goroutine leak.
+       - `cache.go` line 38: `Set` uses `time.Now().Add(c.ttl)`. Fine.
+       - `cache.go` line 44: `Get` returns `nil, false` on expiry, but `e.value` is returned on success. Fine.
+       - Wait, `Get` has a subtle bug: It checks `time.Now().After(e.expiresAt)` *after* unlocking. If another goroutine calls `Set` with the same key, `e` is a copy, so it's fine. But if `evict` deletes it, `e` still exists in the local variable. So it's not a panic, but it returns an expired value. That's a correctness issue.
+       - Another issue: `evict()` uses `time.Sleep(time.Minute)`. Hardcoded. Not a bug, but inflexible. I'll skip for nits if needed.
+       - `cache.go` line 28: `go c.evict()` starts a goroutine without context or stop channel. Goroutine leak.
+       - `cache.go` line 44-46: `Get` releases lock before checking expiration. This means `Get` can return an expired value. Should check expiration while holding the lock, or at least handle it atomically.
+       - `cache.go` line 58-66: `evict()` loop has no exit condition. Goroutine leak.
+       - `cache.go` line 44: `Get` returns `nil, false` for expired, but `e.value` is not nil. It just returns `nil`. That's fine.
+       - Let's look at `cache_test.go`:
+         - `TestSetGet`: Uses `time.Sleep(200 * time.Millisecond)`. Flaky test due to timing dependencies. Not a critical bug, but a test quality issue. I'll list it as a nit or correctness issue.
+         - `TestDelete`: Fine.
+       - Security: None obvious.
+       - Correctness/Bugs:
+         1. `cache.go:44-46`: `Get` checks expiration after releasing the mutex. This creates a race condition where an expired entry can be returned, or concurrent `Set`/`Delete` operations can cause inconsistent state relative to the expiration check.
+         2. `cache.go:58-66`: `evict()` runs an infinite loop with no shutdown mechanism. This causes a goroutine leak for every `Cache` instance created.
+         3. `cache.go:44`: `Get` returns `nil, false` for expired keys, but the actual value `e.value` is discarded. While not strictly a bug, it's inconsistent with typical cache behavior (should return the value + expired flag, or just return it). Actually, returning `nil` is fine, but the race condition is the main issue.
+         Let's refine the concrete issues to be precise and line-specific:
+         - `cache.go:44-46`: `Get` releases the lock before checking `time.Now().After(e.expiresAt)`. This allows a race condition where the entry could be modified or deleted concurrently, and it permits returning expired values. The expiration check must happen while holding the lock.
+         - `cache.go:58-66`: `evict()` contains an unbounded `for` loop with no context cancellation or stop channel. This results in a permanent goroutine leak for each `Cache` instance.
+         - `cache.go:28`: `go c.evict()` is called in `New` without any mechanism to signal termination, compounding the goroutine leak issue.
+         - `cache_test.go:12`: `time.Sleep(200 * time.Millisecond)` in `TestSetGet` makes the test flaky and slow. Should use a shorter TTL or `time.After`/`context` for deterministic testing.
+         I'll stick to 3 concrete issues as requested. I'll pick the race condition, goroutine leak, and maybe the hardcoded sleep or test flakiness. The prompt says "List concrete issues (bugs, security, correctness). Be specific: file name and line." I'll list 3.
+
+   - *Nits/Style (max 3):*
+     1. `cache.go:10`: `value` field in `entry` is unexported but used in `interface{}`. Fine.
+     2. `cache.go:58`: `time.Sleep(time.Minute)` is hardcoded. Should be configurable or use a ticker.
+     3. `cache.go:44`: `Get` returns `(interface{}, bool)`. Returning a second boolean for "found" is standard, but for expired items, returning `nil, false` loses the actual value. Not a nit, more design.
+     Let's pick clear nits:
+     1. `cache.go:58`: Hardcoded `time.Sleep(time.Minute)` in `evict()` reduces flexibility. Consider accepting an eviction interval parameter or using `time.NewTicker`.
+     2. `cache.go:10`: `entry` struct fields are unexported, which is fine, but `value` is `interface{}`. Consider using generics (Go 1.18+) for type safety, or at least document the expected types. (Maybe too modern/optional)
+     3. `cache_test.go:12`: Using `time.Sleep` for test timing is discouraged. Use `time.After` or a shorter TTL with `time.Sleep` only if necessary, but better to use `time.AfterFunc` or adjust TTL for deterministic tests.
+     Actually, I'll stick to simpler nits:
+     1. `cache.go:58`: Hardcoded eviction interval (`time.Minute`) should be configurable.
+     2. `cache.go:10`: `value` field uses `interface{}`. Consider generics for compile-time type safety.
+     3. `cache_test.go:12`: `time.Sleep` in tests introduces flakiness. Use `time.After` or a dedicated test helper for timing assertions.
+     Wait, the prompt says "at most 3 nits/style issues". I'll list exactly 2 or 3. I'll go with 3.
+
+3.  **Structure the Review:**
+   - State approval status clearly at the top.
+   - List concrete issues with file:line.
+   - List nits/style issues (max 3).
+   - Stop immediately after. No summaries.
+
+   Draft:
+   **Status:** Request Changes
+
+   **Concrete Issues (Bugs/Correctness):**
+   - `cache.go:44-46`: `Get` releases the mutex before checking expiration (`c.mu.Unlock()` on line 45, check on line 46). This creates a race condition where the entry could be modified or deleted concurrently, and it allows returning expired values. The expiration check must occur while holding the lock.
+   - `cache.go:58-66`: `evict()` runs an infinite `for` loop with no shutdown mechanism. This causes a permanent goroutine leak for every `Cache` instance created. A `context.Context` or stop channel must be added to allow graceful termination.
+   - `cache.go:28`: `go c.evict()` is invoked in `New` without any termination signal, directly contributing to the goroutine leak mentioned above.
+
+   **Nits/Style:**
+   - `cache.go:58`: Hardcoded `time.Sleep(time.Minute)` reduces flexibility. Consider accepting an eviction interval parameter or using `time.NewTicker`.
+   - `cache.go:10`: `value` is typed as `interface{}`. Consider using Go generics (`type Cache[K comparable, V any]`) for compile-time type safety.
+   - `cache_test.go:12`: `time.Sleep(200 * time.Millisecond)` makes the test slow and flaky. Use `time.After` or a shorter TTL with deterministic assertions instead.
+
+   Check constraints:
+   - State whether approve, request changes, or block. -> "Request Changes"
+   - List concrete issues (bugs, security, correctness). Be specific: file name and line. -> Done.
+   - List at most 3 nits/style issues. -> Done (3).
+   - Stop after your review. Do not re-summarize, do not repeat concerns already listed. -> Will ensure strict compliance.
+
+   One minor adjustment: The prompt says "List concrete issues... Be specific: file name and line." I'll make sure the line references are precise.
+   Let's verify line numbers based on the provided code:
+   ```go
+   // cache/cache.go
+   package cache
+   ...
+   10: type entry struct {
+   ...
+   28:     go c.evict()
+   ...
+   44: func (c *Cache) Get(key string) (interface{}, bool) {
+   45:     c.mu.Lock()
+   46:     e, ok := c.entries[key]
+   47:     c.mu.Unlock()
+   48:     if !ok || time.Now().After(e.expiresAt) {
+   ...
+   58: func (c *Cache) evict() {
+   59:     for {
+   60:         time.Sleep(time.Minute)
+   ...
+   ```
+   I'll adjust line numbers to match exactly:
+   - `cache.go:47-48`: `Get` unlocks before checking expiration.
+   - `cache.go:58-66`: `evict()` infinite loop goroutine leak.
+   - `cache.go:28`: `go c.evict()` lacks shutdown mechanism.
+   Actually, I'll combine the goroutine leak into one issue to be concise, or keep them separate. The prompt says "List concrete issues". I'll list 3.
+   Let's count lines carefully from the prompt:
+   1: // cache/cache.go
+   2: package cache
+   3: import (
+   4:     "context"
+   5:     "sync"
+   6:     "time"
+   7: )
+   8:
+   9: type entry struct {
+   10:     value     interface{}
+   11:     expiresAt time.Time
+   12: }
+   13:
+   14: type Cache struct {
+   15:     mu      sync.Mutex
+   16:     entries map[string]entry
+   17:     ttl     time.Duration
+   18: }
+   19:
+   20: func New(ttl time.Duration) *Cache {
+   21:     c := &Cache{
+   22:         entries: make(map[string]entry),
+   23:         ttl:     ttl,
+   24:     }
+   25:     go c.evict()
+   26:     return c
+   27: }
+   28:
+   29: func (c *Cache) Set(key string, val interface{}) {
+   30:     c.mu.Lock()
+   31:     c.entries[key] = entry{value: val, expiresAt: time.Now().Add(c.ttl)}
+   32:     c.mu.Unlock()
+   33: }
+   34:
+   35: func (c *Cache) Get(key string) (interface{}, bool) {
+   36:     c.mu.Lock()
+   37:     e, ok := c.entries[key]
+   38:     c.mu.Unlock()
+   39:     if !ok || time.Now().After(e.expiresAt) {
+   40:         return nil, false
+   41:     }
+   42:     return e.value, true
+   43: }
+   44:
+   45: func (c *Cache) Delete(key string) {
+   46:     c.mu.Lock()
+   47:     delete(c.entries, key)
+   48:     c.mu.Unlock()
+   49: }
+   50:
+   51: func (c *Cache) evict() {
+   52:     for {
+   53:         time.Sleep(time.Minute)
+   54:         now := time.Now()
+   55:         c.mu.Lock()
+   56:         for k, e := range c.entries {
+   57:             if now.After(e.expiresAt) {
+   58:                 delete(c.entries, k)
+   59:             }
+   60:         }
+   61:         c.mu.Unlock()
+   62:     }
+   63: }
+
+   Okay, line numbers are slightly different in my manual count vs the prompt. I'll just reference the function/context to be safe, or use exact lines from the prompt block.
+   Prompt block:
+   Line 25: `go c.evict()`
+   Line 38: `c.mu.Unlock()`
+   Line 39: `if !ok || time.Now().After(e.expiresAt) {`
+   Line 51: `func (c *Cache) evict() {`
+   Line 52: `for {`
+   Line 53: `time.Sleep(time.Minute)`
+
+   I will adjust references to match the prompt exactly.
+   Issue 1: `cache.go:38-39`: `Get` releases the lock before checking expiration. Race condition.
+   Issue 2: `cache.go:51-62`: `evict()` runs an infinite loop with no shutdown mechanism. Goroutine leak.
+   Issue 3: `cache.go:25`: `go c.evict()` is started without a context/stop channel, compounding the leak.
+   Nits:
+   1. `cache.go:53`: Hardcoded `time.Sleep(time.Minute)` should be configurable.
+   2. `cache.go:10`: `value` uses `interface{}`. Consider generics.
+   3. `cache_test.go:12`: `time.Sleep` in tests is flaky. Use `time.After` or deterministic timing.
+
+   All constraints met. I will generate the response now. I'll make sure formatting matches the request. No extra text. Stop immediately after the review.
+   One thing: The prompt says "List concrete issues (bugs, security, correctness). Be specific: file name and line." I'll format it clearly.
+   I'll double check the exact line numbers from the prompt text:
+   ```
+   25:     go c.evict()
+   38:     c.mu.Unlock()
+   39:     if !ok || time.Now().After(e.expiresAt) {
+   51: func (c *Cache) evict() {
+   52:     for {
+   53:         time.Sleep(time.Minute)
+   ```
+   Actually, counting from the start of the block:
+   1: // cache/cache.go
+   2: package cache
+   3: import (
+   4:     "context"
+   5:     "sync"
+   6:     "time"
+   7: )
+  
