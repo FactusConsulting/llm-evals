@@ -72,6 +72,11 @@ TAIL = {
 MODE_PRESETS = {
     "gate": {"nonce": "fixed", "temperature": 0.0, "seed": 0},
     "measure": {"nonce": "fixed", "temperature": 1.0, "top_p": 1.0, "min_p": 0.05},
+    # No sampling fields are sent at all, so the endpoint answers with the
+    # sampling its own model card configures. This is the mode for comparing
+    # models as they are actually served: each one runs its own recipe rather
+    # than one recipe imposed on all of them.
+    "served": {"nonce": "fixed", "temperature": None},
 }
 SAMPLING_DEFAULTS = {"nonce": "fixed", "temperature": 0.0, "top_p": None,
                      "min_p": None, "seed": None}
@@ -155,9 +160,10 @@ def request_body(model: str, messages: list, max_tokens: int, sampling: dict,
     body = {
         "model": model,
         "messages": messages,
-        "temperature": sampling["temperature"],
         "max_tokens": max_tokens,
     }
+    if sampling.get("temperature") is not None:
+        body["temperature"] = sampling["temperature"]
     # top_p is a standard field; min_p and seed are llama.cpp extensions, sent
     # the same way in the same body.
     if sampling.get("top_p") is not None:
@@ -398,9 +404,11 @@ def main() -> int:
                     choices=["core", "hard", "hard-smoke", "all"])
     ap.add_argument("--source", help="only cases from this source, e.g. 'GPQA Diamond'")
     ap.add_argument("--limit", type=int, help="first N cases (smoke runs)")
-    ap.add_argument("--mode", choices=["gate", "measure"],
+    ap.add_argument("--mode", choices=["gate", "measure", "served"],
                     help="gate: temp 0, fixed nonce, seed 0. measure: ds4's own "
                     "temp/top_p/min_p defaults, fixed nonce, seed from --seed. "
+                    "served: send no sampling fields, so the endpoint's own model "
+                    "card decides; fixed nonce, seed from --seed. "
                     "An explicit --temperature/--top-p/--min-p/--seed/--nonce "
                     "overrides the preset.")
     ap.add_argument("--nonce", choices=["fixed", "random"],

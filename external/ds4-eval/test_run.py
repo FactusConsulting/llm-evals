@@ -159,6 +159,14 @@ check("stream is requested", measure_body["stream"], True)
 check("usage is requested with the stream",
       measure_body["stream_options"], {"include_usage": True})
 
+served = sampling_of("served", seed=2)
+served_body = run.request_body("m", [], 100, served)
+check("served mode sends no temperature", "temperature" in served_body, False)
+check("served mode sends no top_p or min_p",
+      ("top_p" in served_body, "min_p" in served_body), (False, False))
+check("served mode still carries the seed", served_body.get("seed"), 2)
+check("served mode keeps the fixed nonce", served["nonce"], "fixed")
+
 gate_body = run.request_body("m", [], 100, gate)
 check("gate body omits top_p entirely", "top_p" in gate_body, False)
 check("gate body carries seed 0", gate_body["seed"], 0)
