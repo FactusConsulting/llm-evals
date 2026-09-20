@@ -6,6 +6,23 @@
 >
 > Estimated time: ~60-90 minutes of agent + compute work for a complete 3-run evaluation with judging and verdict.
 
+## Read this first — the run count changed
+
+This document describes the **full three-run, six-judge** evaluation. That is now
+the procedure for a **new baseline** only: a new model, a new architecture, a new
+quant family.
+
+For a routine check after a build, quant or serving change, run **one run**. Three
+runs bought 0.13 pp of precision on a measure whose whole top end sits inside
+0.36 pp, for seven hours and six Opus judges. Keep three when establishing a
+baseline, because the run-to-run range is itself a signal — Gemma 4 4B E4B scored
+96.67% with a 1.62 pp range, and a single run would have shown 96.67% and hidden
+that the model was unstable.
+
+This suite is also no longer the instrument for **ranking** models. See
+[external/RUNBOOK.md](external/RUNBOOK.md) for the tiered approach and
+[METHODOLOGY.md](METHODOLOGY.md#the-suite-is-saturated-at-the-top) for why.
+
 ## Mental model
 
 You are an **orchestrator**. You don't score answers yourself — that introduces context pollution and judge bias. You spawn sub-agents to do the actual work, collect their outputs, and aggregate.
