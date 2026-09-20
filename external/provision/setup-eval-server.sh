@@ -57,7 +57,9 @@ fi
 echo "  ok"
 
 log "suite environments"
-make_env tau2      "tau2 @ git+https://github.com/sierra-research/tau2-bench@main"
+# tau2 imports websockets through tau2.voice.audio_native.openai.provider without
+# declaring it, so `tau2 --help` dies on import without this.
+make_env tau2      "tau2 @ git+https://github.com/sierra-research/tau2-bench@main" "websockets"
 make_env bfcl      "bfcl-eval" "soundfile"
 make_env swebench  "swebench"
 
@@ -84,11 +86,16 @@ else
 fi
 
 log "self-test"
+# Print the real error, not a guess at it. These suites fail to import for
+# several unrelated reasons — a missing system library, an undeclared Python
+# dependency, the CPU baseline above — and naming the wrong one sends the reader
+# down the wrong path.
 for s in tau2 bfcl; do
-  if "$ROOT/$s/.venv/bin/$s" --help >/dev/null 2>&1; then
+  if err=$("$ROOT/$s/.venv/bin/$s" --help 2>&1) && [[ -n "$err" ]]; then
     printf '  %-16s ok\n' "$s"
   else
-    printf '  %-16s FAILS to start — see the CPU baseline note above\n' "$s"
+    printf '  %-16s FAILS to start:\n' "$s"
+    printf '%s\n' "$err" | tail -3 | sed 's/^/      /'
   fi
 done
 

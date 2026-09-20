@@ -48,55 +48,39 @@ Read this before trusting a number.
 | ds4-eval `core` / `hard` | **works**; smoke-tested against gx10 |
 | loop detection | works (ours) |
 | own knowledge suite | works, but driven by hand — see `HOW-TO-DRIVE-EVAL.md`; the tier driver only prints a reminder |
-| tau2 | installed on the eval server; **blocked**, and no wrapper yet |
-| BFCL | installed on the eval server; **blocked**, and no wrapper yet |
-| SWE-bench Verified | package installed; needs an agent scaffold and more disk than the VM has |
+| tau2 | installed and starts; **no wrapper yet** |
+| BFCL | installed and starts; **no wrapper yet** |
+| SWE-bench Verified | package installed; needs an agent scaffold |
 | Terminal-Bench | not installed |
 
-## The blocker
+## The eval server
 
-The eval server (VM 390, 192.168.2.175, on pve7) runs with Proxmox's default
-`kvm64` CPU model, which exposes only the x86-64 baseline. NumPy's wheels require
-x86-64-v2, so every scientific Python package dies at import:
+VM 390 at 192.168.2.175, on pve4: 8 cores, 16 GiB, 120 GB on the `ssd` tier,
+`x86-64-v3`. Built by `tofu/eval-server` in the homelab repo — see its
+`RECREATE.md`, which records the four ways a create can fail on that module.
 
-```
-RuntimeError: NumPy was built with baseline optimizations:
-(X86_V2) but your machine doesn't support: (X86_V2).
-```
+`provision/setup-eval-server.sh` installs the suites, one virtualenv each, and
+self-tests by starting every CLI. Two of those failures were not about the box at
+all but about undeclared dependencies: bfcl-eval pulls qemu_agent which imports
+`soundfile` (needs system libsndfile), and tau2 imports `websockets` through its
+voice module without declaring it. Both are handled.
 
-That takes out tau2, BFCL, SWE-bench and Terminal-Bench together. Fix it on the
-Proxmox node:
-
-```bash
-ssh root@pve7.lwa.dk 'qm set 390 --cpu x86-64-v3 && qm stop 390 && qm start 390'
-```
-
-A CPU type change needs a full power cycle, not a reboot from inside the guest.
-Verify with `grep -w avx2 /proc/cpuinfo` on the guest, then re-run
-`provision/setup-eval-server.sh`, whose self-test starts each CLI.
-
-**v3, not v2, and not `host`.** Every node in the cluster supports v3 — the
-i7-7700 in pve1-4 has AVX2, the Xeon W-2145/2245 in pve5-7 have AVX-512 — so v3
-is portable here and unlocks the AVX2 kernels in NumPy and torch that v2 leaves
-unused. A named model beats `host` on a benchmarking guest specifically: under
-`host` the instruction set follows whichever node the VM sits on, so a migration
-between an i7-7700 and a Xeon W silently changes what a number means.
-
-`tofu/eval-server` in the homelab repo now declares this explicitly (homelab
-#832), so the next create is right. The running guest has no tofu state behind
-it, which is why it needs the command above. The same gap had the guest on pve7
-while the code said pve4; the code now says pve7 too.
+The box was originally left on Proxmox's `kvm64` CPU default, which exposes only
+the x86-64 baseline. NumPy's wheels need x86-64-v2, so every scientific package
+died at import and tau2, BFCL, SWE-bench and Terminal-Bench were blocked
+together. That is why the stack now declares `x86-64-v3` explicitly, and why the
+provisioner checks for `avx2` before it trusts anything.
 
 ## Capacity
 
-The VM is 4 cores, 4 GB RAM, 30 GB disk. After the three suite environments there
-are ~13 GB free, and BFCL alone is 5.9 GB because it pulls torch.
+The VM is 8 cores, 16 GiB RAM, 120 GB disk. The three suite environments take
+about 8 GB — BFCL alone is 5.9 GB because it pulls torch — leaving ~105 GB for
+container images.
 
-SWE-bench Verified builds or pulls one image per instance and the full image set
-is far larger than this disk. Run a **fixed, seeded subset** — 50 instances is
-enough to compare models — and check `df -h /opt/evals` before and after. The
-full 500 is a one-off for a number you want to quote outside the house, and it
-needs more disk than this guest has.
+SWE-bench Verified builds or pulls one image per instance, and the full image set
+is larger than that. Run a **fixed, seeded subset** — 50 instances is enough to
+compare models — and check `df -h /opt/evals` before and after. The full 500 is a
+one-off for a number you want to quote outside the house.
 
 Throughput is the other ceiling: gx10 generates at ~22 tok/s. At ten minutes per
 SWE-bench instance, 500 instances is 83 hours.
