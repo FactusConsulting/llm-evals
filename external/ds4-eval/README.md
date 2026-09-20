@@ -44,9 +44,9 @@ the 12-case check that the endpoint and the harness still work.
 **For a reasoning model, give it far more than you think and raise the timeout
 with it.** `--max-tokens 98304 --timeout 7200` is what GLM-5.3-Flash needs here.
 
-## Gate vs measure
+## Gate, measure, served
 
-`--mode` is two named sampling presets, both with a **fixed, per-case nonce** in
+`--mode` is three named sampling presets, all with a **fixed, per-case nonce** in
 the system prompt (see below):
 
 - **`gate`** — temperature 0, seed 0. A deterministic run: the same build against
@@ -57,6 +57,12 @@ the system prompt (see below):
   seed taken from `--seed`. Call it once per seed (`--seed 1`, `--seed 2`, …,
   `--seed N`) to get N honest samples of the model's real variance, then feed
   the N run directories to `compare.py`.
+- **`served`** — sends no sampling fields at all, so the endpoint answers with
+  the sampling its own model card configures; seed from `--seed`. Use this to
+  compare **different models as they are actually deployed**: each runs its own
+  recipe (GLM, DeepSeek and Qwen ship different ones) rather than one recipe
+  imposed on all. `measure` answers "how does this compare to ds4's numbers";
+  `served` answers "which of these should I run".
 
 An explicit `--temperature`/`--top-p`/`--min-p`/`--seed`/`--nonce` always
 overrides the preset. `--top-p`/`--min-p`/`--seed` are only sent when set — the
