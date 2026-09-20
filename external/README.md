@@ -46,11 +46,11 @@ external/
 
 ## Driving them
 
-`RUNBOOK.md` has the three tiers (`gate` / `rank` / `deep`), what each is for,
+`../RUNBOOK.md` has the three tiers (`gate` / `rank` / `deep`), what each is for,
 the current state of every suite, and the one blocker on the eval server.
 `bin/eval-tier` runs a tier. `provision/setup-eval-server.sh` builds the box.
 
-Read `RUNBOOK.md` before trusting a number from here: it says which suites
+Read `../RUNBOOK.md` before trusting a number from here: it says which suites
 actually run today and which are scaffolding.
 
 > Tip (from the survey): run each task N times and report consistency (τ-bench's

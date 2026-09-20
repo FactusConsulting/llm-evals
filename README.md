@@ -20,7 +20,7 @@ model from a strong one. Ranking questions go to the external suites.
 
 | | |
 |---|---|
-| Which suite to run, and what actually works today | [external/RUNBOOK.md](external/RUNBOOK.md) — the `gate` / `rank` / `deep` tiers plus a per-suite status table |
+| Which suite to run, and what actually works today | [RUNBOOK.md](RUNBOOK.md) — the `gate` / `rank` / `deep` tiers plus a per-suite status table |
 | The knowledge suite end to end | [skills/judge-llm-eval/HOW-TO-DRIVE-EVAL.md](skills/judge-llm-eval/HOW-TO-DRIVE-EVAL.md) |
 | Why the method is what it is | [METHODOLOGY.md](METHODOLOGY.md) |
 | Where the raw runs are and what each one proves | [results/README.md](results/README.md) |

@@ -20,7 +20,7 @@ baseline, because the run-to-run range is itself a signal — Gemma 4 4B E4B sco
 that the model was unstable.
 
 This suite is also no longer the instrument for **ranking** models. See
-[external/RUNBOOK.md](../../external/RUNBOOK.md) for the tiered approach and
+[RUNBOOK.md](../../RUNBOOK.md) for the tiered approach and
 [METHODOLOGY.md](../../METHODOLOGY.md#the-suite-is-saturated-at-the-top) for why.
 
 ## Mental model

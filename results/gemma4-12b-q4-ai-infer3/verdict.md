@@ -39,7 +39,7 @@ verbatim `judge-knowledge.py` rubric (pass=2 / partial=1 / fail=0) by Opus subag
 ## Comparison & role
 
 Same-session ranking: **26B 94.1% > Q8 92.1% > Q4 89.9%** — see
-[`../12b-q4-vs-q8-vs-26b-knowledge-singlejudge.md`](../12b-q4-vs-q8-vs-26b-knowledge-singlejudge.md).
+[`../12b-q4-vs-q8-vs-26b-knowledge-singlejudge.md`](../_archive/12b-q4-vs-q8-vs-26b-knowledge-singlejudge.md).
 Q4 carries a small (~2 pt) real knowledge penalty vs Q8 — but on the deterministic
 **agentic eval** Q4 (65.0%) ≈ bf16 (67.6%), equivalent. Fit for the agentic
 overflow/failover role ai-infer3 serves; the knowledge gap is immaterial there.

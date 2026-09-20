@@ -2,7 +2,7 @@
 
 This document explains the design decisions behind the multi-judge evaluation
 methodology and the lessons learned that shaped it. If you just want to run an
-eval, see `external/RUNBOOK.md` (which suite, and what works today) or
+eval, see `RUNBOOK.md` (which suite, and what works today) or
 `skills/judge-llm-eval/HOW-TO-DRIVE-EVAL.md` (the knowledge suite end to end).
 
 ## The original problem
@@ -203,7 +203,7 @@ It remains the right **gate**. It is precise, it is ours, and it is not saturate
 the bottom: Hermes 4 14B scored 92.75% and Gemma 4 12B Q4 scored 89.9%, so it still
 separates a model worth serving from one that is not. Use it to answer "did this
 build, quant or serving change break something", and send ranking questions to the
-external suites in `external/RUNBOOK.md`, which are deterministically graded and not
+external suites in `RUNBOOK.md`, which are deterministically graded and not
 saturated.
 
 **One run, not three.** Three runs bought 0.13 pp of precision on a saturated

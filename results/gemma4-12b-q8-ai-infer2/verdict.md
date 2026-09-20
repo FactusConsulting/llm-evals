@@ -33,6 +33,6 @@ Prose knowledge 94.2%; the only weak spot is the chunk-9 scenario Part-B
 
 This number is from the **same single-judge × 2-round session** as the Q4 (ai3,
 89.9%) and 26B (ai1, 94.1%) re-runs — see
-[`../12b-q4-vs-q8-vs-26b-knowledge-singlejudge.md`](../12b-q4-vs-q8-vs-26b-knowledge-singlejudge.md).
+[`../12b-q4-vs-q8-vs-26b-knowledge-singlejudge.md`](../_archive/12b-q4-vs-q8-vs-26b-knowledge-singlejudge.md).
 Q8 sits ~2 pts above Q4 and ~2 pts below 26B. NOT comparable to the historical
 6-judge references (this method runs ~4–5 pts stricter). Q8 is the agentic default.
