@@ -64,21 +64,28 @@ RuntimeError: NumPy was built with baseline optimizations:
 (X86_V2) but your machine doesn't support: (X86_V2).
 ```
 
-That takes out tau2, BFCL, SWE-bench and Terminal-Bench together. The host is a
-Xeon W-2145, so there is plenty to expose. Fix it on the Proxmox node:
+That takes out tau2, BFCL, SWE-bench and Terminal-Bench together. Fix it on the
+Proxmox node:
 
 ```bash
-ssh root@pve7.lwa.dk 'qm set 390 --cpu host && qm stop 390 && qm start 390'
+ssh root@pve7.lwa.dk 'qm set 390 --cpu x86-64-v3 && qm stop 390 && qm start 390'
 ```
 
 A CPU type change needs a full power cycle, not a reboot from inside the guest.
-Verify with `grep -w sse4_2 /proc/cpuinfo` on the guest, then re-run
+Verify with `grep -w avx2 /proc/cpuinfo` on the guest, then re-run
 `provision/setup-eval-server.sh`, whose self-test starts each CLI.
 
-`tofu/eval-server` in the homelab repo declares `vm_cpu_type = "host"` already —
-the module default is correct. The running guest never got it because that module
-has no state, so nothing ever reconciled the two. The same gap had the guest on
-pve7 while the code said pve4; the code now says pve7.
+**v3, not v2, and not `host`.** Every node in the cluster supports v3 — the
+i7-7700 in pve1-4 has AVX2, the Xeon W-2145/2245 in pve5-7 have AVX-512 — so v3
+is portable here and unlocks the AVX2 kernels in NumPy and torch that v2 leaves
+unused. A named model beats `host` on a benchmarking guest specifically: under
+`host` the instruction set follows whichever node the VM sits on, so a migration
+between an i7-7700 and a Xeon W silently changes what a number means.
+
+`tofu/eval-server` in the homelab repo now declares this explicitly (homelab
+#832), so the next create is right. The running guest has no tofu state behind
+it, which is why it needs the command above. The same gap had the guest on pve7
+while the code said pve4; the code now says pve7 too.
 
 ## Capacity
 
