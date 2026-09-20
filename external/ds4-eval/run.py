@@ -85,6 +85,29 @@ def ask(url: str, model: str, key: str, prompt: str, max_tokens: int,
         return json.loads(r.read())
 
 
+def summarise(records, args, blob, started, t0) -> dict:
+    correct = sum(r["correct"] for r in records)
+    by_source = {}
+    for r in records:
+        s = by_source.setdefault(r["source"], {"n": 0, "ok": 0})
+        s["n"] += 1
+        s["ok"] += r["correct"]
+    return {
+        "model": args.model, "endpoint": args.url, "suite": args.suite,
+        "cases_rev": blob["rev"], "cases_repo": blob["repo"],
+        "temperature": args.temperature, "max_tokens": args.max_tokens,
+        "started": started.isoformat(),
+        "finished": datetime.now(timezone.utc).isoformat(),
+        "wall_seconds": round(time.time() - t0),
+        "total": len(records), "correct": correct,
+        "percentage": round(100 * correct / len(records), 2) if records else 0.0,
+        "errors": sum(1 for r in records if r["error"]),
+        "truncated": sum(1 for r in records if r["finish_reason"] == "length"),
+        "by_source": {k: {**v, "pct": round(100 * v["ok"] / v["n"], 1)}
+                      for k, v in sorted(by_source.items())},
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -123,6 +146,16 @@ def main() -> int:
 
     records, errors = [], 0
     t0 = time.time()
+
+    def persist():
+        # After every case, not just at the end. A long suite against a reasoning
+        # model runs for hours, and an interruption used to lose all of it —
+        # twice. Partial results are worth keeping; the summary says how many
+        # cases they cover.
+        (outdir / "results.json").write_text(json.dumps(
+            {"summary": summarise(records, args, blob, started, t0),
+             "cases": records}, indent=1, ensure_ascii=False))
+
     for i, case in enumerate(cases, 1):
         budget = args.max_tokens or case.get("max_tokens") or DEFAULT_MAX_TOKENS
         label = f"{case['source']}/{case['id']}"
@@ -156,30 +189,11 @@ def main() -> int:
         mark = "ok " if records[-1]["correct"] else ("ERR" if err else "x  ")
         print(f"  [{i:>3}/{len(cases)}] {mark} {label:<34} "
               f"{g['got']!r} vs {g['expected']!r}  {elapsed:.0f}s", flush=True)
+        persist()
 
-    correct = sum(r["correct"] for r in records)
-    truncated = sum(r["finish_reason"] == "length" for r in records)
-    by_source = {}
-    for r in records:
-        s = by_source.setdefault(r["source"], {"n": 0, "ok": 0})
-        s["n"] += 1
-        s["ok"] += r["correct"]
-
-    summary = {
-        "model": args.model, "endpoint": args.url, "suite": args.suite,
-        "cases_rev": blob["rev"], "cases_repo": blob["repo"],
-        "temperature": args.temperature,
-        "started": started.isoformat(),
-        "finished": datetime.now(timezone.utc).isoformat(),
-        "wall_seconds": round(time.time() - t0),
-        "total": len(records), "correct": correct,
-        "percentage": round(100 * correct / len(records), 2),
-        "errors": errors, "truncated": truncated,
-        "by_source": {k: {**v, "pct": round(100 * v["ok"] / v["n"], 1)}
-                      for k, v in sorted(by_source.items())},
-    }
-    (outdir / "results.json").write_text(json.dumps(
-        {"summary": summary, "cases": records}, indent=1, ensure_ascii=False))
+    summary = summarise(records, args, blob, started, t0)
+    correct, truncated = summary["correct"], summary["truncated"]
+    persist()
     (outdir / "run-config.txt").write_text(
         f"ds4-eval suite={args.suite} cases_rev={blob['rev']}\n"
         f"endpoint={args.url} model={args.model} temperature={args.temperature}\n"
