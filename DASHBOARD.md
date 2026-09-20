@@ -109,4 +109,4 @@ jq '{pct:.percentage, score:"\(.total_score)/\(.max_score)"}' agentic/results/<d
 ```
 
 ---
-*Cross-model verdict docs: [`results/GX10-CAMPAIGN-COMPARISON.md`](results/GX10-CAMPAIGN-COMPARISON.md) (the 4 GX10 models), [`results/gemma4-31b-vs-26b-verdict.md`](results/gemma4-31b-vs-26b-verdict.md), [`results/gemma4-26b-q5-vs-q6-verdict.md`](results/gemma4-26b-q5-vs-q6-verdict.md).*
+*Cross-model verdict docs: [`results/_archive/GX10-CAMPAIGN-COMPARISON.md`](results/_archive/GX10-CAMPAIGN-COMPARISON.md) (the 4 GX10 models), [`results/_archive/gemma4-31b-vs-26b-verdict.md`](results/_archive/gemma4-31b-vs-26b-verdict.md), [`results/_archive/gemma4-26b-q5-vs-q6-verdict.md`](results/_archive/gemma4-26b-q5-vs-q6-verdict.md).*

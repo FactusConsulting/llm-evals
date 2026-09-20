@@ -94,7 +94,7 @@ The new template engages with prompts that the old template short-circuited via 
 |---|---|---|---|
 | 26B Q6_K, b8667, old template (pre-2026-04-10) | 96.36% | n/a | single ad-hoc judge run, old baseline |
 | **26B Q6_K, b8753, new template (THIS)** | **98.56%** | **0.67pp** | mean of 3 runs, 2-judge stable |
-| 31B Q4_K_M, b8667 | 96.97% | ~1pp | tested 2026-04-14 (`gemma4-31b-vs-26b-verdict.md`) |
+| 31B Q4_K_M, b8667 | 96.97% | ~1pp | tested 2026-04-14 (`../_archive/gemma4-31b-vs-26b-verdict.md`) |
 | 31B Q5_K_M, b8667 | 97.08% | n/a | single run, tested 2026-04-14 |
 
 26B Q6_K is the winner across all configurations tested. Larger 31B parameters do not beat it on this workload, especially on Part B (code generation). The new template + PR #21704 runtime support pushes 26B Q6_K to its highest measured score.
