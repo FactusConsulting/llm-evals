@@ -43,7 +43,18 @@ external/bin/eval-tier gate <model-name> $HOST [$KEY]
 
 The driver writes `external/results/<model>/<tier>-<timestamp>/STATUS`, naming
 every suite that ran **and every suite it skipped, with the reason**. Read it. A
-suite that is not wired up yet is not a pass.
+suite that is not wired up yet is not a pass, and a suite that ran with a
+qualifier says so on its line.
+
+`rank` reaches the eval server over ssh, and tau2 needs a second model to play
+the customer. Unless the model under test sits behind the router itself, export
+the fleet key for that simulator first:
+
+```bash
+export LLAMA_API_KEY=...                # the endpoint under test; unset if it has none
+export TAU2_USER_API_KEY=...            # the key for https://llm.lwa.dk/v1
+external/bin/eval-tier rank <model-name> $HOST
+```
 
 ## 2. The knowledge suite — one run
 
@@ -131,7 +142,39 @@ given runs; `unstable` is the count that matters. `comparison.json` adds the
 aggregate: mean score and its spread across runs, forced/truncated totals, and
 tokens spent per correct answer.
 
-## 5. Write it down
+## 5. tau2 and BFCL — the rank suites
+
+Both run on the eval server; the wrappers drive them from here and bring the
+results back. The third argument is the **name** of the environment variable
+holding the key — a key never goes on a command line.
+
+```bash
+export LLAMA_API_KEY=...                 # the endpoint under test; unset if it has none
+export TAU2_USER_API_KEY=...             # the fleet key, for tau2's user simulator
+
+external/bfcl/run.sh <model-name> $HOST
+external/tau2/run.sh <model-name> $HOST --num-trials 4
+```
+
+**BFCL** scores function calls against known-good ones, through
+`/v1/chat/completions` with native `tools` — so the server's chat template and
+tool-call parser are scored with the model. It runs 30 hash-selected cases from
+each of ten categories by default; `--limit 0` runs them whole. Which categories
+and why: [external/bfcl/README.md](external/bfcl/README.md).
+
+**tau2** is a conversation between the model and a simulated customer, and the
+customer is a second LLM. That simulator is part of the instrument: the default
+is `workhorse`, a run is only comparable with runs that used the same one, and
+the wrapper **refuses** to let a model be its own customer. Read
+[external/tau2/README.md](external/tau2/README.md) before quoting a tau2 number.
+
+Each results directory has a `summary.json`, a `run-config.txt` with the exact
+command and pinned version, and — when they apply — a `CAVEAT` or a `FAILED`
+file. Both suites have a way of turning an unreachable endpoint into a low
+score instead of an error; the summaries count those cases so it cannot pass
+unnoticed.
+
+## 6. Write it down
 
 - A `verdict.md` and `judge-summary.md` under the model's results directory: the
   scores, the per-chunk and per-part breakdown, the persistent failure modes, the
@@ -139,7 +182,7 @@ tokens spent per correct answer.
 - **One row in [DASHBOARD.md](DASHBOARD.md).** That is the only place a number is
   published. Link the evidence.
 
-## 6. Reading the result
+## 7. Reading the result
 
 Per sub-scale, never as one number. The GLM-5.3-Flash run scored 98.69% overall
 while chunk 9 Part B — code that has to run — was 73.3%; the single figure hides
@@ -196,8 +239,9 @@ Read this before trusting a number.
 | ds4-eval `hard` (50 cases: 30 MMLU-Pro, 10 OlympiadBench, 5 LiveBench, 5 NIST Juliet) | **works**; deterministic, no judges — see `external/ds4-eval/README.md` |
 | loop detection | works (ours) |
 | own knowledge suite | works, but driven by hand — see `../skills/judge-llm-eval/HOW-TO-DRIVE-EVAL.md`; the tier driver only prints a reminder |
-| tau2 | installed and starts; **no wrapper yet** |
-| BFCL | installed and starts; **no wrapper yet** |
+| BFCL | **works** end to end through `external/bfcl/run.sh`; smoke-tested against `workhorse` on the router with 2 cases in each of the ten default categories (`fc`) and 2 cases in `prompt` mode. No run at the default size or in full exists yet |
+| tau2 | **works** end to end through `external/tau2/run.sh`; smoke-tested on 2 `airline` tasks with `workhorse` in both seats, which checks the plumbing and ranks nothing. No run with a separate user simulator exists yet, and `retail` and `telecom` have not been run |
+| `eval-tier rank` | the tau2 and BFCL stages are tested through the driver, including a refusal and a failed run reaching `STATUS` with their reasons; the tier has not been run as a whole (ds4-eval `hard` first, then both) |
 | SWE-bench Verified | package installed; needs an agent scaffold |
 | Terminal-Bench | not installed |
 | Aider polyglot | not installed |
@@ -208,11 +252,17 @@ VM 390 at 192.168.2.175, on pve4: 8 cores, 16 GiB, 120 GB on the `ssd` tier,
 `x86-64-v3`. Built by `tofu/eval-server` in the homelab repo — see its
 `RECREATE.md`, which records the four ways a create can fail on that module.
 
-`external/provision/setup-eval-server.sh` installs the suites, one virtualenv each, and
-self-tests by starting every CLI. Two of those failures were not about the box at
-all but about undeclared dependencies: bfcl-eval pulls qemu_agent which imports
-`soundfile` (needs system libsndfile), and tau2 imports `websockets` through its
-voice module without declaring it. Both are handled.
+`external/provision/setup-eval-server.sh` installs the suites, one virtualenv each,
+pinned — bfcl-eval by version, tau2 by commit — and self-tests by starting every
+CLI. Two of those failures were not about the box at all but about undeclared
+dependencies: bfcl-eval pulls qemu_agent which imports `soundfile` (needs system
+libsndfile), and tau2 imports `websockets` through its voice module without
+declaring it. Both are handled.
+
+tau2's wheel carries code only. Its tasks, policies and databases come from a
+sparse checkout of the same commit under `/opt/evals/tau2/src`, and the
+self-test loads a domain from it: `tau2 --help` starts fine without any tasks
+to run.
 
 The box was originally left on Proxmox's `kvm64` CPU default, which exposes only
 the x86-64 baseline. NumPy's wheels need x86-64-v2, so every scientific package
