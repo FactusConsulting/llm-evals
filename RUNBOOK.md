@@ -92,20 +92,44 @@ the real failure — it means the model spent its whole budget and said nothing.
 ```bash
 cd external/ds4-eval
 ./fetch_cases.py                       # pinned revision; the keys are not committed
-./run.py --url $HOST --model <alias> --api-key "$KEY" --suite core \
-         --max-tokens 98304 --timeout 7200 --out ../results/<model>/ds4-core
+./run.py --url $HOST --model <alias> --api-key "$KEY" --suite core --mode gate \
+         --max-tokens 98304 --timeout 7200 --out ../results/<model>/ds4-core-gate
 ```
 
 **Give a reasoning model far more budget than you think, and raise `--timeout`
 with it.** The failure is silent: a model that spends the whole budget thinking
-writes no `Answer:` line and scores zero, identically to a wrong answer. On the
-first GLM-5.3-Flash run at 16000 tokens, **9 of the 10 failures in 41 cases were
-this**, each logged on the server as `507521.26 ms / 16000 tokens`. The apparent
-54% on GPQA Diamond was the budget, not the model.
+writes no `Answer:` line and scores zero, identically to a wrong answer. A
+case that hits the ceiling with no `Answer:` line gets one forced follow-up
+turn asking for exactly one final line (see README.md); `truncated` in the
+summary counts cases where even that did not produce a clean stop.
 
-Two ceilings bound it: context (`n_ctx` per slot minus the prompt) and your own
-timeout (budget ÷ generation speed, measured at the top — per-token time grows
-with context). **A run with truncations is not comparable to one without.**
+Two ceilings still bound the budget: context (`n_ctx` per slot minus the
+prompt) and your own timeout (budget ÷ generation speed, measured at the top —
+per-token time grows with context).
+
+**`--mode gate` vs `--mode measure`.** Both use a nonce fixed per case
+(`sha256(source/id)`, not a random `uuid4`) so the same case sends the same
+system prompt on every run — otherwise llama-server's KV-restore-by-prefix
+logic collides cases into each other's slots. `gate` is temperature 0 and
+seed 0: same build, same cases, same transcripts, so a difference between two
+gate runs means the build changed something. `measure` is ds4's own sampling
+(temperature 1.0, top_p 1.0, min_p 0.05) with the seed from `--seed`; call it
+once per seed and compare.
+
+**One `measure` run is not enough.** Same case, same server, same settings, 30
+minutes apart: 2265 s / 141,344 characters of reasoning against 321 s /
+19,527 characters, both graded correct — the random nonce this runner used to
+carry moved a temperature-0 run onto a different reasoning path with nothing
+else changed. Run several seeds and feed the run directories to `compare.py`:
+
+```bash
+./compare.py ../results/<model>/measure-seed1 ../results/<model>/measure-seed2 ...
+```
+
+Per case, it prints stable-correct / stable-incorrect / unstable across the
+given runs; `unstable` is the count that matters. `comparison.json` adds the
+aggregate: mean score and its spread across runs, forced/truncated totals, and
+tokens spent per correct answer.
 
 ## 5. Write it down
 
