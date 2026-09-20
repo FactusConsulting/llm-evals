@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Run the full regime against several models on gx10, one model at a time, and
+# leave the box on its committed profile afterwards.
+#
+#   gx10-campaign            run (or resume) the campaign
+#   gx10-campaign status     print what has run so far
+#
+# Resumable: every step writes a marker when it succeeds, and a rerun skips the
+# steps that have one. A failed step is recorded and the campaign moves on — one
+# broken suite must not cost the others — except a failed model swap, which skips
+# that model's block entirely rather than measuring whatever happens to be loaded.
+#
+# Model by model, not suite by suite: the three model cards pin three different
+# llama.cpp builds, so every swap is a rebuild on the box. Three swaps, not six.
+#
+# While this runs, gx10 answers the `bigbrain` role with whichever model is
+# loaded, and queues behind the eval.
+set -uo pipefail
+
+REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+HOMELAB="${HOMELAB:-$HOME/source/homelab}"
+HOST="${GX10_URL:-http://192.168.2.173:30000}"
+OUT="$REPO/external/results/gx10-3way"
+STATUS="$OUT/STATUS"
+PI_CONFIG="${PI_CONFIG:-$HOME/.pi/agent/models.json}"
+
+# key | model card (homelab) | alias the server answers under
+MODELS=(
+  "glm|glm5.3-flash-q2kxl-128k-mtp-gb10|glm5.3-flash"
+  "dsv4|dsv4-flash-iq3xxs-1m-dspark-gb10|dsv4-flash"
+  "qwen|qwen3.8-flash-next-q4kxl-512k-mtp-gb10|qwen3.8-flash-next"
+)
+# The committed profile; the campaign ends by deploying it without an override.
+RESTORE_ALIAS="glm5.3-flash"
+
+DS4_MAX_TOKENS=126976     # the whole slot minus room for the prompt
+DS4_TIMEOUT=10800
+TOOL_MAX_TOKENS=32768     # BFCL and tau2: a reasoning model needs more than 8192
+TAU2_TASKS=20
+TAU2_TRIALS=2             # one simulation is 2-10 min on this box
+
+mkdir -p "$OUT"
+note() { printf '%s  %s\n' "$(date '+%m-%d %H:%M')" "$*" | tee -a "$STATUS"; }
+
+if [[ "${1:-}" == "status" ]]; then
+  [[ -f "$STATUS" ]] && cat "$STATUS" || echo "no campaign has run"
+  exit 0
+fi
+
+served_alias() {
+  curl -s --max-time 15 "$HOST/v1/models" 2>/dev/null |
+    python3 -c "import json,sys; print(json.load(sys.stdin)['data'][0]['id'])" 2>/dev/null
+}
+
+# Load a model card on gx10. An extra-var overrides host_vars, so nothing is
+# committed per swap; the repo keeps describing the steady state.
+ensure_model() {
+  local card="$1" alias="$2" extra=()
+  [[ "$(served_alias)" == "$alias" ]] && return 0
+  [[ -n "$card" ]] && extra=(-e "active_model_profile=$card")
+  note "swap -> ${card:-<committed profile>} (rebuilds llama.cpp if the pin differs)"
+  (cd "$HOMELAB/ansible" && ansible-playbook -i inventory/hosts.yaml \
+      playbooks/llm/llama_cpp.yaml --limit gx10-1 "${extra[@]}") \
+      > "$OUT/swap-$alias-$(date +%H%M).log" 2>&1
+  local i
+  for i in $(seq 1 40); do
+    [[ "$(served_alias)" == "$alias" ]] && { note "serving $alias"; return 0; }
+    sleep 30
+  done
+  note "SWAP FAILED: expected $alias, server answers '$(served_alias)'"
+  return 1
+}
+
+# run_step <model-key> <step-name> <command...>
+run_step() {
+  local key="$1" step="$2"; shift 2
+  local dir="$OUT/$key" t0 rc
+  mkdir -p "$dir"
+  if [[ -f "$dir/.done-$step" ]]; then note "$key $step: already done"; return 0; fi
+  note "$key $step: start"
+  t0=$(date +%s)
+  "$@" > "$dir/$step.log" 2>&1; rc=$?
+  if [[ $rc -eq 0 ]]; then
+    touch "$dir/.done-$step"; rm -f "$dir/.failed-$step"
+    note "$key $step: ok ($(( ($(date +%s) - t0) / 60 )) min)"
+  else
+    touch "$dir/.failed-$step"
+    note "$key $step: FAILED exit $rc ($(( ($(date +%s) - t0) / 60 )) min) — see $dir/$step.log"
+  fi
+  return 0
+}
+
+ds4() {  # <key> <alias> <suite> <seed>
+  "$REPO/external/ds4-eval/run.py" --url "$HOST" --model "$2" --api-key none \
+    --suite "$3" --mode served --seed "$4" \
+    --max-tokens "$DS4_MAX_TOKENS" --timeout "$DS4_TIMEOUT" \
+    --out "$OUT/$1/ds4-$3-seed$4"
+}
+
+bfcl() {  # <key> <alias>
+  env -u LLAMA_API_KEY EVAL_OUT="$OUT/$1/bfcl" "$REPO/external/bfcl/run.sh" "$2" "$HOST" \
+    --threads 1 --max-tokens "$TOOL_MAX_TOKENS"
+}
+
+tau2() {  # <key> <alias>
+  # The simulator's key is read here and lives only in this process's environment.
+  local k
+  k="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['providers']['homelab']['apiKey'])" "$PI_CONFIG")" || return 1
+  env -u LLAMA_API_KEY TAU2_USER_API_KEY="$k" EVAL_OUT="$OUT/$1/tau2" \
+    "$REPO/external/tau2/run.sh" "$2" "$HOST" \
+    --num-tasks "$TAU2_TASKS" --num-trials "$TAU2_TRIALS" \
+    --max-concurrency 1 --max-tokens "$TOOL_MAX_TOKENS"
+}
+
+loopdet() {  # <key> <alias>
+  (cd "$REPO/loop-detection" && ./run-eval.sh --model-url "$HOST" \
+      --model-name "gx10-3way-$1-run1" --api-key dummy --delay-between 5)
+}
+
+knowledge() {  # <key> <alias> — one run; judged separately
+  local md="$REPO/results/gx10-3way-$1" i rc=0
+  mkdir -p "$md/run1"
+  ln -sfn ../_archive/gemma4-26b-q6k/chunks "$md/chunks"
+  for i in 1 2 3 4 5 6 7 8 9; do
+    [[ -s "$md/run1/chunk$i-response.txt" ]] && continue
+    "$REPO/run-chunk-validated.sh" "$md"/chunks/chunk"$i"-*.txt \
+      "$md/run1/chunk$i-response.txt" "$HOST/v1/chat/completions" none "$2" || rc=1
+  done
+  return $rc
+}
+
+note "=== campaign start ($(git -C "$REPO" rev-parse --short HEAD)) ==="
+for entry in "${MODELS[@]}"; do
+  IFS='|' read -r key card alias <<< "$entry"
+  if ! ensure_model "$card" "$alias"; then
+    note "$key: block skipped — the model could not be loaded"
+    continue
+  fi
+  run_step "$key" ds4-core-seed1 ds4 "$key" "$alias" core 1
+  run_step "$key" ds4-hard-seed1 ds4 "$key" "$alias" hard 1
+  run_step "$key" bfcl           bfcl "$key" "$alias"
+  run_step "$key" loop           loopdet "$key" "$alias"
+  run_step "$key" ds4-core-seed2 ds4 "$key" "$alias" core 2
+  run_step "$key" ds4-hard-seed2 ds4 "$key" "$alias" hard 2
+  run_step "$key" tau2           tau2 "$key" "$alias"
+  # GLM and DeepSeek already have knowledge responses in results/; only a model
+  # without any needs a run generated.
+  [[ "$key" == "qwen" ]] && run_step "$key" knowledge knowledge "$key" "$alias"
+done
+
+ensure_model "" "$RESTORE_ALIAS" || note "RESTORE FAILED — gx10 is not on its committed profile"
+note "=== campaign finished ==="
