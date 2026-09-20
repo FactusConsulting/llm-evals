@@ -7,13 +7,18 @@
 #
 # The tiers exist because running everything on every model costs days. See
 # ../../RUNBOOK.md for what each one is for and when to reach for it.
+#
+# rank runs tau2 and BFCL on the eval server through external/tau2/run.sh and
+# external/bfcl/run.sh. tau2's user simulator is a second model on the router
+# and needs the fleet key in TAU2_USER_API_KEY when the model under test is not
+# behind the router itself. The wrappers' TAU2_* and BFCL_* variables pass
+# through.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-EVAL_ROOT="${EVAL_ROOT:-/opt/evals}"
 
-usage() { sed -n '2,9p' "$0" | sed 's/^#\( \|$\)//'; exit 2; }
+usage() { sed -n '2,15p' "$0" | sed 's/^#\( \|$\)//'; exit 2; }
 [[ $# -lt 3 ]] && usage
 
 TIER="$1"; MODEL="$2"; URL="$3"; KEY="${4:-${LLAMA_API_KEY:-none}}"
@@ -25,9 +30,6 @@ log()  { printf '\n\033[1m== %s\033[0m  %s\n' "$1" "$(date +%H:%M:%S)"; }
 skip() { printf '   SKIPPED: %s\n' "$1"; echo "$2: SKIPPED — $1" >> "$OUT/STATUS"; }
 done_() { echo "$1: ran" >> "$OUT/STATUS"; }
 
-# A suite that is not installed must say so loudly. Silence here would look
-# exactly like a pass, which is the failure mode this file exists to avoid.
-have_env() { [[ -x "$EVAL_ROOT/$1/.venv/bin/$1" ]]; }
 
 run_ds4() {
   local suite="$1"
@@ -61,21 +63,30 @@ run_loopdet() {
   fi
 }
 
-run_tau2() {
-  log "tau2-bench"
-  have_env tau2 || { skip "not installed — run provision/setup-eval-server.sh" "tau2"; return; }
-  "$EVAL_ROOT/tau2/.venv/bin/tau2" --help >/dev/null 2>&1 \
-    || { skip "tau2 will not start (CPU baseline? see setup-eval-server.sh)" "tau2"; return; }
-  skip "wrapper not written yet — tau2 needs a domain and agent config" "tau2"
+# tau2 and BFCL live on the eval server and their wrappers reach it over ssh. A
+# wrapper that cannot run — server unreachable, suite not installed, no key for
+# the user simulator, every request failing — writes the reason to FAILED, and a
+# run whose score needs a qualifier writes it to CAVEAT. Both go into STATUS:
+# silence here would look exactly like a pass, which is the failure mode this
+# file exists to avoid. The key goes by environment, never as an argument.
+run_wrapper() {
+  local suite="$1" dir="$OUT/$1"
+  log "$2"
+  if LLAMA_API_KEY="$KEY" EVAL_OUT="$dir" "$REPO/external/$suite/run.sh" "$MODEL" "$URL" LLAMA_API_KEY; then
+    if [[ -s "$dir/CAVEAT" ]]; then
+      echo "$suite: ran — $(<"$dir/CAVEAT")" >> "$OUT/STATUS"
+    else
+      done_ "$suite"
+    fi
+  elif [[ -s "$dir/FAILED" ]]; then
+    skip "$(<"$dir/FAILED")" "$suite"
+  else
+    skip "run failed before it could say why" "$suite"
+  fi
 }
 
-run_bfcl() {
-  log "BFCL"
-  have_env bfcl || { skip "not installed — run provision/setup-eval-server.sh" "bfcl"; return; }
-  "$EVAL_ROOT/bfcl/.venv/bin/bfcl" --help >/dev/null 2>&1 \
-    || { skip "bfcl will not start (CPU baseline? see setup-eval-server.sh)" "bfcl"; return; }
-  skip "wrapper not written yet" "bfcl"
-}
+run_tau2() { run_wrapper tau2 "tau2-bench"; }
+run_bfcl() { run_wrapper bfcl "BFCL"; }
 
 run_swebench() {
   log "SWE-bench Verified (subset)"
