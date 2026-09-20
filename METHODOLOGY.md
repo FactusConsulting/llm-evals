@@ -2,7 +2,8 @@
 
 This document explains the design decisions behind the multi-judge evaluation
 methodology and the lessons learned that shaped it. If you just want to run an
-eval, see `TESTING.md` (short) or `HOW-TO-DRIVE-EVAL.md` (detailed runbook).
+eval, see `external/RUNBOOK.md` (which suite, and what works today) or
+`skills/judge-llm-eval/HOW-TO-DRIVE-EVAL.md` (the knowledge suite end to end).
 
 ## The original problem
 
@@ -119,6 +120,19 @@ the validator says ✗.
 
 Extension we haven't built yet: SQL/Go/Rust validators.
 
+### Mechanism 5 — An empty response is not a clean run
+
+The loop-detection scorer flagged spirals and summed a score. An empty generation
+has no spiral flags, so it scored a clean 3. GLM-5.3-Flash LD2 spent 18 minutes in
+pass 3, returned zero words, and was recorded as a model that stopped cleanly.
+
+Empty is now flagged as `empty_response` and scores 0, kept distinct from a spiral
+so the report says which of the two happened. All 36 existing scores were recomputed
+with the fixed scorer and exactly one changed — but the failure mode this hides is
+not small: the withdrawn GLM-4.7-Flash and North-Mini-Code loop runs were **24
+zero-byte generations each**, published for months as "2/24 spirals". A measure that
+reads absence as success cannot be trusted in either direction.
+
 ## Mechanisms we tried that did NOT work
 
 ### Super-judge that re-scores disagreements
@@ -158,7 +172,9 @@ Per run:
 - **Inter-judge agreement %** — should be 95-98%. Below 90% means the rubric
   is unclear or one judge is misbehaving.
 - **`alternative_acceptable` rate** — should be 10-30%. Below 5% means
-  judges are too strict (treating reference as contract).
+  judges are too strict (treating reference as contract). The Gemma 4 26B
+  baseline ran 14.6%; GLM-5.3-Flash ran 27-33%, at the top of the band but not
+  above it.
 - **Per-judge delta from mean** — should be <0.5pp. Larger means one judge
   has a systematic bias for that run.
 
@@ -168,11 +184,80 @@ Across runs:
 - **Persistent failure modes** — questions that fail in all 3 runs are real
   model limits. Questions that fail in 1/3 runs are stochastic noise.
 
+## The suite is saturated at the top
+
+The variance work succeeded, and success exposed the next problem: the instrument is
+now more precise than the differences it is being asked to measure.
+
+| Model | Knowledge | Range |
+|---|---|---|
+| Gemma 4 31B Q6_K | 98.92% | 0.00 pp (single-judge) |
+| GLM-5.3-Flash UD-Q2_K_XL | 98.69% | 0.13 pp |
+| Gemma 4 26B-A4B Q6_K | 98.56% | 0.67 pp |
+
+Three models inside **0.36 pp**, on a measure whose own precision is **0.13 pp**.
+Nothing in that spread is a quality difference. The suite cannot rank these models
+and should not be asked to.
+
+It remains the right **gate**. It is precise, it is ours, and it is not saturated at
+the bottom: Hermes 4 14B scored 92.75% and Gemma 4 12B Q4 scored 89.9%, so it still
+separates a model worth serving from one that is not. Use it to answer "did this
+build, quant or serving change break something", and send ranking questions to the
+external suites in `external/RUNBOOK.md`, which are deterministically graded and not
+saturated.
+
+**One run, not three.** Three runs bought 0.13 pp of precision on a saturated
+measure, for seven hours and six Opus judges. Keep three when establishing a new
+baseline — a new model, a new architecture, a new quant family — because the
+run-to-run range is itself a signal: Gemma 4 E4B scored 96.67% with a **1.62 pp**
+range, and a single run would have reported 96.67% and hidden that the model is
+unstable.
+
+### What is left when a suite saturates
+
+The residue is not spread evenly. Chunks 1-8 are at or near 100% for every strong
+model; **all of the remaining loss is chunk 9 Part B, which asks for working code
+and IaC**. GLM-5.3-Flash is 100% on Part A (analysis) and Part C (architecture) in
+every run and 73.3% on Part B. The same handful of questions fail across model
+families and quants:
+
+- **SC9-B** — AWS WAFv2: managed rule groups omitted, `field_to_match` written flat
+  instead of the nested `query_string {}`, geo-block `for_each` country list missing
+- **SC4-B** — Kubernetes NFS CSI in Terraform: StorageClass and PVC without the PV
+- **SC6-B** — Transit Gateway
+- **SC10-B** — Patroni in Ansible: template snippets with no apt install, no etcd DCS
+  config, no handlers, and `synchronous_standby_names` missing from an answer that
+  promised zero data loss
+- **B11** — bash `$!` versus `!$`
+
+Two distinct defect classes produce most of it. One is **syntax compression**: a 2-bit
+quant writes `variable "storage" { type = string, default = "500Gi" }` and
+`import ( "context", "time", )` — correct schema and logic, invalid separators, and
+both are rejected by their own tools. `tofu fmt` catches that class in under a second,
+which is why Mechanism 4 exists and why "run the formatter on generated HCL" is a
+cheap guard rather than a blocker. The other is **exact identifiers**: `AddFilter` for
+`AddEndpointFilter`, `pods/logs` for `pods/log`, `-generate-resource-out` for
+`-generate-config-out`, misattributed ATT&CK technique IDs. The prose around the
+identifier is right; the token-exact name slips.
+
 ## Where this fails (known limitations)
 
-1. **Reference answers can drift out of sync with the eval suite.** If the
-   eval suite changes a question, the reference answer must be updated. We
-   don't have automated detection of this.
+1. **Reference answers can drift out of sync with the eval suite — or never
+   cover it.** If the eval suite changes a question, the reference answer must be
+   updated, and we have no automated detection of that. Worse, a key can be
+   silently incomplete: `answers/chunk7-8-architect.md` covered only Q1-12 of each
+   of its four sections, so **32 of the 80 questions in chunks 7 and 8 were scored
+   from judge knowledge alone** and nobody noticed until a judge said so. Filling
+   the key and rescoring both chunks from scratch moved the mean by -0.09 pp, and
+   **exactly one of the 32 changed its final rating** — the hole was not inflating
+   the score. What it was costing was reproducibility: the run-to-run range halved,
+   from 0.27 pp to 0.13 pp. A complete key does not buy a different answer; it buys
+   the same answer twice.
+
+   Keys also rot against their own sources. ATT&CK for ICS restructured three
+   techniques the suite asks about — `T0855` → `T1692`, `T0857` → `T1693.001`,
+   `T0803` → `T1691` — so the key now records both, or a judge penalises a correct
+   current ID and credits a retired one.
 
 2. **Judges can collude on a wrong rubric interpretation.** If both Opus
    agents share the same blind spot (e.g. both think `kubernetes_csi_volume`

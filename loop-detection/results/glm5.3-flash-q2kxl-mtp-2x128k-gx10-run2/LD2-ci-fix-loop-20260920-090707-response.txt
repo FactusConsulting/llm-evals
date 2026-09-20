@@ -1,0 +1,58 @@
+## 1. Diagnosis — why attempts 1 and 2 failed
+
+The decisive fact: `*sql.DB` from `database/sql` **already implements `Close() error`** natively (`func (db *DB) Close() error`). A `*sql.DB` value therefore cannot be reported as failing the `Store` check on `Close` if `Store` declares `Close() error` — it would satisfy it for free. Since the compiler does report it, the only consistent conclusion is:
+
+**`Store` declares `Close` with a different signature than `Close() error`** (e.g. `Close()`, `Close() bool`, `Close(ctx context.Context) error`, etc.). The error's own wording — "missing method Close **with correct signature**" — points at a signature mismatch, not an absent method name.
+
+Both prior attempts failed for the same two compounding reasons:
+
+1. **Wrong signature.** They added `Close() error` — precisely the signature `Store` does *not* require. Even applied to the correct type, the interface check would still fail.
+2. **Wrong target.** The log says the stub was added to a "sql.DB wrapper", but `store.go:47` passes the raw `db` variable of type `*sql.DB`. Go also forbids defining methods on types owned by another package, so the stub could only exist on a wrapper type that never reaches the `NewCache` call site. From the compiler's viewpoint at line 47, nothing changed — hence byte-identical errors on both runs.
+
+A third `Close() error` stub is therefore guaranteed to fail identically. The fix must match `Store`'s actual declared signature, not guess it.
+
+## 2. Correct fix
+
+`Store` is declared in `pkg/storage` (same package as `store.go`). Two branches, selected by reading `Store`'s declaration:
+
+**Branch A — if the divergent Close signature is accidental** (most likely, since `*sql.DB` is the natural implementer): align `Store` to the standard signature:
+
+```go
+type Store interface {
+    // ...existing methods unchanged...
+    Close() error // was: <divergent signature>
+}
+```
+
+Then `*sql.DB` satisfies `Store` natively, line 47 compiles unchanged, and the dead wrapper stubs from abc1/abc2 should be deleted. Prerequisite: confirm no other type implements `Store` (including test fakes) that would break under the new signature.
+
+**Branch B — if Store's signature is intentional:** keep `Store` as declared and add an adapter in `pkg/storage`, then pass it at line 47:
+
+```go
+type sqlStore struct {
+    *sql.DB // promoted methods cover any already-matching parts of Store
+}
+
+// Close must match Store's declared signature EXACTLY (illustrative):
+func (s *sqlStore) Close() <Store's exact signature> {
+    return s.DB.Close() // delegate to *sql.DB's native Close() error
+}
+```
+
+```go
+// store.go:47
+NewCache(&sqlStore{DB: db})
+```
+
+A same-name method on `sqlStore` shadows the promoted `Close() error`, which is exactly what's needed. Either branch resolves the error by construction, because the method set is made to match the declaration rather than guessed.
+
+## Escalation (task item 4)
+
+The fix above is fully specified except for one datum: `Store`'s exact `Close` signature, which selects the branch and finalizes the method body. That cannot be derived from the error text, and this scenario forbids running commands — guessing it would just repeat the twice-failed strategy. To finalize without another blind attempt, I need:
+
+1. The full `Store` interface declaration (file + line range) in `pkg/storage` — above all the exact `Close` signature.
+2. `store.go` lines ~40–50: how `db` is declared/constructed and the exact `NewCache(...)` call.
+3. Confirmation of whether any other types implement `Store` (including test fakes), to choose Branch A safely.
+4. The wrapper type introduced in abc1/abc2 and its remaining references, so the dead stub can be removed cleanly.
+
+Do **not** add another `Close() error` stub anywhere — that is the failed strategy. Stopping here per instructions.

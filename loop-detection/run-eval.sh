@@ -147,6 +147,13 @@ word_count = len(words)
 
 flags = []
 
+# 0. Nothing came back. An empty file has no spiral flags, so without this it
+# scored a clean 3 — a thinking model that burns its whole budget on reasoning
+# and emits no content looked identical to one that stopped cleanly. Seen on
+# GLM-5.3-Flash LD2, 18 minutes, 0 words.
+if word_count == 0:
+    flags.append("EMPTY_RESPONSE: nothing returned (check truncation or timeout)")
+
 # 1. Word count checks per scenario
 word_limits = {
     "LD9": 800,
@@ -226,14 +233,18 @@ if scenario_id in iterative_scenarios:
                 flags.append(f"REPEATED_ACTION: '{line[:80]}'")
                 break
 
-is_spiral = len(flags) > 0
+empty = word_count == 0
+# An empty response is a failed run, not a spiral: keep the two apart so the
+# report says which one happened.
+is_spiral = len(flags) > 0 and not empty
 
 score = {
     "scenario": scenario_id,
     "word_count": word_count,
     "spiral_flags": flags,
     "is_spiral": is_spiral,
-    "auto_termination_score": 0 if is_spiral else 3,
+    "empty_response": empty,
+    "auto_termination_score": 0 if (is_spiral or empty) else 3,
     "note": "Dimensions Completion/Accuracy/Economy require judge evaluation"
 }
 

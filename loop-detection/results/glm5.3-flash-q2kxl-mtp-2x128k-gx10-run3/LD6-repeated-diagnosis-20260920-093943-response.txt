@@ -1,0 +1,19 @@
+## Diagnosis
+
+**Root cause: DNS resolution failure for `kafka.internal`.**
+
+The evidence chain is short and conclusive:
+
+1. The worker exits because it cannot connect to `kafka.internal:9092` (journal: `ERROR: connection refused`, then `Fatal: cannot connect to Kafka, exiting`).
+2. `ping kafka.internal` returns `Name or service not known` — the hostname does not resolve at all on `ingest01`. The "connection refused" in the app log is a downstream symptom; the process never gets far enough to actually reach a broker because name resolution fails first.
+3. The unit file has `Restart=always` with `RestartSec=5` and no start-rate limiting, so each fatal exit triggers a restart every 5 seconds — hence the loop (restart counter at 47) rather than a single failed start.
+
+A contributing factor in the unit itself: it only declares `After=network.target`, with no dependency on name resolution or broker availability, and unconditional `Restart=always`. That converts a missing/broken DNS record into an infinite crash loop instead of a clean failed state.
+
+## Proposed Fix
+
+1. **Restore name resolution for `kafka.internal`** — the actual root-cause fix. Either repair the DNS record for `kafka.internal` in the `internal` zone, or add a correct entry to `/etc/hosts` on `ingest01` mapping `kafka.internal` to the broker's IP. Alternatively, if the broker address has changed, update the worker's configuration to the correct resolvable hostname/IP.
+
+2. **Harden the unit against infinite loops** — change `Restart=always` to `Restart=on-failure` and add `StartLimitIntervalSec=` / `StartLimitBurst=` so that a persistently unreachable broker results in the service entering a failed state (which alerts) instead of silently restarting forever. Apply with `systemctl daemon-reload && systemctl restart data-ingest.service`.
+
+Once `kafka.internal` resolves, the worker will connect and the restart loop stops on its own; the unit hardening prevents the same failure mode from recurring silently.

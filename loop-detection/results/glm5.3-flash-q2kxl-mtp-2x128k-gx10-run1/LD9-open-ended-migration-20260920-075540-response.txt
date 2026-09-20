@@ -1,0 +1,30 @@
+# Postgres 14 → 16 Upgrade Plan — Payments Service
+
+## Key Risks and Prerequisites
+
+- **Downtime exposure:** DigitalOcean's in-place major-version upgrade takes the cluster (primary + replica) unavailable. For a payments DB, this needs an approved window. Alternative: new 16 cluster + logical replication + cutover (near-zero downtime, more moving parts).
+- **Breaking changes 14→15→16:** PG15 revokes `CREATE` on the `public` schema from non-superusers (breaks app roles creating temp objects); removed/renamed GUCs and backup APIs; PG16 changes to auth defaults. Verify psycopg2 2.9.3 and its libpq against 16's SCRAM auth.
+- **Extensions/config:** Inventory extensions and non-default GUCs; confirm DO offers 16-compatible versions; removed GUCs can prevent instance startup.
+- **Data safety:** Verified recent backup + PITR before starting; pre-upgrade snapshot for rollback; agreed RTO/RPO.
+- **Cutover correctness:** In-flight transactions must drain; connection strings live in K8s secrets; replica lag must be ~0 before switching.
+- **Compliance:** Payments service — change review and stakeholder sign-off required.
+
+## Migration Plan
+
+1. Inventory extensions, roles, and non-default GUCs on the 14 cluster (`pg_extension`, `pg_settings WHERE source <> 'default'`); flag anything removed in 15/16.
+2. Confirm with DigitalOcean whether in-place 14→16 upgrade is supported for this cluster's HA/replica configuration; obtain expected downtime estimate. **[EXTERNAL — DO support]**
+3. Decide upgrade path based on downtime tolerance: (a) DO in-place upgrade in a maintenance window, or (b) new 16 cluster + logical replication + cutover. **[APPROVAL — payments owner]**
+4. Build a staging 16 cluster; restore the latest backup into it; run the payments integration suite against it with psycopg2 2.9.3 (bump to latest 2.9.x if issues surface); fix any `public`-schema/privilege or query regressions.
+5. Verify a full backup restore into 16 succeeds and PITR is enabled on production; record RTO/RPO.
+6. Schedule the maintenance window / cutover time with stakeholders and on-call; publish runbook and rollback criteria. **[APPROVAL — change review]**
+7. Pre-flight (T-30 min): confirm replica lag ≈ 0, no long-running transactions, take a final snapshot/backup, freeze schema migrations via deploy lock.
+8. Path (a): trigger the DO in-place major-version upgrade via control panel/API; monitor until primary and replica return on 16.
+9. Path (b): create the production 16 cluster, seed it (dump/restore or initial logical replication), then replicate incrementally from 14; monitor lag down to seconds.
+10. Cutover (path b): set 14 read-only / pause application writes, wait for full catch-up, update the K8s secret/DNS to point at 16, resume writes. **[APPROVAL — go/no-go]**
+11. Rolling-restart payments pods; confirm connection-pool health, `SELECT version()` = 16, extension versions, and a canary payment flow end-to-end.
+12. Post-checks: verify replica streaming, backups re-enabled on 16, compare `pg_stat_statements` and latency against baseline; watch error rates for 24–48 h.
+13. Retain the 14 cluster (path b) or pre-upgrade snapshot (path a) for rollback until sign-off; decommission after the retention period. **[APPROVAL — decommission]**
+
+## Approval / Coordination Points
+
+DO support (steps 2, 8–9); payments owner for path decision (3); change review for window (6); go/no-go for write pause (10); decommission sign-off (13).

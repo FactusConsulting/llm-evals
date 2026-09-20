@@ -1,0 +1,25 @@
+## Code Review: `cache` package — caching layer
+
+**Verdict: Request changes.** The package does not compile as submitted, and the background goroutine design leaks memory.
+
+### Issues (must fix)
+
+1. **cache.go:5 — Unused import, build failure.** `"context"` is imported but never used, so the package fails to compile (`"context" imported and not used`). Remove it — or better, use it to fix issue #2 below.
+
+2. **cache.go:26, 52–64 — Unstoppable goroutine / permanent memory leak.** `New` spawns `go c.evict()` and there is no way to ever stop it. Two consequences: (a) every cache instance leaks one goroutine for the lifetime of the process; (b) the goroutine holds a root reference to `*Cache`, so once a caller drops all references to the cache, neither the cache, its map, nor its entries can ever be garbage-collected. In a long-running process that creates caches dynamically, this is an unbounded leak. Fix: add a `Close()` method (or accept a `context.Context` in `New`) and have `evict` select on a done channel.
+
+3. **cache.go:54 — Eviction interval is hardcoded and ignores TTL.** `time.Sleep(time.Minute)` means expired entries are retained for up to ~60s after expiry regardless of TTL. With the 100ms TTL used in the tests, dead entries are held ~600× longer than they are valid, so memory usage is dominated by garbage. Derive the interval from `ttl` (e.g., `ttl/2`, clamped to a sane minimum) or make it a `New` parameter — which also makes `evict` testable.
+
+4. **cache.go:21–28 — No TTL validation.** `New(0)` or a negative TTL produces entries whose `expiresAt` is already in the past at `Set` time (cache.go:32), so every write is immediately unreadable and the cache silently stores nothing. Panic with a clear message or document the behavior.
+
+5. **cache.go:30–34, 36–44 — Shared mutable values returned without copy.** `Get` returns the stored `interface{}` by reference. For reference-type values (maps, slices, pointers), any caller can mutate the cached value outside the lock, causing data races between concurrent readers and cross-caller visibility of mutations. At minimum, document that stored values must be treated as immutable; ideally note this in the API contract.
+
+6. **cache.go:56–62 — Eviction holds the lock for the full map scan.** On a large cache, the range loop blocks all `Get`/`Set`/`Delete` for the entire iteration. Acceptable at current scale, but collect expired keys first and delete after unlock, or batch, before this becomes a latency problem.
+
+7. **cache_test.go:16 — Timing-dependent test.** `time.Sleep(200 * time.Millisecond)` after a 100ms TTL makes `TestSetGet` flaky: on a loaded CI runner the entry can expire between `Set` (line 11) and the first `Get` (line 12), failing with "expected v". Use a larger margin or inject a clock. Related: there is no test for `evict` at all — another reason to make the interval configurable (issue #3).
+
+### Nits
+
+- cache.go:11, 30, 36 — Use `any` instead of `interface{}` (Go 1.18+); a generic `Cache[V any]` would also remove type assertions at call sites.
+- cache.go:53–54 — Prefer `time.Ticker` over `Sleep`-in-a-loop for the evictor.
+- cache.go:16 — For a read-heavy cache, `sync.RWMutex` would allow concurrent `Get`s.

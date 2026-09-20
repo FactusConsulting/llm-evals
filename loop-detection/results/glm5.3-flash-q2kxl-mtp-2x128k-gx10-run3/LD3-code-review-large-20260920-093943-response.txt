@@ -1,0 +1,23 @@
+## Code Review: caching layer (`cache` package)
+
+**Verdict: Request changes** — the package does not compile as submitted, and the background goroutine design has a leak that must be fixed before merge.
+
+### Issues
+
+1. **cache/cache.go:5 — Build failure: unused import.** `"context"` is imported but never referenced anywhere in the file. Go rejects unused imports, so this PR fails to compile (`"context" imported and not used`). Either remove the import or actually use it (see issue 2, where a context would be the natural shutdown mechanism).
+
+2. **cache/cache.go:26, 52–64 — Goroutine leak; cache is never garbage-collectable.** `New` spawns `go c.evict()` and there is no way to stop it: the `for` loop at line 53 has no exit condition, no `done` channel, no context cancellation. Consequences: (a) one leaked goroutine per `New` call for the lifetime of the process; (b) the goroutine holds a reference to `c`, so even after callers drop all references the `Cache` and its entire `entries` map are pinned in memory forever. If caches are ever created dynamically (per tenant, per request), this is a genuine leak. Fix: add a `done chan struct{}` (or accept a `context.Context`), `select` on it in the loop, and expose `Close()`/`Stop()`. Tests should call it via `defer c.Close()`.
+
+3. **cache/cache.go:54 — Hardcoded 1-minute eviction interval, decoupled from TTL.** `time.Sleep(time.Minute)` means expired entries are retained in memory for up to a minute after expiry regardless of TTL — the test's 100ms TTL is a case in point. Derive the interval from `ttl` (e.g., `ttl/2`, clamped to a sane minimum) or make it a `New` parameter; prefer `time.Ticker` over `Sleep` so the interval doesn't drift.
+
+4. **cache/cache.go:21 — No TTL validation.** `New(0)` produces `expiresAt == now`, so every entry is dead on arrival; a negative TTL sets `expiresAt` in the past. Either reject non-positive TTL (change signature to return an error) or explicitly document the behavior.
+
+5. **Unbounded memory growth (cache/cache.go:32).** There is no size cap and no eviction policy beyond TTL. If keys are derived from user input, a client can grow `entries` without bound — a memory-exhaustion vector. At minimum document the limitation; ideally add a max-size with LRU or random eviction.
+
+6. **cache/cache.go:36–43 — Expired entries are never lazily removed.** `Get` returns `false` for an expired entry but leaves it in the map, so garbage accumulates until the (currently 1-minute) sweep. Consider deleting under the lock when an expired entry is observed (this requires moving the expiry check inside the locked section, which is safe since `entry` is copied by value).
+
+### Nits
+
+- cache/cache.go:11, 30, 36 — `interface{}` → `any` (Go 1.18+).
+- cache/cache.go:16 — `sync.RWMutex` would suit this read-heavy workload better than `sync.Mutex`.
+- cache_test.go:16 — the `time.Sleep(200 * time.Millisecond)` assertion is timing-dependent and can flake on loaded CI; consider an injectable clock, and add a concurrent Set/Get/Delete test to run under `-race`.

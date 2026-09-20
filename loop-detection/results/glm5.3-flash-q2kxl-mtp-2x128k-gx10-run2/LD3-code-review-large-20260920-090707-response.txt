@@ -1,0 +1,19 @@
+**Verdict: Request changes** — the package does not compile as written, and the background eviction design leaks goroutines and prevents garbage collection of the cache.
+
+## Issues
+
+1. **cache/cache.go:5 — unused import, build failure.** `"context"` is imported but never referenced. Go rejects unused imports, so `go build ./...` fails with `"context" imported and not used`. Remove it, or use it for shutdown (see next issue).
+
+2. **cache/cache.go:26 and 52–63 — unbounded goroutine leak; `Cache` can never be GC'd.** `New` unconditionally starts `go c.evict()`, and the `for` loop at line 53 has no exit condition, no done channel, and no way for the caller to stop it. Consequences: (a) every `Cache` instance leaks one goroutine for the process lifetime, including every cache created in the tests; (b) the goroutine holds a live reference to `c`, so a `Cache` that is no longer used is never garbage-collected. If caches are created dynamically (per request/session), this is an unbounded goroutine + memory leak. Fix: add a `Close()`/`Stop()` method, replace the sleep loop with `time.Ticker` plus a `select` on a done channel or `context.Context` cancellation.
+
+3. **cache/cache.go:54 — eviction interval is hardcoded to 1 minute, independent of TTL.** `Get` does lazy expiry but leaves the entry in the map, so expired entries are only reclaimed by `evict`. With a short TTL (the test uses 100ms), memory is retained for up to a minute per expired key; with a long TTL, the goroutine wakes pointlessly. Make the interval a parameter of `New` or derive it from `ttl` (e.g., `ttl/2`, clamped to a sane range).
+
+4. **cache/cache.go:21 — no validation of `ttl`.** `New(0)` or a negative TTL produces entries whose `expiresAt` is already in the past at `Set` time, so every `Get` misses and the cache silently becomes a black hole. Reject non-positive TTLs in `New` (return an error or panic) or document the behavior.
+
+5. **cache/cache_test.go — the eviction path introduced by this PR is untested.** `TestSetGet` relies on wall-clock sleeps and only exercises lazy expiry in `Get`; the `evict` goroutine (with its 1-minute sleep) can never be observed by these tests. Inject a clock/now-func into `Cache` so expiry and eviction can be tested deterministically instead of sleeping.
+
+## Nits
+
+1. `sync.Mutex` → `sync.RWMutex`: `Get` is a read and would allow concurrent readers.
+2. `interface{}` → `any` (Go ≥ 1.18) in `entry.value`, `Set`, and `Get`.
+3. No concurrency coverage: add a parallel Set/Get/Delete test and run the suite with `-race` to validate the locking.

@@ -1,0 +1,66 @@
+# PR Review: JWT Auth Migration
+
+## Blocking issues
+
+**1. The signing key is generated at process startup.**
+`init()` creates a fresh random secret per process. Consequences:
+- Every restart/redeploy silently invalidates every outstanding token — all users get logged out on each deploy.
+- Behind a load balancer with N replicas, each instance mints and validates with a different key; a token issued by instance A fails validation on instance B. Intermittent 401s that will be very hard to debug.
+- `rand.Read`'s error return is discarded. On failure you could be signing with a partially-filled or zeroed key.
+
+The secret must come from configuration or a secret manager (env var, KMS, etc.), loaded with an explicit error path, and rotated deliberately — not generated at runtime.
+
+**2. You've lost the ability to revoke credentials.**
+Sessions in Redis could be deleted to force logout, on password change, on account disable, or in response to a stolen credential. A 24-hour JWT with no denylist, no `jti`, and no server-side state has none of those levers — a compromised token is valid for up to 24 hours no matter what you do. This is a real security regression against the session model and needs either a documented acceptance of that risk or a revocation design (short-lived access tokens + denylist, or similar).
+
+**3. `GenerateRefreshToken` is half a feature.**
+It produces a random string, but there is no validation function, no storage, no rotation, and no binding to a user. As written, nothing can verify a refresh token, so it's dead code — or the storage half is missing from this diff. If refresh tokens need persistence, that storage dependency directly contradicts the "removes Redis dependency" claim. What's the intended flow here?
+
+## High-priority issues
+
+**4. Bearer parsing accepts anything.**
+`strings.TrimPrefix(authHeader, "Bearer ")` returns the input unchanged when the prefix is absent, so `Authorization: Basic abc123` or a bare token gets passed straight to `ValidateToken`. Check the scheme explicitly (`strings.HasPrefix`, case per RFC 6750) and reject other schemes with a clear error rather than relying on signature failure.
+
+**5. Role claims go stale.**
+Embedding `role` in the token means a demotion or admin-permission revocation doesn't take effect until token expiry — up to 24 hours of the old privilege level. The session store always reflected current state. Either shorten the access-token window considerably or re-fetch role from your source of truth per request.
+
+**6. The keyfunc ignores the token's algorithm.**
+`func(t *jwt.Token) (interface{}, error) { return jwtSecret, nil }` will happily return the HMAC secret for whatever algorithm the token claims. Today the library constrains this, but the standard defense against alg-confusion is to assert the method inside the keyfunc:
+
+```go
+if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+    return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+}
+```
+
+**7. No `iss`/`aud` claims.**
+Once the secret moves to shared config (which it must, per point 1), any service or environment that obtains it can mint tokens accepted everywhere. Set `Issuer`/`Audience` in `RegisteredClaims` and verify them at parse time.
+
+**8. Middleware doesn't validate that required claims are present.**
+A validly-signed token with an empty `uid` or `role` sails through and puts empty-string values into the request context. Check for non-empty `claims.UserID` (and role, if it's required) before proceeding.
+
+**9. Client-side token storage changes your XSS posture.**
+Session cookies could be `HttpOnly` and `Secure`, keeping them out of JS reach. Whatever stores this JWT on the client (localStorage? in-memory?) is readable by injected script. Where is the frontend planning to keep it, and have the CSP implications been considered? Conversely, confirm whether dropping cookies changes your CSRF assumptions.
+
+## Medium / questions
+
+**10. Context keys.**
+`context.WithValue(r.Context(), "userID", ...)` uses bare string keys — collision-prone and flagged by staticcheck (SA1029). Use an unexported custom key type, and consider a single typed `CurrentUser` struct instead of two independent values.
+
+**11. Error conflation in `ValidateToken`.**
+Expired, malformed, and bad-signature tokens all collapse into one error path. Callers can't distinguish them for logging, alerting, or telling a client "your token expired, refresh" vs. "this token is garbage." Also consider `jwt.WithLeeway` — strict `exp` checking with no clock-skew tolerance produces intermittent 401s across a small fleet.
+
+**12. HS256 means verifier == minter.**
+Every party that can validate a token can also forge one. Fine for a single service; if other services will verify these tokens, consider RS256/EdDSA so the signing key stays with the issuer.
+
+**13. Migration completeness.**
+The excerpt shows the cookie path deleted outright. Are there other `store.GetSession` call sites elsewhere in the 400-line diff? What does the logout handler do now? Existing cookie-based clients break the moment this deploys — is there a dual-acceptance window or a coordinated client release? Please confirm the Redis-removal claim holds across the whole diff, not just these files.
+
+**14. Session length UX.**
+Is 24 hours the product-approved session length? With no working refresh flow (point 3), users re-authenticate daily; lengthening the token to avoid that makes the revocation gap in point 2 worse. These two decisions need to be made together.
+
+**15. Tests.**
+I see none in the excerpt. I'd want coverage for: token expiry, tampered signature, wrong key, missing/malformed Authorization header, non-Bearer scheme, empty `uid` claim, and role propagation through context.
+
+**16. Minor nits.**
+`base64.RawURLEncoding` avoids `=` padding if these tokens ever land in query strings; consider `WWW-Authenticate: Bearer` on the 401 responses; and make sure nothing in the logging path ever writes the `Authorization` header value.
