@@ -11,6 +11,12 @@ set -euo pipefail
 ROOT=/opt/evals
 UV=/usr/local/bin/uv
 
+# Pinned, so a score can name the code that produced it. The wrappers copy both
+# values into every run-config.txt.
+TAU2_REPO=https://github.com/sierra-research/tau2-bench
+TAU2_REV=b7ea9074c1cba482b30687fecdb5c8425fd6f619
+BFCL_VERSION=2026.3.23
+
 log() { printf '\n== %s\n' "$*"; }
 
 log "base directory"
@@ -59,9 +65,26 @@ echo "  ok"
 log "suite environments"
 # tau2 imports websockets through tau2.voice.audio_native.openai.provider without
 # declaring it, so `tau2 --help` dies on import without this.
-make_env tau2      "tau2 @ git+https://github.com/sierra-research/tau2-bench@main" "websockets"
-make_env bfcl      "bfcl-eval" "soundfile"
+make_env tau2      "tau2 @ git+$TAU2_REPO@$TAU2_REV" "websockets"
+make_env bfcl      "bfcl-eval==$BFCL_VERSION" "soundfile"
 make_env swebench  "swebench"
+
+log "tau2 task data"
+# The wheel carries code only. Tasks, policies, databases and the user-simulator
+# guidelines live in the repository's data/ tree, and without them `tau2 run`
+# has no domain to load. They are checked out from the commit the package is
+# built from, sparse and blobless: the voice corpus and upstream's submitted
+# results are most of the repository and no text run reads them.
+TAU2_SRC="$ROOT/tau2/src"
+if [[ "$(git -C "$TAU2_SRC" rev-parse HEAD 2>/dev/null)" != "$TAU2_REV" ]]; then
+  rm -rf "$TAU2_SRC"
+  git init -q "$TAU2_SRC"
+  git -C "$TAU2_SRC" remote add origin "$TAU2_REPO"
+  git -C "$TAU2_SRC" sparse-checkout set --no-cone /data/tau2/domains /data/tau2/user_simulator
+  git -C "$TAU2_SRC" fetch -q --depth 1 --filter=blob:none origin "$TAU2_REV"
+  git -C "$TAU2_SRC" -c advice.detachedHead=false checkout -q FETCH_HEAD
+fi
+printf '  %s  %s\n' "${TAU2_REV:0:12}" "$(du -sh "$TAU2_SRC/data" | cut -f1)"
 
 log "docker access for the current user"
 if ! docker info >/dev/null 2>&1; then
@@ -98,6 +121,16 @@ for s in tau2 bfcl; do
     printf '%s\n' "$err" | tail -3 | sed 's/^/      /'
   fi
 done
+# Starting is not enough for tau2: it starts without its data and then has no
+# tasks. Load a domain's task file the way a run does.
+if err=$(TAU2_DATA_DIR="$TAU2_SRC/data" "$ROOT/tau2/.venv/bin/python" -c '
+from tau2.registry import registry
+print(len(registry.get_tasks_loader("airline")()), "airline tasks")' 2>&1); then
+  printf '  %-16s ok (%s)\n' "tau2 data" "$(printf '%s\n' "$err" | tail -1)"
+else
+  printf '  %-16s FAILS to load:\n' "tau2 data"
+  printf '%s\n' "$err" | tail -3 | sed 's/^/      /'
+fi
 
 log "disk"
 df -h "$ROOT" | tail -1

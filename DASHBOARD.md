@@ -8,7 +8,7 @@ dimension was **not tested this generation**.
 and Gemma 4 31B (98.92%) sit inside 0.36 pp, and the knowledge suite's own precision
 is 0.13 pp. It cannot rank them. It is still the right regression gate — it is
 precise, and Hermes 4 14B scored 92.75% on it, so the bar is not automatic. Ranking
-questions go to the external suites: [`external/RUNBOOK.md`](external/RUNBOOK.md).
+questions go to the external suites: [`RUNBOOK.md`](RUNBOOK.md).
 
 The three dimensions:
 

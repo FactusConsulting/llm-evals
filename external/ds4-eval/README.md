@@ -33,18 +33,101 @@ the subsets are small enough that a few cases swing a percentage point.
 
 ```bash
 ./fetch_cases.py                      # writes cases.json from a pinned ds4 revision
-./test_grade.py                       # 27 assertions covering the grading port
+./test_grade.py && ./test_run.py      # grading port + runner, mock server only
 ./run.py --url http://192.168.2.173:30000 --model glm5.3-flash \
-         --suite core --out ../../results/<model>/ds4-core
+         --suite core --mode gate --out ../../results/<model>/ds4-core-gate
 ```
 
 `--source 'GPQA Diamond'` and `--limit N` narrow a run; `--suite hard-smoke` is
 the 12-case check that the endpoint and the harness still work.
 
-**For a thinking model, pass `--max-tokens 16000`.** The hard suite's per-case
-budget is 4096, which GLM-5.3-Flash can spend entirely on reasoning; it then
-emits no `Answer:` line and scores zero. The runner warns when any generation
-hits the limit — a run with truncations is not comparable to one without.
+**For a reasoning model, give it far more than you think and raise the timeout
+with it.** `--max-tokens 98304 --timeout 7200` is what GLM-5.3-Flash needs here.
+
+## Gate vs measure
+
+`--mode` is two named sampling presets, both with a **fixed, per-case nonce** in
+the system prompt (see below):
+
+- **`gate`** — temperature 0, seed 0. A deterministic run: the same build against
+  the same cases produces the same transcripts. Use this for regression —
+  any difference between two gate runs means the build changed something,
+  not that the sampler got lucky.
+- **`measure`** — ds4's own defaults (temperature 1.0, top_p 1.0, min_p 0.05),
+  seed taken from `--seed`. Call it once per seed (`--seed 1`, `--seed 2`, …,
+  `--seed N`) to get N honest samples of the model's real variance, then feed
+  the N run directories to `compare.py`.
+
+An explicit `--temperature`/`--top-p`/`--min-p`/`--seed`/`--nonce` always
+overrides the preset. `--top-p`/`--min-p`/`--seed` are only sent when set — the
+default (no `--mode`) is plain temperature-0 with nothing else, matching the
+runner's original behaviour.
+
+### Why the nonce is deterministic
+
+Every request carries `SESSION=<token>` ahead of the real system prompt.
+llama-server picks a slot by longest-common-prefix similarity against past
+requests and restores that slot's KV state; a byte-identical prompt across
+cases collides into whatever slot the KV-restore logic picks, which has a
+corner case that corrupts generation. A random token avoids the collision but
+makes the prompt — and therefore the reasoning path a temperature-0 model
+takes — different on every run, so nothing is reproducible.
+
+`--nonce fixed` (the default) is `SESSION=` followed by the first 32 hex
+characters of `sha256("<source>/<id>")`: unique per case, so no two cases
+collide, and identical across runs, so a run can be repeated byte-for-byte
+under `gate`. `--nonce random` is a fresh `uuid4` per request — the same
+disruptive behaviour this runner shipped with originally, kept for
+comparison.
+
+### One run is not enough for this suite
+
+Same case, same server, same settings, 30 minutes apart: 2265 s and 141,344
+characters of reasoning against 321 s and 19,527 characters, both graded
+correct. Nothing about the model or the endpoint changed between the two —
+the random nonce alone moved a temperature-0 run onto a different reasoning
+path. A single `measure` run reports one such path, not the model's accuracy;
+run it with several seeds and compare, or use `gate` if the question is
+reproducibility rather than variance.
+
+### Think-closure
+
+A case that hits its token ceiling mid-reasoning with no `Answer:` line gets
+one follow-up turn: the original exchange, the truncated reasoning (the last
+6000 characters, if it ran longer) as an assistant turn, and a request for
+exactly one final line, capped at 512 tokens. The case is graded from that
+follow-up and marked `forced: true`; the summary's `forced` count says how
+many cases needed it. `--no-force` turns this off. `--think-budget N` caps
+only the first phase's tokens (default: the resolved `--max-tokens` budget),
+so the cost of a wide sweep can be bounded independently of how much room a
+model gets before closure kicks in.
+
+Two ceilings still bound the first-phase budget: context (`n_ctx` per slot
+minus the prompt) and your own `--timeout` (budget ÷ generation speed,
+measured at the top — per-token time grows with context). **A run with
+`truncated` above 0 is not comparable to one without** — those cases still
+had no clean stop even after the forced follow-up.
+
+## Comparing runs
+
+```bash
+./compare.py ../../results/glm5.3-flash/measure-seed1 \
+             ../../results/glm5.3-flash/measure-seed2 \
+             ../../results/glm5.3-flash/measure-seed3
+```
+
+Classifies every case common to all the given runs:
+
+- **stable-correct** — correct in every run.
+- **stable-incorrect** — wrong in every run.
+- **unstable** — correct in some runs and wrong in others. This is the number
+  that "one run is not enough" is about.
+
+The table on stdout shows tokens and seconds per run per case; `comparison.json`
+holds the same data plus the aggregate: mean score and its spread across runs,
+the unstable count, total `forced` and `truncated` cases, and tokens spent per
+correct answer (a cost-of-correctness figure, comparable across runs of the
+same model).
 
 ## Why cases.json is not committed
 
@@ -57,33 +140,41 @@ keys living here.
 ## How faithful this is to ds4-eval
 
 The prompts, the answer extraction and the matching are ported from
-`ds4_eval.c`, so a score here means what a score from `ds4-eval` means. The port
-is covered by `test_grade.py`, which asserts the behaviours the C spells out:
-`</think>` stripping, last-`Answer:`-wins, prose that must not be read as a pick
-("A careful look", "I'll say C"), negated distractors ("not B, so D"), leading
-zeros, `\boxed{}` stripping, aliases, and COMPSEC line-set subsetting.
+`ds4_eval.c`, so a score here means what a score from `ds4-eval` means. The
+port is covered by `test_grade.py`, which asserts the behaviours the C spells
+out: `</think>` stripping, last-`Answer:`-wins, prose that must not be read as
+a pick ("A careful look", "I'll say C"), negated distractors ("not B, so D"),
+leading zeros, `\boxed{}` stripping, aliases, and COMPSEC line-set subsetting.
 
-Three differences, all of which make our numbers a **lower bound** rather than
-an inflated one:
+Two differences remain, both of which make our numbers a **lower bound**
+rather than an inflated one:
 
-1. **No forced think-closure.** ds4 reserves a reply budget (1024 soft / 512
-   hard) and makes the model close its reasoning as it approaches the limit. We
-   speak plain HTTP and cannot. A thinking model that spends the whole budget
-   reasoning returns no `Answer:` line and scores zero, where ds4 would have
-   nudged it into answering. Watch `truncated` in the summary — if it is not 0,
-   raise `--max-tokens` before comparing anything.
-2. **Sampling.** We default to `temperature 0`. ds4 uses its own top-p/min-p
-   defaults and a "high" think mode.
-3. **Reasoning arrives out of band.** llama.cpp returns `reasoning_content`
+1. **Think-closure is one-shot, not continuous.** ds4 reserves a reply budget
+   and nudges the model toward closing its reasoning as it approaches the
+   limit, throughout generation. We speak plain HTTP: a case that hits the
+   ceiling gets exactly one forced follow-up (above), not ds4's continuous
+   nudging. `--no-force` reproduces ds4's absence of any closure at all.
+2. **Reasoning arrives out of band.** llama.cpp returns `reasoning_content`
    separately, so we grade `content` alone. ds4 grades one string and strips
    everything before `</think>`. Same result, different plumbing.
+
+`--mode measure` uses ds4's own temperature/top_p/min_p defaults; the runner's
+own default (no `--mode`) is temperature 0, which is not what ds4 samples with.
 
 The default token budget is 16000, matching ds4; hard-suite cases carry their
 own per-case budget and override it, which is also ds4's precedence.
 
 ## Output
 
-`results.json` holds a summary plus one record per case — expected, got, kind,
-finish_reason, seconds, and the full response, so a disputed grade can be
-re-read without re-running. `run-config.txt` records the exact command, the
-pinned cases revision, and the date.
+`results.json` holds a summary plus one record per case. The summary records
+the run conditions — mode, nonce, temperature/top_p/min_p/seed, max_tokens,
+think_budget, whether forcing was enabled, and a `server` snapshot of the
+endpoint's `/props` and `/slots` (`build_info`, slot count, `n_ctx` per slot,
+the first slot's sampler params) taken once at the start; a field is `null`
+if that snapshot call failed, which never aborts the run. Per case: expected,
+got, kind, `finish_reason`, `seconds`, `prompt_tokens`/`completion_tokens`
+(from the endpoint's `usage`, or a character-based estimate flagged
+`estimated: true` when `usage` is missing), `forced`, `repeated_lines` and
+`repeated_sentences` in the reasoning, and the full response, so a disputed
+grade can be re-read without re-running. `run-config.txt` records the exact
+command, the resolved sampling, the pinned cases revision, and the date.

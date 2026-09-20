@@ -15,8 +15,10 @@ upstream authors. Anything under `external/` is NOT our test.
 external/
   bin/eval-tier             # runs a tier end to end
   provision/                # builds the eval server
-  <suite>/                  # ds4-eval, lm-eval-harness, ...
+  lib/remote.sh             # ssh to the eval server; keys go over stdin, never argv
+  <suite>/                  # ds4-eval, bfcl, tau2, ...
     README.md               # how that suite runs (framework + version + config)
+    run.sh                  # bfcl, tau2: run the suite on the eval server
   results/
     <model>/
       <tier>-<timestamp>/   # e.g. gate-20260920-103623
@@ -24,6 +26,7 @@ external/
         <benchmark>/
           results.json      # raw harness output
           run-config.txt    # exact command + pinned revision + date
+      <suite>-<timestamp>/  # a wrapper run on its own, e.g. bfcl-20260920-200851
 ```
 
 ## Models (all reached via LiteLLM `https://llm.lwa.dk/v1`)
@@ -41,16 +44,19 @@ external/
   OlympiadBench, LiveBench, NIST Juliet. No judges. See `ds4-eval/README.md`.
 - **lm-eval-harness** (EleutherAI) — IFEval, GPQA, ... via the OpenAI-compatible
   LiteLLM endpoint (`local-chat-completions`).
-- **tau2** / **BFCL** — installed on the eval server, not yet wrapped.
+- **BFCL** — function calling, AST- and state-checked, through
+  `/v1/chat/completions` with native `tools`. See `bfcl/README.md`.
+- **tau2** — multi-turn tool use against a simulated customer; the customer is a
+  second LLM, and which one is a decision. See `tau2/README.md`.
 - _(planned)_ SWE-bench Verified, Terminal-Bench, Aider polyglot.
 
 ## Driving them
 
-`RUNBOOK.md` has the three tiers (`gate` / `rank` / `deep`), what each is for,
+`../RUNBOOK.md` has the three tiers (`gate` / `rank` / `deep`), what each is for,
 the current state of every suite, and the one blocker on the eval server.
 `bin/eval-tier` runs a tier. `provision/setup-eval-server.sh` builds the box.
 
-Read `RUNBOOK.md` before trusting a number from here: it says which suites
+Read `../RUNBOOK.md` before trusting a number from here: it says which suites
 actually run today and which are scaffolding.
 
 > Tip (from the survey): run each task N times and report consistency (τ-bench's
