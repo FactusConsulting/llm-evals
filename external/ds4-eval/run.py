@@ -270,7 +270,11 @@ def force_closure(url: str, model: str, key: str, sys_msg: str, user_msg: str,
         {"role": "assistant", "content": tail},
         {"role": "user", "content": FORCE_INSTRUCTION},
     ]
-    body = request_body(model, messages, FORCE_MAX_TOKENS, sampling)
+    # Greedy, whatever phase 1 sampled with. This turn extracts a conclusion from
+    # reasoning that already exists; sampling noise here adds variance to the
+    # score without measuring anything about the model.
+    greedy = {**sampling, "temperature": 0.0}
+    body = request_body(model, messages, FORCE_MAX_TOKENS, greedy)
     return post_stream(url, key, body, timeout)
 
 

@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import run  # noqa: E402
 
 REQUEST_LOG = []  # (model, len(messages)) per POST this process has seen
+TEMP_LOG = []     # the temperature each POST asked for, in order
 
 
 def sse(*chunks) -> bytes:
@@ -67,6 +68,7 @@ class MockHandler(BaseHTTPRequestHandler):
         model = payload.get("model")
         messages = payload.get("messages", [])
         REQUEST_LOG.append((model, len(messages)))
+        TEMP_LOG.append(payload.get("temperature"))
         if model == "ceiling":
             body = CEILING_FORCED if len(messages) >= 4 else CEILING_FIRST
         else:
@@ -114,6 +116,7 @@ def sampling_of(mode, **overrides):
 def run_one(case: dict, model: str, sampling: dict, no_force: bool = False,
            think_budget: int = 0, max_tokens: int = 200):
     REQUEST_LOG.clear()
+    TEMP_LOG.clear()
     args = SimpleNamespace(url=URL, model=model, api_key="none", timeout=10,
                            max_tokens=max_tokens, think_budget=think_budget,
                            no_force=no_force, suite="core")
@@ -204,6 +207,12 @@ rec5, _, _ = run_one(ceiling_case, "ceiling", gate, no_force=True)
 log_after_no_force = list(REQUEST_LOG)
 check("--no-force skips the follow-up", log_after_no_force, [("ceiling", 2)])
 check("without forcing the case scores wrong", rec5["correct"], False)
+
+# The follow-up extracts a conclusion from reasoning that already exists, so it
+# is greedy even when phase 1 sampled at the model's recipe temperature.
+run_one(ceiling_case, "ceiling", measure)
+check("measure mode: phase 1 samples, the forced turn is greedy",
+      list(TEMP_LOG), [1.0, 0.0])
 
 ok_case = make_case("GPQA Diamond", "p5", answer="B")  # finish_reason stop, has an answer
 rec6, _, _ = run_one(ok_case, "plain", gate)
