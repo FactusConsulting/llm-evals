@@ -19,7 +19,7 @@
 
 ## TL;DR
 
-- **Mean across 3 runs: 98.78%** (731/740), range **0.27 pp**
+- **Mean across 3 runs: 98.69%** (730.3/740), range **0.13 pp**
 - Analysis and architecture are **100% in every run**; every point lost is in written code
 - One dominant, reproducible defect: **HCL/Go syntax compressed onto one line with commas**
 - Throughput: **238-246 tok/s prefill, 22.2-22.8 tok/s generation**, MTP acceptance 0.56-0.62
@@ -33,7 +33,7 @@ See `judge-summary.md` for the full tables. Headline:
 
 | | run1 | run2 | run3 | Mean |
 |---|---|---|---|---|
-| % | 98.78 | 98.92 | 98.65 | **98.78** |
+| % | 98.65 | 98.78 | 98.65 | **98.69** |
 | Part A / C (chunk 9) | 100 / 100 | 100 / 100 | 100 / 100 | **100 / 100** |
 | Part B (chunk 9) | 75.0 | 80.0 | 65.0 | **73.3** |
 
@@ -76,19 +76,32 @@ Measured from `llama-server` `print_timings` during the eval:
 Prefill at ~240 tok/s is the number to remember; an earlier 150 tok/s reading was taken
 while the box was serving real work on the other slot.
 
+## Judged twice
+
+Round 1 exposed a hole in the suite, not in the model: `answers/chunk7-8-architect.md`
+covered only Q1-12 of its four sections, so 32 of the 80 questions in chunks 7 and 8 had
+no reference and were scored from judge knowledge. The key was filled in (80 answers now,
+up from 48, exact identifiers checked against primary sources) and chunks 7 and 8 were
+rescored from scratch by two fresh judges per run.
+
+Result: **-0.09 pp on the mean, and the range halved from 0.27 to 0.13 pp.** Two final
+ratings moved across 240 rescored questions, and only one of them (run2 AA19, a missed
+enumerated sub-part) was among the 32 that had lacked a reference. The missing key was not
+inflating anything. `run*/judge-round1.json` holds the pre-key scoring.
+
 ## Comparison
 
 Same methodology (`judge-llm-eval/2.0`, two Opus judges, mean(A,B)):
 
 | Model | Mean | Range |
 |---|---|---|
-| **GLM-5.3-Flash UD-Q2_K_XL (gx10)** | **98.78%** | 0.27 pp |
+| **GLM-5.3-Flash UD-Q2_K_XL (gx10)** | **98.69%** | 0.13 pp |
 | Gemma 4 31B Q6_K turbo 128k (ai-infer2) | 98.92% | — |
 | Gemma 4 26B Q6_K turbo v2 (ai-infer2) | 98.56% | 0.67 pp |
 | Gemma 4 4B E4B BF16 (ai-infer2) | 96.67% | 1.62 pp |
 | Hermes 4 14B Q8 (ai-infer2) | 92.75% | 0.95 pp |
 
-+0.22 pp over the 26B baseline and -0.14 pp under the 31B. Both are inside the noise
++0.13 pp over the 26B baseline and -0.23 pp under the 31B. Both are inside the noise
 floor the procedure sets (deltas under 1 pp are noise), so the honest reading is a
 **three-way tie at the top** — and GLM gets there with the tightest run-to-run range of
 any model in the set.
