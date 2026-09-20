@@ -20,8 +20,8 @@ baseline, because the run-to-run range is itself a signal — Gemma 4 4B E4B sco
 that the model was unstable.
 
 This suite is also no longer the instrument for **ranking** models. See
-[external/RUNBOOK.md](external/RUNBOOK.md) for the tiered approach and
-[METHODOLOGY.md](METHODOLOGY.md#the-suite-is-saturated-at-the-top) for why.
+[external/RUNBOOK.md](../../external/RUNBOOK.md) for the tiered approach and
+[METHODOLOGY.md](../../METHODOLOGY.md#the-suite-is-saturated-at-the-top) for why.
 
 ## Mental model
 
@@ -63,7 +63,7 @@ MODEL_DIR="results/<descriptive-model-name>"   # e.g. gemma4-4b-e4b-f16-turbo4-a
 mkdir -p $MODEL_DIR/run{1,2,3}
 
 # Symlink chunks (the question files are shared across all model evals)
-ln -s ../gemma4-26b-q6k/chunks $MODEL_DIR/chunks
+ln -s ../gemma4-26b-bf16-vllm-gx10/chunks $MODEL_DIR/chunks
 
 # Create run-chunk.sh wrapper pointing at the model's API
 cat > $MODEL_DIR/run-chunk.sh <<'SH'
@@ -82,9 +82,9 @@ The `run-chunk-validated.sh` script handles anti-cache nonces and validation tha
 
 ### 1b. Run the eval
 
-**Always run 3 runs, never just 1.** Single-run scores have ~1pp stochastic variance from temperature sampling. Three runs gives a usable mean.
+**One run for a routine check, three for a new baseline.** A single run carries ~1 pp stochastic variance from temperature sampling, which is fine when the question is "did this build break something" and not fine when you are setting the number every later run is compared against. Never more than 3: past that the returns are gone, and the 0.7 pp typical range is already the noise floor.
 
-**Don't run more than 3 unless you suspect something specific** — diminishing returns past 3, and the 0.7pp typical range is at the noise floor.
+The rest of this phase shows the three-run form. For a single run, use `run1` alone everywhere `run{1,2,3}` appears.
 
 ```bash
 # Use a background bash task for the eval — it takes ~30 min for 3 runs × 9 chunks
@@ -139,7 +139,7 @@ For each judge agent, use the prompt template at `skills/judge-llm-eval/prompts/
 The judge reads:
 - `skills/judge-llm-eval/prompts/rubric.md` (the rubric)
 - `skills/judge-llm-eval/answers/chunk{1..9}-*.md` (reference answer key — for fact-checking only)
-- `results/gemma4-26b-q6k/chunks/chunk{1..9}-*.txt` (the questions)
+- `results/gemma4-26b-bf16-vllm-gx10/chunks/chunk{1..9}-*.txt` (the questions)
 - `results/<model>/run<N>/chunk{1..9}-response.txt` (the model's answers to score)
 
 The judge writes a single JSON object to `/tmp/judge-{a,b}-v2-run<N>.json` with this shape:
@@ -296,24 +296,26 @@ If `range_pct > 1.5pp`, something's wrong — typical stable scoring gives 0.5-0
 
 ### 3b. Write `judge-summary.md` and `verdict.md`
 
-Use the existing files at `results/gemma4-26b-q6k-458k-turbo4-v2-ai-infer2/{judge-summary.md,verdict.md}` as templates. Key sections:
+Use `results/glm5.3-flash-q2kxl-mtp-2x128k-gx10/{judge-summary.md,verdict.md}` as templates — they are the most recent pair and show what a complete write-up covers. Key sections:
 
 - Per-run table (score, %, pass/partial/fail, alt_acceptable, agreement)
 - Cross-run mean + range
 - Per-chunk percentages
 - Chunk 9 Part A/B/C breakdown
 - Persistent failure modes (questions that fail in all runs — these are real model limits)
-- Comparison with baseline (the current baseline is gemma4-26b-q6k v2 at 98.56%)
+- Comparison with the DASHBOARD's top band, not with one baseline: Gemma 26B 98.56%, GLM-5.3 98.69% and Gemma 31B 98.92% are a three-way tie inside 0.36 pp
 - Hardware budget (VRAM, slots, context)
 - Production decision
 
 ### 3c. Compare with baselines
 
-The current baselines are in `results/`:
-- `gemma4-26b-q6k-458k-turbo4-v2-ai-infer2/verdict.md` — 98.56% (baseline)
-- `gemma4-31b-q4km-256k-turbo4-ai-infer2/` and `gemma4-31b-q5km-160k-turbo4-ai-infer2/` — 31B at lower precision
-- `gemma4-26b-q5kl-524k-turbo4/` — 26B at Q5_K_L
-- `gemma4-26b-q6k/` — 26B Q6_K on old b8667 template (pre-baseline)
+The comparators, all scored by two judges with mean(A,B):
+- `results/gemma4-26b-q6k-458k-turbo4-v2-ai-infer2/verdict.md` — 98.56%, the long-standing reference point
+- `results/glm5.3-flash-q2kxl-mtp-2x128k-gx10/verdict.md` — 98.69%, the tightest range measured (0.13 pp)
+- `results/gemma4-4b-e4b-bf16-10slots-turbo4-ai-infer2/verdict.md` — 96.67% with a 1.62 pp range, the example of an unstable model
+- `results/hermes4-14b-q8-q4kv-2slot-65k-ai-infer2/run*/judge.json` — 92.75%, the low end of what a serving-worthy model scores
+
+Older quant and context sweeps are in `results/_archive/`; they were single-judge scored and are not comparable on absolute numbers.
 
 Note that older baselines were judged with single ad-hoc Opus and have ±2pp uncertainty. **Don't compare absolute numbers tightly** — instead compare via "the gap between the new model and the v2 baseline is X pp" computed with the SAME judging methodology.
 
@@ -323,9 +325,10 @@ If you're comparing a new model against the v2 baseline using the same /judge sk
 
 ```bash
 cd /home/lars/source/llm-evals
+git checkout -b eval/<model-name>
 git add results/<model-name>/ loop-detection/results/<model-name>-run1/
-git commit -m "feat(eval): <model-name> baseline — mean X%, range Y pp"
-git push origin main
+git commit -m "results: <model-name> — mean X%, range Y pp"
+git push -u origin eval/<model-name>   # then open a PR; main is not pushed to directly
 ```
 
 ## Common pitfalls (read before you start)

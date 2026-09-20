@@ -13,12 +13,17 @@ upstream authors. Anything under `external/` is NOT our test.
 
 ```
 external/
-  <suite>/                  # e.g. lm-eval-harness, livebench, tau-bench, swe-bench
-    README.md               # how that suite was run (framework + version + config)
-    <model>/                # gemma4-12b-q4-ai-infer3 | gemma4-12b-q8-ai-infer2 | gemma4-26b-ai-infer1
-      <benchmark>/          # ifeval, gpqa, ...
-        results.json        # raw harness output
-        run-config.txt      # exact command + framework version + date
+  bin/eval-tier             # runs a tier end to end
+  provision/                # builds the eval server
+  <suite>/                  # ds4-eval, lm-eval-harness, ...
+    README.md               # how that suite runs (framework + version + config)
+  results/
+    <model>/
+      <tier>-<timestamp>/   # e.g. gate-20260920-103623
+        STATUS              # every suite that ran, and every suite skipped and why
+        <benchmark>/
+          results.json      # raw harness output
+          run-config.txt    # exact command + pinned revision + date
 ```
 
 ## Models (all reached via LiteLLM `https://llm.lwa.dk/v1`)

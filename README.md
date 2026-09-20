@@ -1,99 +1,56 @@
-# LLM Knowledge Evaluation Suite
+# llm-evals
 
-Domain-specific test suites for evaluating LLM model competency in infrastructure, development, and architecture topics.
+How we decide which model the homelab runs. Two things live here: **our own suites**
+(knowledge, loop-detection, agentic, narrow-delivery) and **runs of external
+benchmarks** against the same endpoints, under `external/`.
 
-## 👉 Start here
+## The scores
 
-- **[TESTING.md](TESTING.md)** — short overview of how we test models (the multi-judge approach + commands)
-- **[HOW-TO-DRIVE-EVAL.md](HOW-TO-DRIVE-EVAL.md)** — detailed runbook for an AI agent (or you) to drive a full model evaluation end-to-end
-- **[METHODOLOGY.md](METHODOLOGY.md)** — why we use the multi-judge architecture and what we tried that didn't work
-- **[skills/judge-llm-eval/](skills/judge-llm-eval/)** — the Claude Code skill that orchestrates judging (rubric + reference answers + validators)
+**→ [DASHBOARD.md](DASHBOARD.md)** — one row per model: knowledge, loop, agentic,
+serving engine, and a link to the evidence. It is the only place a number is
+published.
 
-**Per-model results + the vLLM-vs-llama.cpp comparison** → **[DASHBOARD.md](DASHBOARD.md)** (one row per model, latest generation, with the GX10 vLLM campaign deltas). Knowledge high-water-mark is currently Qwen3.6-27B BF16 (vLLM) at 99.05%.
+What it says today, in one paragraph: the knowledge suite is **saturated at the top**.
+Gemma 4 26B (98.56%), GLM-5.3-Flash (98.69%) and Gemma 4 31B (98.92%) sit inside
+0.36 pp while the suite's own precision is 0.13 pp, so it **gates** builds and cannot
+**rank** models — Hermes 4 14B's 92.75% is the evidence that it still separates a weak
+model from a strong one. Ranking questions go to the external suites.
 
-## What's Here
+## Running one
 
-| File | Topics | Questions | Max Score |
-|------|--------|-----------|-----------|
-| `infrastructure.md` | Networking, Linux, Kubernetes, Dev, OpenTofu, Ansible | 120 | 240 |
-| `development.md` | Go, Rust, .NET, Python, JS/TS, Bash, PowerShell | 140 | 280 |
-| `architecture.md` | Application, On-Prem, Cloud, OT Architecture | 80 | 160 |
-| `scenarios.md` | Cross-domain scenarios (3 parts each) | 10 | 60 |
-| **Total** | | **350** | **740** |
+| | |
+|---|---|
+| Which suite to run, and what actually works today | [external/RUNBOOK.md](external/RUNBOOK.md) — the `gate` / `rank` / `deep` tiers plus a per-suite status table |
+| The knowledge suite end to end | [skills/judge-llm-eval/HOW-TO-DRIVE-EVAL.md](skills/judge-llm-eval/HOW-TO-DRIVE-EVAL.md) |
+| Why the method is what it is | [METHODOLOGY.md](METHODOLOGY.md) |
+| Where the raw runs are and what each one proves | [results/README.md](results/README.md) |
 
-## Reference Answers
-
-The `results/architect/` directory contains answers from the architect agent, which can serve as a reference baseline for evaluating other models.
-
-## How to Use
-
-### 1. Test a Model
-
-Open any test suite file, select a question, and paste it into the model you're testing.
-
-### 2. Rate the Answer
-
-Use this prompt with a strong evaluator model (Claude Opus 4.6 or GPT 5.4):
-
-```
-Rate the following answer using the scoring guide below.
-
-**Question:** {paste question}
-
-**Answer to rate:** {paste model's answer}
-
-**Scoring Guide:**
-| Rating | Criteria |
-|--------|----------|
-| ✅ Pass | Correct, complete, and demonstrates understanding |
-| ⚠️ Partial | Mostly correct but missing key details or contains a minor error |
-| ❌ Fail | Incorrect, significantly incomplete, or demonstrates misunderstanding |
-
-Give your rating for each part of the question, then calculate the score:
-✅ = 2 points, ⚠️ = 1 point, ❌ = 0 points
+```bash
+external/bin/eval-tier gate <model> http://<host>:<port>
 ```
 
-### 3. Compare Evaluators
+**One run is the routine.** Three runs are for a new baseline — a new model, a new
+architecture, a new quant family — because the run-to-run range is itself a signal.
 
-For important results, run the same answer through **both** evaluator models (Claude Opus + GPT 5.4) and compare their ratings. If they disagree significantly, the answer is likely in a gray area.
+## The suites
 
-## Evaluation Workflow
+| Suite | What it measures | Size |
+|---|---|---|
+| knowledge (`infrastructure.md`, `development.md`, `architecture.md`, `scenarios.md`) | does the model solve the problem, across 9 chunked topic sets | 370 scored items, 740 points |
+| `loop-detection/` | does it stop cleanly instead of spiralling, over-explaining or expanding the task | 12 scenarios per pass |
+| `agentic/` | real tool use against a live exec host | 10 or 30 tasks |
+| `narrow-delivery/` | obedience and functional verification on scoped delivery tasks | 9 tasks + exec tasks |
+| `external/ds4-eval/` | deterministically graded reasoning and code cases, no judges | 142 cases |
 
-```
-┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│ Pick        │     │ Paste question   │     │ Copy answer     │
-│ question    │────▶│ into model being │────▶│ into evaluator  │
-│ from .md    │     │ tested           │     │ (Opus/GPT 5.4)  │
-└─────────────┘     └──────────────────┘     └────────┬────────┘
-                                                       │
-                                              ┌────────▼────────┐
-                                              │ Evaluator rates  │
-                                              │ with rubric      │
-                                              └────────┬────────┘
-                                                       │
-                                    ┌──────────────────┼──────────────────┐
-                                    │                  │                  │
-                              ┌─────▼─────┐    ┌──────▼──────┐    ┌─────▼──────┐
-                              │ Rating    │    │ Rating      │    │ Compare    │
-                              │ from Opus │    │ from GPT    │    │ scores     │
-                              └───────────┘    └─────────────┘    └────────────┘
-```
+The four knowledge files are the questions themselves, which is why they sit in the
+root: 120 items on networking/Linux/Kubernetes/dev/OpenTofu/Ansible, 140 on
+Go/Rust/.NET/Python/JS/Bash/PowerShell, 80 on application, on-prem, cloud and OT
+architecture, and 10 cross-domain scenarios scored in three parts each.
 
-## Scoring
-
-| Score | Interpretation |
-|-------|----------------|
-| 90%+ | Excellent — model is strong in this domain |
-| 70-89% | Good — competent but missing depth in some areas |
-| 50-69% | Weak — significant gaps |
-| <50% | Poor — unreliable for this domain |
-
-## Contributing
-
-Add new questions by following the existing format:
-- Section header with question number and difficulty (`Easy`, `Medium`, `Hard`)
-- Clear, unambiguous question
-- Update the scoring table at the bottom of the file
+Knowledge answers are judged by **two independent Opus judges per run**, scored
+`mean(A, B)` per question, against a reference answer key that is explicitly *one
+valid solution, not a contract*. `skills/judge-llm-eval/` holds the rubric, the key
+and the deterministic code validators.
 
 ## License
 

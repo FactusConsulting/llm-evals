@@ -23,11 +23,13 @@ skipped suite is never silent: silence would read exactly like a pass.
 
 ## Why the tiers are split this way
 
-Our own knowledge suite is **saturated at the top**. Gemma 4 26B, Gemma 4 31B and
-GLM-5.3-Flash sit within 0.36 pp of each other and our measurement precision is
-0.13 pp, so it cannot rank them — the spread is the noise floor. It is still the
-right gate: it is precise, and precision is what catches "did this build break
-something". Hermes 4 14B scored 92.75% on it, so the bar is not automatic.
+Our own knowledge suite is **saturated at the top**. Gemma 4 26B (98.56%), GLM-5.3-Flash
+(98.69%) and Gemma 4 31B (98.92%) sit within 0.36 pp of each other and our measurement
+precision is 0.13 pp, so it cannot rank them — the spread is the noise floor. It is
+still the right gate: it is precise, and precision is what catches "did this build break
+something". Hermes 4 14B scored 92.75% on it, so the bar is not automatic. The long
+version, including what the residual failures are, is in
+[`../METHODOLOGY.md`](../METHODOLOGY.md#the-suite-is-saturated-at-the-top).
 
 One run, not three, from here on. Three runs bought 0.13 pp of precision on a
 saturated measure for seven hours and six judges. **Keep three runs when
@@ -45,13 +47,15 @@ Read this before trusting a number.
 
 | Suite | State |
 |---|---|
-| ds4-eval `core` / `hard` | **works**; smoke-tested against gx10 |
+| ds4-eval `core` (92 cases: 25 GPQA Diamond, 25 SuperGPQA, 25 AIME 2025, 17 defensive code review) | **works**; smoke-tested against gx10 |
+| ds4-eval `hard` (50 cases: 30 MMLU-Pro, 10 OlympiadBench, 5 LiveBench, 5 NIST Juliet) | **works**; deterministic, no judges — see `ds4-eval/README.md` |
 | loop detection | works (ours) |
-| own knowledge suite | works, but driven by hand — see `HOW-TO-DRIVE-EVAL.md`; the tier driver only prints a reminder |
+| own knowledge suite | works, but driven by hand — see `../skills/judge-llm-eval/HOW-TO-DRIVE-EVAL.md`; the tier driver only prints a reminder |
 | tau2 | installed and starts; **no wrapper yet** |
 | BFCL | installed and starts; **no wrapper yet** |
 | SWE-bench Verified | package installed; needs an agent scaffold |
 | Terminal-Bench | not installed |
+| Aider polyglot | not installed |
 
 ## The eval server
 
