@@ -26,6 +26,13 @@ SYSTEM_PROMPT = ("You are solving a hard benchmark question. Reason carefully. "
 
 # ds4-eval's own default. A per-case budget from the hard suite overrides it,
 # which is also ds4's precedence when --max-tokens is not given explicitly.
+#
+# It is far too low for a reasoning model, and the failure is silent: the model
+# spends the whole budget thinking, never writes an "Answer:" line, and scores
+# zero exactly like a wrong answer. Measured on GLM-5.3-Flash — 9 of 10 failures
+# in the first 41 cases were this, each one gx10 logging
+# "eval time = 507521.26 ms / 16000 tokens". Pass --max-tokens explicitly, and
+# raise --timeout with it or the client gives up before the budget does.
 DEFAULT_MAX_TOKENS = 16000
 
 # The trailing instruction is what makes grading deterministic; it is quoted

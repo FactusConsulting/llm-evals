@@ -92,14 +92,20 @@ the real failure — it means the model spent its whole budget and said nothing.
 ```bash
 cd external/ds4-eval
 ./fetch_cases.py                       # pinned revision; the keys are not committed
-./run.py --url $HOST --model <alias> --api-key "$KEY" \
-         --suite core --max-tokens 16000 --out ../results/<model>/ds4-core
+./run.py --url $HOST --model <alias> --api-key "$KEY" --suite core \
+         --max-tokens 98304 --timeout 7200 --out ../results/<model>/ds4-core
 ```
 
-**`--max-tokens 16000` for a thinking model.** The hard suite carries a 4096-token
-per-case budget that a reasoning model spends entirely before answering; it then
-emits no `Answer:` line and scores zero. The runner warns when any generation hits
-the limit — **a run with truncations is not comparable to one without.**
+**Give a reasoning model far more budget than you think, and raise `--timeout`
+with it.** The failure is silent: a model that spends the whole budget thinking
+writes no `Answer:` line and scores zero, identically to a wrong answer. On the
+first GLM-5.3-Flash run at 16000 tokens, **9 of the 10 failures in 41 cases were
+this**, each logged on the server as `507521.26 ms / 16000 tokens`. The apparent
+54% on GPQA Diamond was the budget, not the model.
+
+Two ceilings bound it: context (`n_ctx` per slot minus the prompt) and your own
+timeout (budget ÷ generation speed, measured at the top — per-token time grows
+with context). **A run with truncations is not comparable to one without.**
 
 ## 5. Write it down
 

@@ -41,10 +41,21 @@ the subsets are small enough that a few cases swing a percentage point.
 `--source 'GPQA Diamond'` and `--limit N` narrow a run; `--suite hard-smoke` is
 the 12-case check that the endpoint and the harness still work.
 
-**For a thinking model, pass `--max-tokens 16000`.** The hard suite's per-case
-budget is 4096, which GLM-5.3-Flash can spend entirely on reasoning; it then
-emits no `Answer:` line and scores zero. The runner warns when any generation
-hits the limit — a run with truncations is not comparable to one without.
+**For a reasoning model, give it far more than you think and raise the timeout
+with it.** `--max-tokens 98304 --timeout 7200` is what GLM-5.3-Flash needs here.
+
+The failure is silent. A model that spends its whole budget thinking writes no
+`Answer:` line and scores zero, identically to a wrong answer. On the first
+GLM run at `--max-tokens 16000`, **9 of the 10 failures in 41 cases were this** —
+gx10 logged `eval time = 507521.26 ms / 16000 tokens` for each. The apparent
+54% on GPQA Diamond was the budget, not the model.
+
+Two ceilings bound the budget. Context: `n_ctx` per slot, 131072 on gx10, minus
+the prompt. Time: your own `--timeout`, which must exceed budget ÷ generation
+speed — and per-token time grows with context, so measure at the top, not at 16k.
+
+The runner warns when any generation hits the limit. **A run with truncations is
+not comparable to one without.**
 
 ## Why cases.json is not committed
 
