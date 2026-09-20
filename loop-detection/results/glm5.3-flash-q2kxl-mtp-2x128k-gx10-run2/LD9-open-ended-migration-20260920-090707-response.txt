@@ -1,0 +1,31 @@
+## Risks & Prerequisites
+
+- **DBaaS constraint:** DigitalOcean controls the engine binaries. An in-place major-version upgrade is only possible via DO's tooling; otherwise the path is a new PG16 cluster plus a data migration. Confirm which is available before committing to a downtime figure.
+- **PG15 breaking change (applies en route to 16):** CREATE privilege on the `public` schema is revoked from non-owner roles by default. App roles or migration tooling that creates tables in `public` will break.
+- **Payments = correctness-critical:** orphaned prepared transactions (2PC), long-running transactions, and replication lag must be resolved before cutover. A stale replica is not a rollback path.
+- **Rollback asymmetry:** the existing PG14 replica cannot follow a PG16 primary. Rollback means failing back to the PG14 cluster and accepting loss of post-cutover writes — hence a read-only retention window.
+- **Connection plumbing:** a new cluster means a new endpoint, credentials, SSL mode, trusted sources, pooler config, and Kubernetes secrets. This is the most common failure point.
+- **Extension parity:** verify every extension (pg_stat_statements, pgcrypto, etc.) exists on DO PG16 at a compatible version.
+- **Driver:** psycopg2 2.9.3 uses the same wire protocol against PG16; no upgrade required, but validate in staging.
+- **Backup gate:** no proven, recent restore = no migration.
+
+## Migration Plan
+
+1. Inventory the cluster: databases, roles, extensions with versions, sizes, flags (max_connections, max_prepared_transactions), pooler settings, VPC/trusted sources.
+2. Audit application and migration code for `public`-schema DDL by non-owner roles and any PG14-specific behavior; pre-grant `CREATE ON SCHEMA public` or fix the code.
+3. Stand up a PG16 test instance (Docker or DO) and run the full test suite plus payment-flow integration tests against it.
+4. Confirm with DigitalOcean whether an in-place major-version upgrade is offered for this cluster. **[External: DO support]**
+5. Choose the strategy based on (4): in-place upgrade with a maintenance window, or new PG16 cluster + logical replication + cutover. **[Approval: engineering lead + payments stakeholders — sets the downtime budget]**
+6. Take a fresh base backup and prove it: restore into a scratch instance and run checksums. Do not proceed without a verified restore.
+7. (New-cluster path) Provision the PG16 cluster with matching specs, private connectivity, trusted sources, flags, roles, and pooler; keep it isolated from production traffic.
+8. Copy schema (`pg_dump --schema-only`), inventory tables without primary keys (logical replication limitation), then create publications on PG14 and a subscription on PG16; complete initial sync.
+9. Monitor replication lag; when steady, validate row counts and checksums on payments and ledger tables.
+10. Sync sequence values on PG16 (`setval` to current max) — logical replication does not carry sequences.
+11. Rehearse cutover in staging: repoint a staging app at PG16, run smoke tests, document every secret/endpoint change required.
+12. Schedule the cutover window; notify on-call, downstream consumers, and merchant-facing teams; freeze deploys. **[Approval + coordination: stakeholders and on-call]**
+13. Run pre-cutover checks: replication lag ≈ 0, no long-running transactions, no orphaned prepared transactions, backup confirmed.
+14. Execute cutover: set the app read-only / pause writes and scheduled payment jobs, wait for replication to drain, repoint Kubernetes secrets and pooler to PG16, restart app pods, resume writes.
+15. Verify: health checks, end-to-end payment smoke test, error-rate dashboards, `pg_stat_activity`, extension behavior.
+16. Rebuild the replica on PG16, confirm streaming, and re-enable monitoring/alerting bound to the new endpoint.
+17. Retain the PG14 cluster read-only as the rollback path for an agreed period (e.g., 7 days), then decommission. **[Approval: rollback-window length and decommission/cost sign-off]**
+18. Update Terraform/IaC, runbooks, and DNS documentation to the new endpoint.

@@ -1,0 +1,33 @@
+## PR Review
+
+### Blocking
+
+**1. The signing key is ephemeral and per-process.** `init()` generates `jwtSecret` at startup and never persists it. Every restart (deploy, crash, autoscale event) invalidates every outstanding token; behind a load balancer, N instances hold N different secrets, so a token only validates on the instance that issued it; and there is no way to rotate the key without logging everyone out. The `rand.Read` error is also discarded — on older Go releases a failure would leave you signing with a zeroed key. Where is the production key supposed to come from? It needs to be loaded from env/KMS/secret store via an explicit setup path that returns an error, not `init()`.
+
+**2. No revocation story.** Redis sessions could be deleted on logout, password change, or account ban. A 24-hour JWT cannot be revoked: a stolen token works for up to 24 hours, and "logout" becomes a client-side no-op. What is the plan — short-lived access tokens plus a real refresh flow, a token-version claim checked against the DB, or a denylist? As written, the PR silently trades a revocable session for an unrevocable token.
+
+**3. `GenerateRefreshToken` is dead code and the refresh flow doesn't exist.** It generates 32 random bytes, encodes them, and returns them to nobody — not stored, not bound to a user, no endpoint, no rotation, no reuse detection. And since the PR removes Redis, there is no storage layer left to persist refresh tokens in. The current design is: 24h token, no refresh, no revocation. What closes the loop? (Nit: `URLEncoding` includes `=` padding; `RawURLEncoding` plays nicer if these ever travel in URLs.)
+
+### Security
+
+**4. Validation hardening.** The keyfunc ignores the token and never asserts the signing method — pin it to `*jwt.SigningMethodHMAC` per the library docs as defense in depth against algorithm confusion. No `iss`, `aud`, or `jti` is set or verified, so a secret shared with any other service (now or later) accepts foreign tokens, and individual tokens can't be identified for a future denylist. Consider `jwt.WithLeeway` for clock skew, and whether `uid` should be the standard `sub` claim for tooling interop.
+
+**5. Role claims go stale.** Authorization now trusts `role` from a token up to 24 hours old. Demotion or ban takes effect only at token expiry. If any privileged endpoint reads `claims.Role`, either shorten token lifetime or re-check role server-side for sensitive operations.
+
+**6. Client-side token storage.** Moving off cookies to an `Authorization` header usually means the token lands in localStorage and becomes XSS-stealable (CSRF risk drops in exchange). What's the intended storage? Related: CORS config must now allow the `Authorization` header (preflight change), and any flow that relied on the browser attaching the cookie automatically — email verification links, SSR pages, non-JS clients — will now 401.
+
+### Correctness / code-level
+
+**7. Context keys.** `context.WithValue(ctx, "userID", ...)` with bare string keys risks collisions across packages and trips staticcheck SA1029. Use an unexported key type plus accessors (`auth.UserFromContext(ctx)`) so downstream handlers don't re-declare the keys.
+
+**8. Header parsing.** `strings.TrimPrefix(authHeader, "Bearer ")` is case-sensitive; RFC 6750 schemes are case-insensitive, and a malformed header silently becomes a parse failure rather than a distinct 400. Also consider emitting `WWW-Authenticate: Bearer` on 401 and using `http.StatusUnauthorized` instead of the literal.
+
+**9. No failure detail anywhere.** Expired, tampered, and malformed tokens all collapse into a bare 401 with no server-side logging. Auth failures in production will be undebuggable — log the validation error (server-side only) with a request ID.
+
+**10. Testability and tests.** `jwtSecret` is a package-level var set in `init()`, so tests can't inject a known key and test order matters — move to a constructor or config-injected key. The PR also contains no tests at all; for auth code that's not mergeable. Minimum set: round-trip, expiry, signature tampering, wrong-key, and middleware tests (missing header, bad scheme, valid token, claims propagation).
+
+### Questions on the unshown ~315 lines and rollout
+
+**11.** Where is `IssueToken` called — what does the login handler do now, and is credential verification unchanged? What does the logout endpoint do? Are there leftover references to the old session store? Is Redis used for anything else (rate limiting, caching), i.e., is the dependency actually removed or only the session use?
+
+**12. Migration and rollback.** The middleware stops reading cookies entirely, so all existing cookie sessions are dropped at deploy — a forced global logout. Is a transition period (accepting both) needed? What's the rollback plan, given Redis sessions will be stale for anyone who logged in post-switch? And has product agreed to users re-authenticating every 24 hours?

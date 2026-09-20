@@ -1,0 +1,37 @@
+## 1. Key Risks and Prerequisites
+
+**Risks**
+- Downtime: DigitalOcean's in-place major-version upgrade takes the whole cluster (primary and replica) offline; a payments service needs an approved maintenance window and a tested rollback.
+- Behavior changes 14→16: PG15 removed default CREATE privileges on the `public` schema; PG16 changes `pg_hba.conf` handling and some catalog behavior — application roles and connection rules may break.
+- Query-plan regressions from optimizer changes on latency-critical payment queries.
+- Extension drift: every extension in use must be available and supported on DO's PG16 image.
+- psycopg2 2.9.3 is generally server-version-agnostic, but connection options and the bundled libpq must be validated against 16.
+- Rollback after an in-place upgrade means restoring from backup — RPO/RTO must be acceptable for payments.
+
+**Prerequisites**
+- Verified recent backup with a successful test restore (PITR enabled).
+- PG16 staging cluster with a current production-like dataset.
+- Inventory of extensions, non-default GUCs, roles, and grants.
+- Approved maintenance window and stakeholder notification.
+- Kubernetes-side ability to pause traffic (maintenance-mode flag) and pre-staged DSN/secret changes.
+
+## 2. Migration Plan
+
+*Steps tagged [Human approval] or [External coordination] require sign-off or outside coordination.*
+
+1. Inventory extensions, non-default settings, roles, and grants on the PG14 cluster; save the output for comparison.
+2. Confirm with DigitalOcean support the supported upgrade path (in-place major-version upgrade vs. new cluster + logical replication) and expected downtime. **[External coordination]**
+3. Create a PG16 staging cluster on DO and restore the latest backup into it.
+4. Run the application test suite and payment-critical integration tests against staging PG16 with psycopg2 2.9.3; log every failure.
+5. Compare EXPLAIN plans and timings for the top queries (from `pg_stat_statements`) between 14 and 16; correct regressions with index or GUC adjustments.
+6. Fix all incompatibilities found in staging (e.g., re-grant `public` schema privileges, adjust role options, replace unsupported extensions).
+7. Request and confirm the maintenance window with the business owner; notify downstream consumers of the payments API. **[Human approval]**
+8. Take a fresh production backup and perform a test restore to validate recoverability.
+9. Pre-stage Kubernetes changes: updated DSN/secret (if the endpoint changes), maintenance-mode flag, and a rollback manifest referencing the pre-upgrade backup.
+10. At window start, enable maintenance mode on the payments service (pause consumers, drain traffic, return 503s) and confirm zero in-flight transactions. **[Human approval to begin]**
+11. Trigger the DO major-version upgrade via control panel or API; monitor until the cluster reports PG16 healthy on both primary and replica.
+12. Run smoke tests: server version check, read/write transaction, end-to-end payment test against a sandbox tenant, connection-pool health.
+13. Disable maintenance mode and ramp traffic gradually; watch error rate, latency, and connection saturation for 30–60 minutes.
+14. Run `ANALYZE` across the database; confirm backups and PITR are active on the upgraded cluster.
+15. Update monitoring dashboards and alerts to reflect PG16 (new `pg_stat_statements` views, changed GUC defaults).
+16. Retain the pre-upgrade backup and rollback manifest for an agreed period (e.g., 7 days); decommission old artifacts only after written sign-off. **[Human approval]**
