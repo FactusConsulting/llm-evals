@@ -1,0 +1,59 @@
+# Diagnosis
+
+**What the compiler is actually telling us.** At `store.go:47`, the argument `db` has type `*sql.DB` — the standard `database/sql` type. The standard type already exports `Close() error`. Since the compiler still reports `*sql.DB` as "missing method Close **with correct signature**", the only consistent reading is that the `Store` interface declares `Close` with a *different* signature (e.g., `Close(ctx context.Context) error` or similar). This is a signature mismatch, not an absent method.
+
+**Why attempts 1 and 2 could not work — three independent reasons:**
+
+1. **Wrong type.** Both attempts added a stub to a "sql.DB wrapper" type, but the failing expression at line 47 passes the raw `*sql.DB` variable `db`. The wrapper never appears in the expression the compiler checks, so its methods are invisible to this error.
+2. **Wrong signature.** `Close() error` is exactly the method `*sql.DB` already has. Adding another `Close() error` anywhere cannot satisfy an interface that requires a different `Close` signature. Both attempts added a method the target type already possesses, in the wrong form.
+3. **Structural impossibility.** Go does not permit adding methods to a type declared in another package. `*sql.DB`'s method set is immutable from `pkg/storage`. No stubbing strategy can ever succeed; the fix must change either the value passed at line 47 or the `Store` interface itself.
+
+The error stayed byte-identical across four runs because neither attempt changed (a) the type of `db`, (b) the expression at line 47, or (c) the `Store` declaration — the three inputs the compiler error is a function of.
+
+One residual uncertainty: Go reports the first unsatisfied method, and since no attempt changed the type at line 47, the compiler would print the same first error every run even if `Store` had other unsatisfied methods. The stable Close-only error plus `*sql.DB`'s broad method set suggests Close is the sole mismatch, but the full interface definition is needed to confirm.
+
+# Correct fix
+
+Two branches; the `Store` declaration selects which one applies. **Neither repeats the stub strategy.**
+
+**Branch A — `Store` is repo-owned and its `Close` signature is the bug.** Align the interface with the method `*sql.DB` already exports:
+
+```go
+type Store interface {
+    // ...existing methods unchanged...
+    Close() error // was: Close(<different signature>)
+}
+```
+
+Line 47 then compiles as-is. Verify any other `Store` implementations (mocks, in-memory stores) still compile; update them if they implemented the old signature.
+
+**Branch B — `Store`'s `Close` signature is deliberate, or `Store` comes from a dependency.** Keep `Store` unchanged; wrap the standard type in an adapter and pass *that* at line 47:
+
+```go
+type sqlDBStore struct {
+    *sql.DB // promotes Query/Exec/etc., satisfying Store's remaining methods
+}
+
+// Signature MUST be copied verbatim from the Store declaration —
+// the context parameter shown here is a placeholder, not a guess to ship.
+func (s sqlDBStore) Close(ctx context.Context) error {
+    return s.DB.Close()
+}
+
+// line 47:
+cache := NewCache(sqlDBStore{db}, ...)
+```
+
+The adapter's explicit `Close` shadows the promoted `Close() error` from the embedded `*sql.DB` (shallowest method wins), so the method set presents exactly the signature `Store` requires. If the project's existing wrapper was intended for this role, equivalently: correct *its* `Close` signature to match `Store` and pass the wrapper at line 47 instead of raw `db`.
+
+**Decision rule:** if `Store` is defined in this repo and no other implementation needs its current `Close` signature → Branch A (smallest correct diff). If `Store` is third-party, or the signature is intentional → Branch B is forced.
+
+# Escalation note
+
+I am not claiming a verified fix, because the one fact the error text cannot supply — the exact signature `Store` requires for `Close` — determines which branch compiles, and guessing it would repeat the precise failure mode of attempts 1 and 2. To finalize, I need:
+
+1. The complete `Store` interface declaration (file path + lines), especially the exact `Close` signature and all other methods.
+2. `store.go` lines ~35–55: the imports (to confirm whether `sql` is `database/sql` or a local package), how `db` is constructed, and the full `NewCache(...)` call.
+3. Whether `Store` is defined in this repo or imported from a dependency, and whether any other types implement `Store`.
+
+Stopping here.

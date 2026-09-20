@@ -1,0 +1,154 @@
+# Networking
+
+**N1** — A Layer 2 switch forwards frames based on MAC addresses (learning, flooding, STP, VLANs) but has no routing. A Layer 3 switch adds routing: it has switched virtual interfaces (SVIs), routes between VLANs/subnets in hardware (ASIC) at line rate, and often supports static/OSPF. It's not a full router (typically no WAN interfaces, NAT, or advanced edge features), but it handles inter-VLAN routing far faster than a software router.
+
+**N2** — /20 mask = 255.255.240.0. Third octet: 5 AND 240 = 0; broadcast third octet = 0 + 15 = 15.
+- Network: **10.0.0.0/20**
+- Broadcast: **10.0.15.255**
+- Usable hosts: 10.0.0.1 – 10.0.15.254 (4,094 hosts)
+
+**N3** — Client sends SYN (with ISN), server replies SYN-ACK (its own ISN), client sends ACK. If the final ACK is lost: the client is already in ESTABLISHED, but the server stays in SYN_RCVD and retransmits the SYN-ACK with exponential backoff (`tcp_synack_retries`). If the client sends data, that packet implicitly ACKs and completes the handshake. If the client stays silent, the server eventually aborts (sends RST). This half-open state is also the basis of SYN flood attacks.
+
+**N4** — SNAT rewrites the **source** address (post-routing), typically for outbound traffic: a corporate NAT gateway masquerades 10.0.0.0/8 to one public IP so many hosts share egress. DNAT rewrites the **destination** (pre-routing), typically for inbound: port-forwarding `203.0.113.5:443 → 10.0.0.5:8443` to publish an internal server. In iptables terms: SNAT/MASQUERADE in POSTROUTING, DNAT in PREROUTING.
+
+**N5** — Three common causes:
+1. The URL uses a name not in the certificate's SAN (e.g., accessing by IP address, or an internal hostname absent from the cert).
+2. DNS resolves `example.com` to the wrong server/vhost (stale DNS, hosts-file entry, CDN misconfiguration), which serves a different or default certificate.
+3. SNI/Host header is missing or stripped (old client, misconfigured proxy), or a transparent/MITM proxy presents its own cert. (Also: wildcard mismatch, or the backend serves an expired/replaced cert.)
+
+**N6** — VLAN is L2 segmentation via an 802.1Q tag: 12-bit VID (~4,094 usable), requires L2 trunks end-to-end, and large STP domains scale poorly. VxLAN is an L2 **overlay** tunneled in UDP (typically port 4789) over an L3 IP fabric: 24-bit VNI (~16M segments), usually with EVPN/BGP as control plane, anycast gateways, and better ECMP utilization. Choose VxLAN for large multi-tenant data centers, stretching L2 across routed boundaries, and cloud/hybrid deployments; VLANs remain fine for small, flat, static environments.
+
+**N7** — Linux routes by destination only: the reply's destination is off-subnet, so it follows the default route via eth0 (10.0.0.1), producing asymmetric routing (and rp_filter drops if in strict mode). Fix with policy-based routing:
+```
+ip route add default via 192.168.1.1 dev eth1 table 100
+ip rule add from 192.168.1.0/24 table 100 priority 100
+```
+For return traffic of established sessions from arbitrary sources, use CONNMARK: mark connections arriving on eth1 in PREROUTING mangle, restore the mark on output, and route on the mark (`ip rule add fwmark 1 table 100`). Also set `net.ipv4.conf.all.rp_filter=2` (loose) or 0 if asymmetry persists.
+
+**N8** — BGP best-path selection (in order):
+1. Highest **Weight** (Cisco-local, not propagated)
+2. Highest **Local Preference**
+3. Locally originated route preferred (network/aggregate)
+4. Shortest **AS_PATH**
+5. Lowest **Origin** (IGP < EGP < Incomplete)
+6. Lowest **MED** (between routes from the same neighbor AS)
+7. eBGP preferred over iBGP
+8. Lowest IGP metric to the next hop
+9. Tie-breakers: oldest eBGP route → lowest router ID → lowest cluster ID → lowest neighbor address.
+
+**N9** — Two layers of encapsulation inside a 1500 physical MTU:
+- IPsec ESP tunnel mode (AES-GCM): outer IP 20 + ESP header 8 + IV 8 + trailer ~4 + ICV 16 ≈ **56 bytes** (AES-CBC+HMAC-SHA1 is ~54–73 depending on padding).
+- VxLAN: outer IP 20 + UDP 8 + VxLAN header 8 = **36 bytes**.
+
+Math: 1500 − 56 (IPsec) = 1444 inner IP MTU; 1444 − 36 (VxLAN) = **1408 bytes** max inner payload (≈1391 with AES-CBC+SHA1). Set the inner interface MTU to ~1400 and clamp TCP MSS to ~1360 (1408 − 40 IP/TCP headers) to avoid PMTUD blackholes.
+
+**N10** — ARP resolves an IPv4 address to a MAC address within a broadcast domain. Gratuitous ARP is an unsolicited ARP announcement (reply or request where sender and target IP are the announcer's own IP). It solves the problem of **stale ARP caches** after events like HA/VRRP failover or IP migration: neighbors update immediately instead of waiting for cache timeout, preventing traffic from going to the old (dead) MAC.
+
+**N11** — Public IPs are globally routable, IANA/RIR-assigned, unique on the internet. Private IPs are for internal use, not routable on the internet, reusable everywhere, and require NAT to reach the internet. RFC 1918 ranges:
+- **10.0.0.0/8**
+- **172.16.0.0/12**
+- **192.168.0.0/16**
+
+**N12** — DNS is the hierarchical system resolving names to resources. **A record**: hostname → IPv4 address. **AAAA record**: hostname → IPv6 address. **CNAME**: alias pointing to another *name* (which is then resolved further); cannot exist at the zone apex and cannot coexist with other records on the same name.
+
+**N13** — DHCP automatically assigns IP configuration to hosts. DORA:
+1. **Discover** — client broadcasts (0.0.0.0:68 → 255.255.255.255:67) "any DHCP servers?"
+2. **Offer** — server offers an IP + options (mask, gateway, DNS, lease time).
+3. **Request** — client broadcasts its acceptance of one offer.
+4. **Acknowledge** — server confirms the lease. Leases renew at T1 (50%) and rebind at T2 (87.5%).
+
+**N14** — **Hub**: L1 (physical) — repeats every bit to all ports, one collision domain, obsolete. **Switch**: L2 (data link) — forwards frames per-port using a MAC address table, per-port collision domains. **Router**: L3 (network) — forwards packets between IP networks using a routing table, decrements TTL.
+
+**N15** — Half-duplex: send **or** receive at a time (collisions possible; CSMA/CD needed — hubs, old 10BASE-T). Full-duplex: simultaneous both directions, no collisions, no CSMA/CD. Modern switched Ethernet is **full-duplex**, negotiated automatically (IEEE 802.3 autonegotiation).
+
+**N16** — TTL prevents routing loops: every router decrements it by 1; at 0 the packet is dropped and an ICMP Time Exceeded message is sent. Traceroute exploits this by sending probes with TTL=1, 2, 3, …: each router that drops a probe reveals itself via ICMP Time Exceeded; the final hop is identified when the destination itself responds (ICMP port-unreachable or echo reply).
+
+**N17** — A NAT gateway translates between private and public addressing at a network edge. **Static NAT**: permanent 1:1 mapping (one private IP always maps to one public IP). **Dynamic NAT**: private IPs are mapped on demand to addresses from a public pool (many-to-many, limited by pool size). **PAT/NAT overload**: many private IPs share one public IP, distinguished by source port — the typical home/office broadband NAT.
+
+**N18** — ECMP installs multiple next hops with equal cost; the router picks a next hop **per flow** (not per packet, to avoid reordering) via a hash. Common hash inputs: 2-tuple (src/dst IP), 4-tuple (+ports), 5-tuple, or 8-tuple (incl. protocol, MPLS labels); techniques include hash-threshold (RFC 2992), random, and resilient/maglev-style hashing to minimize flow remapping on topology change. Problems: with stateful firewalls, forward and return packets may hash to different links, so each firewall sees only half the flow and drops it (no session state) — mitigated by routing both directions symmetrically, firewall clusters sharing session state, or flow-based steering. Also watch for hash polarization (uneven load) and per-packet hashing causing reordering.
+
+**N19** — Throughput is bounded by window ÷ RTT, not bandwidth. With a 64 KB window and a 10 MB BDP, the sender can have only 64 KB in flight; at e.g. 100 ms RTT that's 640 KB/s ≈ 5 Mbps no matter the link speed. The problem: the TCP window field is 16 bits (max 65,535). **Window scaling (RFC 1323)** negotiates a scale factor (0–14) in the SYN/SYN-ACK; the effective window is `window << scale`, up to ~1 GB. Enable `net.ipv4.tcp_window_scaling=1` (default on modern kernels) and raise buffer limits: `net.core.rmem_max`/`wmem_max` and `net.ipv4.tcp_rmem`/`tcp_wmem` (autotuning then grows the window toward the BDP).
+
+**N20** — An 802.1Q trunk carries frames from multiple VLANs over one link by inserting a 4-byte tag after the source MAC: TPID `0x8100` + TCI (PCP 3 bits, DEI 1 bit, VID 12 bits). The native VLAN is sent untagged. Wire format: `[dst MAC][src MAC][0x8100][PCP|DEI|VID][EtherType][payload][FCS]` — hence MTU is 4 bytes larger on tagged frames.
+
+Linux config for VLANs 10/20/30 on one NIC:
+```
+modprobe 8021q
+ip link add link eth0 name eth0.10 type vlan id 10
+ip link add link eth0 name eth0.20 type vlan id 20
+ip link add link eth0 name eth0.30 type vlan id 30
+ip addr add 10.10.0.5/24 dev eth0.10   # repeat per VLAN
+ip link set eth0.10 up                  # etc.
+```
+Persist with NetworkManager (`nmcli con add type vlan ...`), systemd-networkd netdev files, or ifcfg files. The switch port must be configured as a trunk permitting VLANs 10, 20, 30.
+
+# Linux
+
+**L1** — A **hard link** (`ln`) is another directory entry pointing to the same inode: same filesystem only, no hard links to directories, data survives deletion of any one name (link count in `ls -l`). A **symlink** (`ln -s`) is a separate inode containing a *path*: can span filesystems, can point to directories, and can dangle if the target is removed.
+
+**L2** —
+```
+sudo find /var/log -type f -size +100M -exec ls -lh {} \;
+```
+Add `-xdev` to stay on one filesystem, or `-printf '%s\t%p\n'` for sizes in bytes.
+
+**L3** — State D means the process is in **uninterruptible sleep**: blocked inside a kernel syscall (usually disk/NFS/device I/O or a kernel lock), so it cannot be woken by signals. `kill -9` will not take effect until the syscall returns — the signal is queued, not delivered. A persistently D-state process usually indicates a storage problem; check `/proc/<pid>/stack` and `dmesg` for hung-task warnings.
+
+**L4** — cgroups **v1** has one hierarchy per controller (cpu, memory, blkio…), a process can live in many cgroups, and controllers are duplicated across hierarchies — awkward to manage and delegate. **v2** has a single unified hierarchy, no internal processes (except the root), a consistent controller interface, and pressure notifications. systemd prefers **v2** because its single hierarchy maps cleanly onto the unit tree, delegation (`Delegate=`) is simple and safe, and accounting/controls are unified — it's the default on modern distros.
+
+**L5** — iptables is the legacy interface: protocol-specific tables/chains (ip/ip6/arp/bridge) built on x_tables. nftables is the successor: a unified netlink API, a kernel "VM" of expressions, sets, atomic rule updates, and dual-stack rules. Both register netfilter hooks, so the kernel can run **both simultaneously** — packets traverse each hook's chains in priority order, which risks conflicting/duplicate rules. `iptables-nft` is a translation layer that programs the nftables backend from iptables syntax; firewalld/systemd default to nftables.
+
+**L6** — Most likely: **files deleted while still open** by a process (e.g., a log file unlinked but a daemon still writing to it). The inode is freed only when the last fd closes, so `df` counts the space but `du` can't see it. Confirm with `lsof +L1` (or `lsof | grep deleted`); fix by restarting the process or truncating via `/proc/<pid>/fd/<n>`. (Other causes: sparse files, du/df metadata accounting.)
+
+**L7** —
+1. **UEFI firmware**: POST, hardware init, reads NVRAM BootOrder, loads the EFI executable from the ESP (shim → GRUB for Secure Boot, or systemd-boot/UKI).
+2. **Bootloader** (GRUB): loads `vmlinuz` and the initramfs, passes the kernel command line.
+3. **Kernel**: decompresses, sets up page tables/memory management, initializes core subsystems, mounts the initramfs as root, executes `/init`.
+4. **initramfs**: userspace that loads storage drivers, runs udev, unlocks LUKS, activates LVM/RAID, mounts the real root at `/sysroot`, then `switch_root`s to it.
+5. **systemd** (PID 1): reads the default target, starts units in dependency order (sysinit → basic → multi-user/graphical), reaching the target with services running.
+
+**L8** — "Available" is not buff/cache: it's free memory plus cache that is genuinely reclaimable. Here ~45 GB is **anonymous memory** (process heaps/stacks), which cannot be reclaimed without swap — and with only 2 GB of swap there's almost no room. Part of the 15 GB buff/cache may also be unreclaimable (e.g., **tmpfs/shmem** pages, which count as cache but are only freed when files are deleted, or dirty pages). So demand for anonymous memory exceeds RAM+swap and the OOM killer fires. Tunables: `vm.overcommit_memory` (2 = strict, with `vm.overcommit_ratio`), `vm.swappiness`, `vm.min_free_kbytes`, `vm.watermark_scale_factor`, `vm.vfs_cache_pressure`, `vm.dirty_ratio`/`dirty_background_ratio`, per-process `oom_score_adj`, and userspace guards (earlyoom/systemd-oomd). Real fix: add RAM/swap or fix the leak.
+
+**L9** — `ip netns` manages named network namespaces: `ip netns add/exec/list/delete` (bind mounts under `/var/run/netns`). Container runtimes use the same kernel mechanism (clone/unshare with `CLONE_NEWNET`) to give each container or pod its own network stack, connected to a bridge/overlay via veth pairs; `ip netns exec <ns> ss -tan` is the standard way to debug a container's network.
+
+**L10** — **SIGTERM (15)**: "please terminate," catchable, allows cleanup. **SIGKILL (9)**: cannot be caught, blocked, or ignored; the kernel terminates the process immediately — no cleanup, unflushed data lost. **SIGQUIT (3)**: catchable; default action terminates with a core dump; some daemons (e.g., nginx) use it for graceful shutdown. Catchable: SIGTERM and SIGQUIT. Never catchable: SIGKILL.
+
+**L11** — stdin (fd 0), stdout (fd 1), stderr (fd 2) are the standard data streams. Redirect stderr to a file while stdout stays on the terminal:
+```
+command 2>error.log
+```
+(Also useful: `>out 2>err`, `2>&1`, `&>`.)
+
+**L12** — `chmod 755` sets `rwxr-xr-x`. Each octal digit is a user class: **7 = owner** (r=4+w=2+x=1), **5 = group** (r+x), **5 = others** (r+x). Typical for directories and executables: owner full access, everyone else read/execute.
+
+**L13** — root is UID 0: the kernel grants it all capabilities and bypasses (most) permission checks. A sudo user is a normal account granted specific privileges via `/etc/sudoers`: per-command control, full audit logging, no shared root password, and root can be locked entirely while admins retain access. Root has unrestricted power; sudo can be scoped to exactly what's needed.
+
+**L14** — A package manager installs, upgrades, and removes software, resolving dependencies against repositories with integrity checks. Debian/Ubuntu: **apt** (front end) over **dpkg**. RHEL/Fedora: **dnf** (formerly yum) over **rpm**.
+
+**L15** — `/etc/fstab` is the static mount table: devices, mount points, filesystem types, options, dump/fsck pass. systemd converts entries to mount units at boot. A misconfigured entry can hang boot or drop the system into **emergency mode**; mitigate with `nofail`, `x-systemd.device-timeout`, and `_netdev` for network mounts. Always test with `mount -a` and `findmnt --verify` before rebooting.
+
+**L16** — LVM abstracts storage: **physical volumes** (block devices initialized with `pvcreate`) feed a **volume group** (a pool of extents, `vgcreate`), from which **logical volumes** are carved (`lvcreate`) and formatted. Extend online:
+```
+pvcreate /dev/sdb
+vgextend vg_data /dev/sdb
+lvextend -r -L +10G /dev/vg_data/lv_app   # -r resizes the fs too
+```
+(`resize2fs` for ext4, `xfs_growfs` for XFS if not using `-r`.) All safe on a running system.
+
+**L17** — The I/O scheduler reorders/merges block requests to reduce seeks and latency. **mq-deadline**: guarantees per-request deadlines (reads prioritized), FIFO/sorted trees, general-purpose default including NVMe. **bfq**: proportional-share, cgroup-aware, favors interactive/low-latency workloads on slower devices (HDDs, desktops) at the cost of overhead. **none**: pass-through, no reordering — best for very fast NVMe or devices with their own scheduling (SANs, hardware RAID, zram/loop). Change at runtime:
+```
+cat /sys/block/nvme0n1/queue/scheduler
+echo mq-deadline > /sys/block/nvme0n1/queue/scheduler
+```
+Persist via udev rules or the `elevator=` kernel parameter.
+
+**L18** — Linux load average counts tasks in **R (running/runnable) and D (uninterruptible)** states, decayed over 1/5/15 minutes — unlike classic Unix (CPU only). So D-state tasks stuck on disk/NFS I/O inflate load while CPU stays idle. Diagnosis:
+- `vmstat 1`: `r` (run queue), `b` (blocked/D-state), `wa` (I/O wait) — high `b`+`wa` with low `us`+`sy` points at I/O.
+- `iostat -x 1`: `%util`, `await`, queue size — disk bottleneck.
+- `pidstat -d` / `iotop`: which processes do I/O; PSI (`/proc/pressure/io|cpu|memory`) for pressure.
+- Network: `sar -n DEV 1`, `ss -s`, `ethtool -S`, retransmits/errors.
+- Compare load to core count (load ≈ cores = saturated).
+
+**L19** — SELinux is a Linux Security Module implementing MAC: every process/object carries a security context (user:role:type:level), and Type Enforcement rules **deny by default** — the kernel checks LSM hooks after DAC. **Enforcing**: violations blocked and logged (AVC). **Permissive**: violations logged but allowed (testing). **Disabled**: policy and labels ignored entirely. Troubleshooting a daemon that can't bind a non-standard port: `ausearch -m avc -ts recent` / `audit2why` to confirm the denial; then assign the port to the right type, e.g. `semanage port -a -t http_port_t -p tcp 8080` (or a local module via `audit2allow`); verify file contexts with `ls -Z`/`restorecon`; use `setenforce 0` only as a temporary test.
+
+**L20** — On a memory access the MMU raises a fault; the kernel checks the address against the process's VMAs. If invalid → SIGSEGV. If valid: a **minor fault** is resolved without I/O — the page is already in memory (mapping to page cache, demand-zero page, COW copy) and the PTE is updated. A **major fault** requires I/O: the kernel allocates a page, submits a read (or swap-in), puts the task to sleep, and wakes it on completion — expensive (ms vs µs). **THP** backs anonymous memory with 2 MB pages: fewer TLB misses and faults for large contiguous allocations (good for throughput/HPC), but allocation needs memory compaction → latency spikes, khugepaged overhead, memory bloat/fragmentation, and COW amplification (fork copies 2 MB instead of 4 KB). Disable it for latency-sensitive applications (Redis, MongoDB, Oracle recommend it): `transparent_hugepage=never` boot parameter or `echo never > /sys/kernel/mm/transparent_hugepage/enabled` (optionally `madvise` mode so apps can opt in).

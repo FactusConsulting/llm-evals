@@ -1,0 +1,214 @@
+# Go
+
+**G1 — Slice vs Array**
+An array `[N]T` is a fixed-size value type; its length is part of the type and it's copied by value on assignment. A slice `[]T` is a small header (pointer to backing array + len + cap) that references an underlying array; it's dynamic and shares storage. When you `append` to a slice at full capacity, the runtime allocates a new, larger backing array (roughly doubling for small slices, ~1.25× growth for large ones), copies the elements over, and returns a slice pointing at the *new* array — which is why you must reassign: `s = append(s, x)`. If capacity remains, append writes into the existing array.
+
+**G2 — `var x int` vs `x := 0`**
+`var x int` declares x with its zero value (0); `x := 0` declares *and* initializes with type inference. `:=` is only valid inside functions, and requires at least one new variable on the left. You cannot use `:=` at package scope (must use `var`/`const`), when no variable on the left is new (`a, err := ...` where both exist), or for struct fields/parameters. Gotcha: `:=` inside an `if`/`for` creates a new scoped variable that can shadow an outer one.
+
+**G3 — Goroutines and the GMP scheduler**
+A goroutine is a lightweight, runtime-managed unit of execution: ~2 KB initial stack (grows/shrinks), cheap to create (hundreds of thousands are fine), multiplexed onto a small pool of OS threads. The GMP model: **G** = goroutine, **M** = OS thread, **P** = a scheduling context (number set by `GOMAXPROCS`). An M must acquire a P to execute Gs; each P holds a local run queue, and idle Ps steal work from others. Blocking syscalls/cgo detach the M; network I/O goes through the runtime's netpoller. Goroutines are preempted (async preemption since Go 1.14) so tight loops don't starve the scheduler.
+
+**G4 — Channels**
+A channel is a typed, thread-safe conduit; send/receive both synchronize (establish happens-before). **Unbuffered**: send blocks until a receiver is ready (rendezvous — both parties synchronized). **Buffered**: has capacity; send only blocks when the buffer is full, receive blocks when empty. Sending to a full buffered channel blocks the goroutine until another goroutine receives (or deadlocks if none ever will). Sending on a closed channel panics; receiving from a closed channel yields the zero value with `ok == false`; a nil channel blocks forever.
+
+**G5 — context + WithTimeout example**
+`context` carries cancellation signals, deadlines, and request-scoped values across API boundaries, especially network calls.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+defer cancel()
+
+req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://example.com", nil)
+if err != nil { return err }
+resp, err := http.DefaultClient.Do(req) // aborted if ctx deadline fires
+if err != nil { return err }
+defer resp.Body.Close()
+```
+
+For your own long work, select on `ctx.Done()` and return `ctx.Err()`.
+
+**G6 — Interface satisfaction**
+Go uses **structural, implicit** typing: any type whose method set contains the interface's methods satisfies it — no `implements` declaration. Java/C# use nominal typing: you must explicitly declare `implements`. The empty interface `interface{}`/`any` is satisfied by every type, making it a universal container — powerful for heterogeneous APIs, dangerous because it erases static type safety: you get runtime type assertions, possible panics, hidden allocations (boxing), and lost compiler checks. Prefer generics where the type relationships are known.
+
+**G7 — Memory model / visibility**
+This is a **data race**: there is no happens-before edge between the goroutine's writes and the main goroutine's reads, so the behavior is undefined. The compiler may reorder `data = "hello"` after `ready = true`, or the loop may never observe the write (loads can be cached/hoisted; a tight `for !ready {}` also historically blocked the scheduler). Correct alternatives:
+
+```go
+// 1) Channel (preferred): send establishes happens-before
+data := make(chan string)
+go func() { data <- "hello" }()
+fmt.Println(<-data)
+
+// 2) Mutex: all accesses under the same lock
+// 3) atomics: var ready atomic.Bool; ready.Store(true) / ready.Load()
+//    (atomic ops in Go's memory model create the necessary ordering)
+```
+
+**G8 — Mutex vs RWMutex vs sync.Map**
+`sync.Mutex` is exclusive. `sync.RWMutex` allows many readers *or* one writer (a blocked writer prevents new readers to avoid starvation). RWMutex has higher constant cost, so it only pays off for large, genuinely read-mostly critical sections. `sync.Map` is specialized: it keeps a read map (accessed atomically, lock-free reads) and a dirty map (promoted on misses). Use it for append-only caches or read-mostly, disjoint key sets; use `map` + `RWMutex` for general workloads — it's typed, supports `len`, iteration, and predictable performance. `sync.Map` is slow under write-heavy/miss-heavy access and stores keys/values as `any`.
+
+**G9 — Modules, go.mod/go.sum, MVS**
+A module is a set of packages versioned together. `go.mod` declares the module path, Go version, and direct/indirect requirements with versions. `go.sum` stores cryptographic checksums of module content (and their go.mod files) to verify downloads — it's a lock/verification file, not a dependency list. `go mod tidy` adds missing and removes unused dependencies for all build targets and updates `go.sum`. **MVS**: the build list is computed by walking the requirement graph from the main module; for each module, select the *maximum* of the minimum versions required along all reachable paths — i.e., the lowest version that satisfies every requirement. No registry crawling; each module's own go.mod constrains its dependencies.
+
+**G10 — defer**
+`defer` schedules a function call to run just before the enclosing function returns; arguments are evaluated at the `defer` statement. Multiple defers run in **LIFO** order. Loop gotcha: defers accumulate until the *function* returns — e.g., `defer f.Close()` inside a loop leaks every file descriptor until function exit. Fix by calling directly or wrapping the body in an anonymous function per iteration. (Related pre-1.22 gotcha: deferred closures capturing the loop variable see its final value.)
+
+**G11 — Pointers**
+A pointer holds the address of a value; its zero value is `nil` (dereferencing nil panics). Create a pointer to a struct literal with `&`:
+
+```go
+u := &User{Name: "ada"} // allocates the struct, u is *User
+```
+
+Also `new(T)` or `&someAddressableVar`. Go has no pointer arithmetic.
+
+**G12 — init()**
+`init()` runs automatically during package initialization: imported packages first (depth-first, in import order), then package-level variable initializers, then `init()` functions. A package may have multiple `init()` functions, even in the same file; they execute in the order the files are presented to the compiler (the go tool sorts by filename) and, within a file, top-to-bottom. `init()` takes no arguments and returns nothing; it can't be called directly.
+
+**G13 — make vs new**
+`new(T)` allocates a zeroed `T` and returns `*T`; works with any type. `make(T, ...)` allocates *and initializes* and returns the value `T` (not a pointer); it only works with slices, maps, and channels, because those need internal runtime structures initialized (backing array, hash buckets, channel buffer).
+
+**G14 — Errors**
+`error` is an interface: `type error interface { Error() string }`. Idiomatic pattern: check immediately and return, wrapping with context: `if err != nil { return fmt.Errorf("loading config: %w", err) }`. `==` compares interface equality directly — works for sentinel errors (`ErrNotFound`) but fails through wrapping. `errors.Is(err, ErrNotFound)` traverses the wrap chain (also honoring custom `Is` methods); `errors.As(err, &target)` finds the first error in the chain of a specific type and sets target.
+
+**G15 — Composite types and zero values**
+- `map`: nil — reading is safe (returns zero values), writing panics; must `make` or literal-initialize.
+- `slice`: nil — len/cap 0, safe to `range` and `append` (append allocates).
+- `channel`: nil — send/receive block forever.
+- `struct`: every field set to its zero value.
+- (array: all elements zeroed.)
+
+**G16 — Race conditions and -race**
+A data race: two goroutines access the same memory concurrently, at least one is a write, with no synchronization → undefined behavior. `-race` enables the race detector (ThreadSanitizer-based, happens-before/vector-clock algorithm) by instrumenting memory accesses; it reports the offending goroutine stacks. Cost: roughly 2–20× CPU and 5–10× memory, and it only detects races that actually execute — run it in CI/tests.
+
+```go
+// RACE
+var n int
+for i := 0; i < 100; i++ { go func() { n++ }() }
+
+// Fix with a mutex:
+var mu sync.Mutex
+go func() { mu.Lock(); n++; mu.Unlock() }()
+
+// or a channel:
+func counter() func() int {
+    inc := make(chan struct{}); done := make(chan int)
+    go func() { n := 0; for range inc { n++ }; done <- n }()
+    ...
+}
+```
+
+**G17 — select**
+`select` waits on multiple channel operations, proceeding with whichever is ready first. Unlike `switch`, its cases are channel send/receive (plus optional `default`), and channel operands are evaluated once up front. If multiple cases are ready, one is chosen **uniformly at random** (avoids starvation/bias). With no ready case and a `default`, the default runs; without one, it blocks. Timeout:
+
+```go
+select {
+case v := <-ch:
+    use(v)
+case <-time.After(2 * time.Second):
+    return ErrTimeout
+}
+```
+
+**G18 — Escape analysis**
+The compiler decides stack vs heap: if a variable provably does not outlive its frame and no reference escapes, it's stack-allocated (cheap: bump-allocation, freed at return). It escapes (→ heap) if its address is returned, stored in a heap-reachable structure, boxed into an interface, captured by a closure that outlives the frame, sized dynamically, or very large. Inspect with `go build -gcflags="-m"` (`-m -m` for detail: "escapes to heap" / "moved to heap"). It matters because heap allocation adds GC pressure and latency; avoiding escapes in hot paths is one of Go's biggest performance levers.
+
+**G19 — reflect**
+`reflect.Type` (from `reflect.TypeOf`) describes the static type; `reflect.Value` (from `reflect.ValueOf`) wraps the runtime value with its kind, allowing dynamic field access, method calls, and construction. Costs: boxing allocations, dynamic dispatch, no inlining/devirtualization, and field/method access is typically 10–100× slower than direct code; unexported fields aren't settable. Justified when the schema is genuinely dynamic (encoding/json, database drivers, ORMs). For hot paths or known shapes, prefer generics or code generation (`go generate`, template-based generators), which restore compile-time checks and performance.
+
+**G20 — go:embed**
+`//go:embed` embeds files at compile time into variables of type `string`, `[]byte`, or `embed.FS` (import `embed`; blank import `_ "embed"` for string/[]byte). Single file: `//go:embed hello.txt` above a `string`/`[]byte` var. Directories: patterns on an `embed.FS` var embed recursively. `embed.FS` implements `fs.FS`, so it composes with `fs.Sub`, `fs.WalkDir`, `template.ParseFS`, and `http.FileServer(http.FS(assets))`. Limitations: paths must be within the package directory (no `..`, no absolute paths), files starting with `.` or `_` are excluded unless matched explicitly, content is baked into the binary (increases size, no lazy loading).
+
+---
+
+# Rust
+
+**R1 — Ownership**
+Ownership is Rust's compile-time memory management model. The three rules: (1) every value has exactly one owner; (2) at any time there is a single owner — assignment or passing a non-`Copy` value *moves* ownership (the source can't be used afterward); (3) when the owner goes out of scope, the value is dropped (RAII: heap memory, file handles, locks are freed deterministically). `Copy` types (ints, bools, etc.) are duplicated instead of moved.
+
+**R2 — String vs &str**
+`String` is an owned, heap-allocated, growable UTF-8 buffer (essentially `Vec<u8>` with a UTF-8 invariant). `&str` is a borrowed string slice — a view into `String`, a literal, or any UTF-8 bytes. In signatures: prefer `&str` for read-only parameters (more general — literals and `&String` coerce via deref); use `String` when you need ownership, mutation, or to build/return a new string; returning `String` gives the caller ownership. `&str` in structs requires a lifetime annotation.
+
+**R3 — Borrowing rules**
+Shared references `&T`: any number may exist, but they're read-only. Mutable references `&mut T`: exactly one may exist, and no shared references may coexist with it. All references must remain valid (no dangling — the referent outlives every use). The borrow checker enforces this statically; with non-lexical lifetimes, a borrow ends at its last use. This eliminates data races, use-after-free, and iterator invalidation at compile time.
+
+**R4 — Result, Option, ?**
+`Result<T, E>` = `Ok(T) | Err(E)` for recoverable errors; `Option<T>` = `Some(T) | None` for absent values. `?` unwraps on success or performs an early return of the error, applying `From::from` to convert error types automatically.
+
+```rust
+use std::io;
+
+fn read_config(path: &str) -> Result<String, io::Error> {
+    let contents = std::fs::read_to_string(path)?; // returns Err on failure
+    Ok(contents)
+}
+```
+
+**R5 — Box, Rc, Arc**
+`Box<T>`: single-owner heap allocation — for large values, recursion, or trait objects (`Box<dyn Trait>`); no runtime overhead beyond the allocation. `Rc<T>`: single-threaded reference-counted shared ownership; `clone` bumps the count, the value drops when the last handle does; not `Send`. `Arc<T>`: atomically reference-counted, safe to share across threads (`Send + Sync` iff `T` is). None give interior mutability by themselves — combine with `Mutex`/`RwLock`/`RefCell`. Use `Box` for plain ownership with indirection, `Rc` for shared data in one thread, `Arc` for shared data across threads.
+
+**R6 — Traits, dyn Trait vs generics**
+Traits define shared behavior (with default methods, associated types/consts) and are implemented explicitly via `impl Trait for Type` — nominal, unlike Go's structural satisfaction. `dyn Trait` is a **trait object**: dynamic dispatch through a vtable, usable behind `&`, `Box`, `Rc`, requires dyn-compatibility (object safety). `T: Trait` generics use **static dispatch**: monomorphized per concrete type, inlinable, zero-cost, and one type per instantiation. Use generics for performance and when types are known at compile time; use `dyn` for heterogeneous collections or to shrink code size at the cost of a vtable call.
+
+**R7 — Lifetimes**
+The compiler can't verify that the returned reference outlives its validity: it doesn't know whether the result borrows from `x` or `y`, so it can't prove the output doesn't dangle. Fix by declaring that the output lives exactly as long as both inputs:
+
+```rust
+fn longest<'a>(x: &'a str, y: &'a str) -> &'a str {
+    if x.len() > y.len() { x } else { y }
+}
+```
+
+Lifetimes are purely compile-time region constraints — zero runtime cost; they describe how long references must remain valid, not how long values live.
+
+**R8 — Send and Sync**
+`Send`: the type can have ownership moved to another thread. `Sync`: `&T` is `Send` (the type can be shared by reference across threads). `Rc<T>` is neither: its reference count is a plain non-atomic integer, so concurrent clone/drop from multiple threads would race and could double-free or leak. `Arc<T>` uses atomic reference counting (acquire/release orderings), making count updates thread-safe; `Arc<T>` is `Send + Sync` only when `T: Send + Sync`. These are checked at compile time by bounds like `std::thread::spawn`'s `F: Send`.
+
+**R9 — async/await under the hood**
+`async fn` compiles to a state machine type implementing `Future` (poll-based): each `.await` is a yield point where the state machine saves/resumes locals. Futures are lazy — nothing runs until polled. An **executor** (Tokio) owns tasks, polls them, and integrates with a reactor (epoll/kqueue/io_uring) and timers; a `Waker` re-schedules the task when its I/O is ready. Versus Go: Rust async is cooperative at compile time (colored functions, stackless coroutines, no built-in runtime — you pick Tokio etc.), while goroutines are stackful, preemptively scheduled by the runtime, and blocking code is fine. Rust's model is lower-overhead but more invasive; Go's is simpler but with runtime-managed threads.
+
+**R10 — unsafe**
+`unsafe` unlocks superpowers safe Rust forbids: (1) dereference raw pointers; (2) call `unsafe` functions (including FFI) and implement `unsafe` traits; (3) access or mutate `static mut`; (4) access fields of `union`; (5) unwrap `unsafe` in `#[unsafe(...)]`-gated operations. It does *not* disable the borrow checker — it disables a subset of checks and makes *you* responsible for upholding memory-safety invariants. Justified for FFI bindings, OS/syscall interfaces, and performance-critical primitives the compiler can't prove safe; the rule is to encapsulate it in small, well-documented safe abstractions and test with Miri.
+
+**R11 — Pattern matching**
+`match` compares a value against patterns (literals, destructuring, bindings, ranges, guards) and runs the first matching arm; all arms must produce the same type. `if let` handles a single pattern concisely (`if let Some(x) = opt { ... }`). The compiler enforces **exhaustiveness**: every possible case must be handled or you must include a `_` catch-all — adding a new enum variant breaks compilation everywhere it's matched, which is a safety feature.
+
+**R12 — Vec vs array**
+`[T; N]` is a fixed-size array, size known at compile time, stored inline (usually the stack). `Vec<T>` is a heap-allocated growable buffer of (pointer, length, capacity). When a push exceeds capacity, `Vec` allocates a new, larger buffer (amortized growth, roughly doubling), moves the elements over, and frees the old buffer — making pushes O(1) amortized. `Vec` derefs to `[]T`/slice for most operations.
+
+**R13 — Enums**
+Rust enums are **sum types** (algebraic data types): variants can carry arbitrary, per-variant data (`Result<T,E>`, `Option<T>`, AST nodes), destructured by pattern matching. C enums are just named integer constants; Java enums are fixed object instances with uniform fields. `Option<T>` is `Some(T) | None`: instead of null, absence is encoded in the type system, so the compiler forces you to handle the `None` case — eliminating null-pointer errors by construction.
+
+**R14 — impl blocks**
+`impl Type { ... }` defines associated functions and methods. `&self`: read-only access by shared borrow. `&mut self`: may mutate, exclusive borrow. `self`: consumes the value, taking ownership (e.g., `into_iter`, builder finalizers) — the caller can't use it afterward. Associated functions (no `self`), like `String::new()`, are namespaced on the type and typically serve as constructors.
+
+**R15 — derive**
+`#[derive(...)]` generates trait implementations automatically. Common: `Debug`, `Clone`, `Copy`, `PartialEq`/`Eq`, `PartialOrd`/`Ord`, `Hash`, `Default`, plus external ones like `serde::Serialize`/`Deserialize`. You cannot derive a trait when any field's type doesn't implement it, when the trait requires non-mechanical semantics (e.g., `Display` needs format choices, `Drop`/`Deref` need custom logic — not derivable), or when the trait isn't covered by an available derive macro / isn't in scope.
+
+**R16 — Cow**
+`Cow<'a, T>` is `enum Cow { Borrowed(&'a T), Owned(<T as ToOwned>::Owned) }` — a borrowed view or an owned value, decided at runtime, derefing to `T`. Useful when a function usually doesn't need to modify input but sometimes does:
+
+```rust
+fn normalize(s: &str) -> Cow<'_, str> {
+    if s.contains(' ') {
+        Cow::Owned(s.replace(' ', "_")) // allocate only when needed
+    } else {
+        Cow::Borrowed(s) // zero allocations in the common case
+    }
+}
+```
+
+Versus always calling `to_string()`/`clone()`, this avoids an allocation per call in the no-change path.
+
+**R17 — Module system**
+`mod` declares a module and its place in the tree — inline (`mod foo { ... }`) or from a file (`mod foo;` loads `foo.rs` or `foo/mod.rs`). `use` brings paths into scope (`use crate::foo::Bar;`). `pub` controls visibility: `pub` (public), `pub(crate)`, `pub(super)`, `pub(in path)`. Edition changes: Rust 2015 resolved paths relative to the *current file* and required `extern crate`; Rust 2018 unified paths relative to the *crate root* (`crate::...`), allowed `foo.rs` without `mod.rs`, and made `extern crate` unnecessary (Cargo dependencies are directly usable).
+
+**R18 — Pin**
+`Pin<P>` is a wrapper guaranteeing the pointee cannot move (be memmoved to a new address) until it's dropped or proven `Unpin`. It's needed because `async fn` compiles to state machines that can hold references to their own locals — **self-referential structs** — and moving such a struct would leave internal pointers pointing at the old location. Futures must be pinned before polling (`Pin<&mut F>` is what `poll` takes); use `Box::pin(fut)` or the stack `pin!` macro. `Unpin` is an auto trait meaning "moving is harmless" — nearly all normal types are `Unpin`; only `async` futures (and similar) are `!Unpin` and require pinning.
+
+**R19 — Macros**
+`macro_rules!` (declarative): match token patterns and expand templates; recursive; resolved after parsing; has *mixed hygiene* — local variables and labels defined in the macro can't accidentally capture call-site identifiers, but items and method names aren't hygienic. Procedural macros operate on `TokenStream` at compile time in a separate crate: **derive** macros generate impls for annotated types; **attribute** macros rewrite items (e.g., `#[tokio::main]`); **function-like** macros accept arbitrary token trees (e.g., `sql!`). Proc macros are not hygienic by default — identifiers they emit behave as if written at the call site, so authors must avoid accidental name capture (unique names, spans).
+
+**R20 — Zero-cost abstractions**
+The principle: abstractions impose no runtime cost over hand-written code — "what you don't use, you don't pay for." **Iterators**: chained adapters (`map.filter.sum`) are inlined and optimized by LLVM into the same (often auto-vectorized, bounds-check-elided) machine code as a manual loop. **Generics**: monomorphization specializes code per concrete type at compile time — static dispatch, no vtable indirection, full inlining opportunities. **Trait bounds**: resolved statically, so polymorphism costs nothing. Combined with ownership (no GC, deterministic drops, no hidden refcounting), you get high-level ergonomics — pattern matching, iterators, traits — compiling down to performance comparable to hand-written C.

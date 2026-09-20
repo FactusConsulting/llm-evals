@@ -1,0 +1,34 @@
+## Diagnosis
+
+The restart loop is caused by the worker exiting fatally on startup because it cannot reach its Kafka broker. The evidence chain:
+
+- The journal shows the process starts, attempts `kafka.internal:9092`, gets a connection error, logs `Fatal: cannot connect to Kafka, exiting`, and exits with status 1. With `Restart=always` and `RestartSec=5`, each failure immediately triggers another start — hence the loop (restart counter at 47).
+- The `ping` result (`Name or service not known`) shows the failure is at the DNS layer: `kafka.internal` does not resolve on this host at all, so the connection is never even attempted.
+- The unit file contributes to the problem: `After=network.target` only orders the service after the network stack is initialized — it does **not** wait for the network to actually be online or for DNS to be resolvable. The worker can therefore start before name resolution is available.
+
+Root cause: `kafka.internal` is not resolvable from this host, and the unit file lets the service start before network/DNS readiness is guaranteed.
+
+## Proposed Fix
+
+1. **Restore name resolution for the broker** — add or repair the DNS record for `kafka.internal` (or add a correct `/etc/hosts` entry), or update the worker's configuration to point at the correct broker address.
+
+2. **Harden the unit file** to wait for real network readiness:
+
+```ini
+[Unit]
+Description=Data Ingest Worker
+Wants=network-online.target
+After=network-online.target
+```
+
+Then apply with `systemctl daemon-reload && systemctl restart data-ingest.service`.
+
+3. **Bound the restart loop** so a persistent failure doesn't spin indefinitely:
+
+```ini
+[Unit]
+StartLimitIntervalSec=300
+StartLimitBurst=5
+```
+
+This makes systemd stop retrying after 5 failures within 5 minutes instead of looping forever.

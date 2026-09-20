@@ -1,0 +1,50 @@
+## Blocking
+
+**1. The signing secret is generated at process startup and never persisted.**
+`init()` calls `rand.Read(jwtSecret)` on every boot. Consequences:
+- Every restart invalidates every outstanding token — one deploy logs out the entire user base.
+- Multiple replicas will each hold a different secret, so a token issued by instance A fails validation on instance B. You haven't removed the "shared state" problem that Redis solved; you've moved it into process memory.
+- The error from `rand.Read` is discarded. On older Go versions a crypto/rand failure would leave a zero-filled slice, i.e. a forgeable secret. Check the error or use a helper that fails hard.
+- A package-level secret set in `init()` is untestable — you can't inject a known key in tests. Move to a constructor or explicit loader.
+
+The secret must come from configuration/KMS, not runtime generation.
+
+**2. The refresh token flow is unimplemented.**
+`GenerateRefreshToken` produces a random string and nothing else: no storage, no lookup, no rotation, no consumption endpoint. Sessions previously lived in Redis; refresh tokens need server-side state to mean anything. Either wire this to a persistence layer or delete the function. Related design question: a 24-hour access token with no refresh path means users re-authenticate daily; the usual pattern is short-lived access tokens (minutes) plus a real refresh flow, which this diff gestures at but doesn't deliver.
+
+**3. There is no revocation story.**
+The old session store could delete a session server-side. With stateless 24-hour JWTs: logout is now client-side only, banning a user leaves their token valid, and "log out all devices" is impossible. What's the plan — a denylist (which reintroduces shared state), much shorter expiry, or an accepted risk you've documented?
+
+**4. Moving from cookies to an `Authorization` header shifts the browser attack surface.**
+HttpOnly cookies kept session tokens out of JS reach; a header-based token has to live somewhere in the client (localStorage is XSS-stealable). Where will browser clients store it? Also: this change requires CORS preflight updates for any cross-origin browser client, and ensure nothing in your logging chain captures the `Authorization` header.
+
+## Should fix
+
+**5. Pin the accepted algorithm.** The keyfunc returns the secret without inspecting `token.Header["alg"]`. The v4 library blocks `none` by default, but defense-in-depth is cheap: `jwt.ParseWithClaims(..., jwt.WithValidMethods([]string{"HS256"}))`.
+
+**6. No `Issuer`, `Audience`, or `jti` claims.** Without `iss`/`aud`, a token minted for one purpose can be replayed at another service that shares the secret. Without `jti`, you can't track or individually invalidate tokens later.
+
+**7. HS256 means every verifier holds the signing key.** If any other service needs to validate these tokens, each one can also mint them. If this token is only verified here, fine — but if it's cross-service, consider RS256/EdDSA.
+
+**8. Role staleness.** `role` is baked into the token, so a promotion, demotion, or ban takes up to 24 hours to take effect. Decide whether role belongs in the token at all or should be fetched per-request from the source of truth.
+
+**9. Bearer parsing is too loose.** `strings.TrimPrefix(authHeader, "Bearer ")` silently passes through a header with no scheme (or lowercase `bearer`) straight into the parser. Check the prefix explicitly and reject malformed `Authorization` headers with a clear error, per RFC 6750.
+
+**10. Context keys.** `context.WithValue(ctx, "userID", ...)` uses a built-in string key — collision-prone across packages and flagged by staticcheck. Use an unexported custom key type with typed accessor functions.
+
+**11. No clock skew tolerance.** Add `jwt.WithLeeway(...)` — distributed clock drift will produce intermittent 401s right at expiry boundaries.
+
+**12. No tests in the diff.** Needed at minimum: expired token, tampered signature, missing/malformed `Authorization` header, and middleware context propagation.
+
+## Questions
+
+**13. What happens at cutover?** Existing users have Redis sessions. Are they all force-logged-out on deploy, or is there a dual-accept window where the middleware falls back to cookie sessions?
+
+**14. Rollback and removal scope.** If this ships and you need to revert, is the Redis session code recoverable? Confirm the session store, its callers, and the Redis dependency in `go.mod` are fully removed — and that Redis isn't serving other purposes (rate limiting, caching) that this PR accidentally touches.
+
+**15. Secret provisioning and rotation.** Once the secret is config-sourced (see blocker 1), what's the rotation plan? There's no `kid` header support, so rotating the key means invalidating all tokens — is a dual-secret verification window planned?
+
+## Nits
+
+- `base64.URLEncoding` emits padding; `base64.RawURLEncoding` is friendlier if these strings ever land in URLs or cookies.
+- The custom `uid` claim duplicates what `RegisteredClaims.Subject` is for — consider using `sub` instead of a parallel field.

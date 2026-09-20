@@ -1,0 +1,232 @@
+# Kubernetes (20 questions)
+
+**K1 — Deployment vs StatefulSet**
+A Deployment manages stateless, interchangeable replicas: pods get random names/hash suffixes, can be scaled/replaced in any order, and share a single template. A StatefulSet provides *stateful identity*: stable pod names (`app-0`, `app-1`…), stable DNS names via a headless Service, ordered deployment/scaling/deletion (highest ordinal first on scale-down), and per-pod storage via `volumeClaimTemplates` (each pod gets its own PVC that survives pod rescheduling). Use Deployments for web frontends/APIs; use StatefulSets for databases, queues, and anything needing stable identity + dedicated persistent storage.
+
+**K2 — ClusterIP Service routing**
+A ClusterIP Service gets a stable virtual IP from the service CIDR (never assigned to a network interface). Each pod's label selector determines its Endpoints/EndpointSlices. kube-proxy on every node watches Services/Endpoints and programs iptables/IPVS/eBPF rules: traffic destined to the ClusterIP:port is DNAT'ed to a randomly selected backend pod IP:port. DNS name `<svc>.<ns>.svc.cluster.local` resolves to the ClusterIP via CoreDNS. The ClusterIP is only meaningful inside the cluster network.
+
+**K3 — PV / PVC / StorageClass**
+- **PersistentVolume (PV):** an actual piece of cluster storage (disk, NFS), either manually provisioned by an admin or dynamically created; cluster-scoped, carries capacity, access modes, and reclaim policy.
+- **PersistentVolumeClaim (PVC):** a user's request for storage in a namespace (size, access modes, optional StorageClass); binds 1:1 to a matching PV.
+- **StorageClass:** a template describing *how* storage should be provisioned — the provisioner (e.g., `kubernetes.io/aws-ebs`), parameters (type, IOPS, encryption), reclaim policy, and binding mode.
+
+Relation: a PVC referencing a StorageClass triggers **dynamic provisioning** — the external provisioner creates a PV matching the claim, and they bind. Pod → PVC → PV → actual storage.
+
+**K4 — CrashLoopBackOff troubleshooting**
+1. `kubectl describe pod <name>` — check Events, restart count, exit codes (137 = OOMKilled/SIGKILL, 1 = app error), last state.
+2. `kubectl logs <name> --previous` — read the crashing container's output before it died.
+3. Verify the container spec: image tag exists, command/args/env correct, required Secrets/ConfigMaps mounted and valid.
+4. Check probes: an overly aggressive liveness probe (too-short `initialDelaySeconds`/`periodSeconds`) can kill a healthy-but-slow-starting app.
+5. Check resources: OOMKilled means the memory limit is too low; check node pressure.
+6. Check dependencies the app needs at startup (DB unreachable, service discovery failing) and try running the image manually (`kubectl run` with a sleep shell, or ephemeral debug container).
+
+**K5 — CoreDNS role**
+CoreDNS is the cluster DNS: it resolves Service names (`svc.namespace.svc.cluster.local`), pod names, serves custom stub zones, and forwards external queries (e.g., `example.com`) to upstream resolvers (node/VPC DNS). Every pod's `/etc/resolv.conf` points at the `kube-dns` Service ClusterIP. If CoreDNS pods are down: any DNS-dependent operation fails — Service-name lookups break, external names can't be resolved (unless cached), new pods whose startup depends on DNS fail, apps that call services by name degrade. Connections by raw IP still work. There is no automatic fallback resolver.
+
+**K6 — Scheduler decision process**
+For each unscheduled pod, kube-scheduler runs a two-phase cycle:
+1. **Filtering (predicates):** eliminate nodes that *cannot* run the pod — insufficient free CPU/memory *requests*, nodeSelector/node affinity mismatch, unsatisfiable taints (NoSchedule/NoExecute), port conflicts, max-pods limits, volume topology constraints (PV zone affinity), node conditions/pressure, topology spread violations.
+2. **Scoring (priorities):** rank feasible nodes — e.g., *LeastRequested/BalancedResourceAllocation* (spread load), *NodeAffinity* preferred terms, *ImageLocality* (image already cached on node), *InterPodAffinity/AntiAffinity*, *TopologySpread* across zones.
+3. **Binding:** highest-scoring node wins (ties broken randomly); scheduler writes `nodeName` via the Bind API. If no node passes filtering, the pod stays Pending (possibly triggering preemption of lower-priority pods).
+
+**K7 — Requests/limits scheduling and runtime**
+The scheduler only considers **requests**: 256Mi requested vs 0.5GB (≈512Mi) of unrequested capacity → **yes, it schedules**. At runtime, the memory limit (512Mi) is enforced by a cgroup limit, not throttled like CPU. If the container tries to use 600Mi, the kernel memory cgroup OOM killer terminates it: container exits with code 137 (`OOMKilled`), kubelet restarts it per `restartPolicy` (likely CrashLoopBackOff if it always exceeds). Note the node may physically have free RAM — the kill is due to the *limit*, not node exhaustion.
+
+**K8 — Ingress → pod request path**
+1. Client hits the **external load balancer** (cloud LB / NodePort / hostNetwork) that fronts the ingress controller.
+2. Traffic reaches the **ingress-nginx controller pod**: external LB forwards to the controller's Service (NodePort/LoadBalancer); kube-proxy's iptables rules (KUBE-NODEPORTS/KUBE-SVC chains) DNAT the packet to a controller pod IP.
+3. The controller terminates TLS (cert from the Ingress/Secret), matches host/path rules from the **Ingress resource** (which it watches and renders into nginx config), and proxies to an **upstream**.
+4. Crucially, ingress-nginx watches **Endpoints/EndpointSlices** directly and load-balances across *pod IPs* (bypassing the Service ClusterIP for the upstream hop).
+5. The packet reaches the app pod's container port; the response returns along the same path. If no rule matches, the default backend returns 404.
+
+**K9 — NetworkPolicy**
+A NetworkPolicy is a pod-level firewall spec (ingress/egress rules selected by pod/namespace labels and IP blocks), enforced by the CNI (Calico, Cilium, etc. — plain flannel ignores them). **Default with no policy:** fully open — any pod can send/receive anything. **Once a policy selects a pod** for a direction: that pod becomes isolated for that direction — deny-by-default, allowing only traffic matching the policy's rules. E.g., an ingress policy selecting `app=web` with a rule allowing from `app=frontend` means `web` pods accept traffic *only* from frontend pods (same-namespace by default unless `namespaceSelector` widens it).
+
+**K10 — RollingUpdate vs Recreate**
+RollingUpdate replaces pods gradually, respecting `maxSurge`/`maxUnavailable`, so the service stays available and old/new versions coexist briefly. Recreate kills *all* old pods before starting new ones → guaranteed downtime window. Choose Recreate when two versions cannot run simultaneously: incompatible schema/state, apps that bind a fixed port/host resource, RWO volumes that can't be double-mounted, or jobs that must fully drain before restarting.
+
+**K11 — Namespace**
+A namespace is a virtual cluster scope: resource names must be unique within it, and RBAC, quotas, and NetworkPolicies are typically namespaced. Default namespaces in a new cluster: `default`, `kube-system` (control plane + system components), `kube-public` (mostly for cluster bootstrap info), `kube-node-lease` (node heartbeat Lease objects).
+
+**K12 — `kubectl describe pod`**
+Shows deep detail beyond the `get` summary. Examples of info `get pod` doesn't show:
+1. **Events** — scheduling, image pull, mounting, probe failures, failed scheduling reasons.
+2. **Container states** — last termination reason and exit code (e.g., `OOMKilled`, exit 137), restart details.
+3. **Conditions & probe results** — `Ready`/`Scheduled` conditions, liveness/readiness success/failure timings.
+4. Also: full volumes/mounts, env var sources, tolerations/affinity/nodeSelector, QoS class, service account, image pull details.
+
+**K13 — ConfigMap**
+A ConfigMap stores non-confidential key/value configuration decoupled from pod specs. Consumption methods:
+1. **Environment variables:** `env: [{valueFrom: {configMapKeyRef: ...}}]` or bulk via `envFrom.configMapRef`.
+2. **Volume mount:** a `configMap` volume mounts keys as files (updated in-place on ConfigMap changes, modulo kubelet sync delay).
+3. (Also: referenced in command/args via env, or consumed by controllers/tools like `kubectl` or operators.)
+
+**K14 — ClusterIP vs NodePort vs LoadBalancer**
+- **ClusterIP:** internal virtual IP, reachable only in-cluster.
+- **NodePort:** builds on ClusterIP; allocates a port (default 30000–32767) on *every* node; `nodeIP:port` forwards to the service — usable from outside if nodes are reachable.
+- **LoadBalancer:** builds on NodePort; asks the cloud controller (or MetalLB) to provision an external LB with an IP/DNS that forwards to the NodePorts. Each LB type adds a layer on top of the previous one.
+
+**K15 — DaemonSet**
+A DaemonSet runs exactly one pod per matching node (all nodes or a subset via selectors/tolerations) — new nodes automatically get the pod, removed nodes lose it. Use instead of a Deployment when the workload is node-aligned infrastructure: log collectors (Fluentd), node metrics exporters (node-exporter), CNI agents, kube-proxy, storage/CSI drivers. Deployments scale by replica count with no node guarantee; DaemonSets scale with the node count.
+
+**K16 — Taints/tolerations vs node affinity**
+Taints are node-side *repellents*: a node with `key=value:Effect` repels pods unless the pod has a matching toleration (effects: `NoSchedule`, `PreferNoSchedule`, `NoExecute`). Node affinity is pod-side *attraction*: the pod specifies which nodes it wants/requires. Practical uses: taint `dedicated=gpu:NoSchedule` on GPU nodes, GPU jobs add the toleration (keeps everything else off); node affinity `nodeAffinity: requiredDuringScheduling... kubernetes.io/e2e-az = us-east-1` to pin workloads to a zone, or prefer spot nodes. They're complementary: taints push generic workloads away; affinity pulls specific workloads in.
+
+**K17 — Kubernetes Operator**
+An Operator is a custom controller paired with a CRD that encodes domain-specific operational knowledge: it watches a custom resource (e.g., `PostgresCluster`) and continuously reconciles reality toward the declared state — provisioning, config, failover, backups, version upgrades, scaling. A standard controller implements generic built-in behavior (Deployments → ReplicaSets → pods); an Operator implements *application-specific* logic. The pattern solves automating complex/stateful app operations that previously required human runbooks — "operating software as software."
+
+**K18 — etcd consistency model and quorum loss**
+etcd uses the **Raft consensus algorithm**: a leader elected by majority; every write is committed only once replicated to a quorum, giving strongly consistent (linearizable) reads/writes. The API server is the only etcd client of consequence — all cluster state lives there. **If quorum is lost** (e.g., 2 of 3 members down), etcd cannot commit writes or serve consistent reads → API server errors on writes (and linearizable reads) → scheduling, deployments, controller reconciliations, and kubelet syncs fail. **Already-running containers keep running** (kubelet, CNI, kube-proxy operate node-locally), but the cluster is effectively frozen for changes. **Recovery from permanent loss of 2/3:** the remaining single member cannot achieve quorum (needs 2). You must restore from a snapshot: provision a new etcd cluster (or re-add members) from the latest `etcdctl snapshot restore`/backup, or rebuild the cluster (e.g., with bootstrapping tools like kubeadm `--backup`/restore). This is why etcd snapshots + odd member counts (3 or 5) are critical.
+
+**K19 — RBAC + manifests**
+- **Role:** namespaced set of rules (verbs on resources) — grants permissions *within one namespace*.
+- **ClusterRole:** same rules but cluster-scoped; reusable across namespaces.
+- **RoleBinding:** grants a subject (User/Group/ServiceAccount) the permissions of a Role *or ClusterRole*, but only in the binding's namespace (a ClusterRole bound via RoleBinding = cluster role, namespaced effect).
+- **ClusterRoleBinding:** grants cluster-wide.
+
+Permissions are purely additive (no deny rules). Read-only pods + logs in one namespace:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-reader
+  namespace: dev
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods/logs"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pod-reader-binding
+  namespace: dev
+subjects:
+- kind: User
+  name: developer
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io
+```
+
+**K20 — ndots and slow external DNS**
+A pod's `/etc/resolv.conf` (with `dnsPolicy: ClusterFirst`) contains `search <ns>.svc.cluster.local svc.cluster.local cluster.local ...` and **`ndots:5`**. The resolver appends search domains to any name with *fewer than 5 dots* before trying it absolutely. So `external.domain.com` (2 dots < 5) is first tried as `external.domain.com.<ns>.svc.cluster.local`, then `.svc.cluster.local`, then `.cluster.local`, and only finally as the absolute name — **4 queries per lookup**, each potentially timing out (SERVFAIL/NXDOMAIN round trips through CoreDNS), producing multi-second latency. Fix via `dnsConfig`:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  dnsPolicy: ClusterFirst
+  dnsConfig:
+    options:
+    - name: ndots
+      value: "1"   # names with ≥1 dot skip search-list expansion first
+```
+
+Alternatives/complements: use fully-qualified names with a trailing dot (`example.com.`), deploy NodeLocal DNSCache, or reduce search domains.
+
+---
+
+# Development (20 questions)
+
+**D1 — rebase vs merge**
+Merge integrates two histories with a merge commit — preserves the true history, safe for shared branches. Rebase replays your commits onto a new base — linear, clean history, but **rewrites commit hashes**. Avoid rebasing commits that others may already have (pushed/shared branches, others' PRs based on yours) — it forces everyone to resolve duplicate/conflicting work. Golden rule: rebase private/local or feature-branch-onto-main; merge for shared integration.
+
+**D2 — TCP vs UDP**
+TCP: connection-oriented (3-way handshake), reliable, ordered, flow/congestion control, byte stream — overhead in exchange for guarantees. UDP: connectionless, fire-and-forget datagrams, minimal overhead/latency, no delivery guarantee. TCP: HTTP/S, SSH, SMTP (also FTP, RDP). UDP: DNS, DHCP (also QUIC/HTTP3, RTP/VoIP, NTP).
+
+**D3 — Race condition**
+A race condition occurs when correctness depends on the timing/interleaving of concurrent operations accessing shared state — the "check-then-act" or read-modify-write sequence gets interleaved. Example (Go):
+
+```go
+var counter int
+// 10 goroutines each do: counter++  →  read, increment, write
+// Two goroutines read counter=5 simultaneously, both write 6 → lost update.
+```
+
+Fix with `sync.Mutex` around the increment, or `atomic.AddInt64`. Detect with `go run -race`.
+
+**D4 — Symmetric vs asymmetric encryption, and TLS**
+Symmetric: one shared key both encrypts and decrypts (AES, ChaCha20) — fast, but requires secure key distribution. Asymmetric: keypair, public key encrypts/verifies, private key decrypts/signs (RSA, ECDSA, ECDH) — solves key distribution but is slow. In TLS: the handshake uses asymmetric crypto — the server presents a certificate (signed by a CA), the client validates it, they perform an (EC)DHE key exchange to derive session keys, then all application data is encrypted with **symmetric** ciphers (AES-GCM/ChaCha20). Best of both: asymmetric for authentication/key agreement, symmetric for bulk data.
+
+**D5 — Image layers and caching**
+Each Dockerfile instruction creates a read-only layer stacked via union filesystem; layers are content-addressed and shared/cached across images and builds. A layer is invalidated if any preceding layer changes, so order Dockerfile from least- to most-volatile: copy dependency manifests and install deps first, copy source code last. Bad ordering (`COPY . .` first) busts the cache on every code change and re-runs `npm install`/`pip install`. Also: multi-stage builds to keep the final image slim, combine related RUN commands, pin base image versions.
+
+**D6 — HTTP 503 troubleshooting (in order)**
+1. **Scope & correlation:** which endpoint/service, all instances or one? Correlate with recent deploys, config changes, traffic spikes.
+2. **Application logs/metrics:** exceptions, error rates, traces for the failing requests.
+3. **Health checks:** are backend health checks failing, causing the LB/proxy to mark instances unhealthy (503 = no healthy upstream)?
+4. **Resource exhaustion:** CPU/memory saturation, connection/thread-pool limits, file descriptors, DB connection pool exhaustion.
+5. **Dependencies:** are downstream services/DB/cache timing out or erroring?
+6. **Infrastructure:** k8s events (OOMKilled, restarts, node pressure), HPA at max, LB/WAF rate limiting.
+
+**D7 — CAP theorem**
+In a distributed system, when a network **partition** occurs you can only keep two of: **C**onsistency (every read sees the latest write), **A**vailability (every request gets a response), **P**artition tolerance (system survives partitions). Since partitions are inevitable, the real choice is C vs A *during* a partition. **CP:** etcd, ZooKeeper, HBase — refuse reads/writes on the minority side to preserve consistency. **AP:** Cassandra, DynamoDB, Eureka — keep serving (possibly stale) data on both sides, reconciling later.
+
+**D8 — Horizontal vs vertical scaling**
+Vertical scaling = bigger machine (more CPU/RAM) — simple but capped by hardware and requires downtime. Horizontal scaling = more instances — near-limitless but requires the architecture to support it. Enabling patterns: **stateless services** (state externalized to DB/cache), load balancing, sharding/partitioning, shared-nothing design, work queues, service discovery, replication, consistent hashing, autoscaling.
+
+**D9 — Environment variables**
+An environment variable is a named key/value in a process's environment, inherited by child processes, commonly used for config (paths, credentials, feature flags). Persist on Linux: add `export MY_VAR=value` to `~/.bashrc` (or `~/.zshrc` / `~/.profile`), then `source ~/.bashrc`. System-wide: `/etc/environment` or a file in `/etc/profile.d/`.
+
+**D10 — JSON vs YAML**
+JSON: strict syntax (braces, quotes, commas), machine-oriented, universally parseable. YAML: indentation-based, human-oriented, supports comments, anchors, multi-documents. JSON advantage: unambiguous, fast, safe to parse programmatically. YAML advantage: far more readable/writable by humans (which is why Kubernetes uses it) — though indentation errors and the "Norway problem" (`no` → `false`) are pitfalls.
+
+**D11 — REST API and HTTP methods**
+A REST API exposes resources via HTTP URLs, manipulated with standard methods, typically stateless. **GET** — retrieve a resource; safe and idempotent. **POST** — create a resource or trigger processing; not idempotent (repeats create duplicates). **PUT** — replace a resource entirely at a known URL; idempotent. **DELETE** — remove a resource; idempotent (repeating yields the same end state).
+
+**D12 — Version pinning**
+Version pinning fixes exact dependency versions (lockfiles like `package-lock.json`/`poetry.lock`, pinned Docker base images or digests, pinned apt packages) so every build resolves the same artifacts. Without it, a transitive dependency release can silently change behavior and break builds — non-reproducible builds, hard-to-debug drift, and supply-chain risk. Trade-off: pin for reproducibility, but have a process (Renovate/Dependabot) to apply security updates deliberately.
+
+**D13 — Compiled vs interpreted**
+Compiled languages translate source to machine code ahead of execution: fast runtime, compile-time error checking — e.g., **C, Rust** (also Go, C++). Interpreted languages execute via an interpreter/runtime at run time: rapid iteration, portability, slower execution — e.g., **Python, JavaScript** (also Ruby, PHP). Nuance: Java and Go compile to bytecode/binaries with JIT/runtime elements — the line is blurry.
+
+**D14 — Reverse proxy vs forward proxy**
+A **forward proxy** acts on behalf of *clients* making outbound requests — hides/controls client identity, egress filtering, caching. A **reverse proxy** sits in front of *servers*, handling inbound traffic — clients connect to it, not the backend. Reverse proxy use cases: **Nginx** — TLS termination, static content, load balancing for web apps; **HAProxy** — high-performance TCP/HTTP load balancing; (also Envoy for service meshes, Traefik for container-native ingress).
+
+**D15 — Deadlock and Coffman conditions**
+A deadlock is when two or more processes are blocked forever, each waiting for a resource the other holds. All four **Coffman conditions** must hold simultaneously: (1) **Mutual exclusion** — resources are non-shareable; (2) **Hold and wait** — a process holds some resources while waiting for more; (3) **No preemption** — resources can't be forcibly taken; (4) **Circular wait** — a cycle of processes each waiting on the next. Prevention breaks any one condition — e.g., lock ordering eliminates circular wait.
+
+**D16 — Eventual consistency and Cassandra**
+Eventual consistency means replicas converge to the same value after updates propagate, but reads may return stale data in the interim — availability and low latency are traded for guaranteed-fresh reads. Cassandra (leaderless, Dynamo-style replication) makes consistency **tunable per query**: writes at `ANY/ONE/LOCAL_QUORUM/.../ALL`, reads at `ONE/LOCAL_QUORUM/.../ALL`. Read-after-write consistency: if you write at `ONE` and read at `ONE`, you may hit a stale replica; use `LOCAL_QUORUM` (or `QUORUM`) on both so read and write sets overlap (R+W > RF), or use `SERIAL`/lightweight transactions (Paxos) for linearizable compare-and-set. Repairs (read repair, hinted handoff, anti-entropy) drive convergence.
+
+**D17 — mTLS**
+Mutual TLS extends TLS so **both** parties present certificates. Handshake (TLS 1.2-style, conceptually): (1) client sends ClientHello (supported versions/ciphers, SNI); (2) server responds with its certificate and a **CertificateRequest** (asking for client auth); (3) client validates the server cert against its trusted CA chain + hostname; (4) client sends its own certificate; (5) server validates the client cert chain (and often maps it to an identity); (6) both perform an (EC)DHE key exchange, derive session keys, and exchange Finished messages. Result: encrypted channel + **bidirectional authentication**. Common uses: service meshes (Istio/Linkerd sidecar-to-sidecar), Kubernetes API server client certs, etcd peer/client TLS, zero-trust internal microservice auth, device/IoT identity.
+
+**D18 — Hash table internals**
+A hash table maps keys to array buckets via a hash function (`index = hash(key) % capacity`). **Collisions** (different keys → same bucket) are resolved by:
+- **Chaining:** each bucket holds a linked list/tree of entries; degrades gracefully, tolerates load factor > 1.
+- **Open addressing:** all entries live in the array; on collision, probe for the next slot (linear probing — clustering risk; quadratic; double hashing; Robin Hood). Requires load-factor control and tombstones for deletion.
+
+Average complexity with a good hash and bounded load factor: **O(1)** insert/lookup/delete. Worst case (all keys collide into one bucket): **O(n)**. Resizing/rehashing at a load-factor threshold keeps averages constant. (Java HashMap uses chaining that treeifies at 8+ nodes; Python's dict uses open addressing.)
+
+**D19 — Circuit breaker pattern**
+A circuit breaker wraps calls to a failing dependency and tracks outcomes, preventing a failing service from cascading (thread-pool/connection exhaustion, retry storms) through the system. States: **Closed** — normal operation, failures counted; when the error rate/threshold is exceeded → **Open** — all calls fail fast (fallback/default returned), no time wasted on doomed calls, giving the dependency time to recover; after a cooldown window → **Half-open** — a limited trial request is allowed; success → back to Closed, failure → back to Open. Relation to retries: retries with **exponential backoff + jitter** handle transient errors, but blind retries amplify outages; the breaker bounds retry behavior (fail fast instead of hammering), and retry attempts feed the breaker's failure count. They're complementary layers: backoff spaces out attempts, the breaker stops the attempts entirely when the dependency is down.
+
+**D20 — Optimistic vs pessimistic concurrency control**
+**Pessimistic:** lock the resource *before* modifying it — concurrent access blocks until the lock is released. **Optimistic:** proceed without locks, validate at commit (version check / compare-and-swap); conflicts are detected after the fact and retried. Choose pessimistic for **high contention/hot rows** where retries would thrash and the operation must succeed now; choose optimistic for **low contention, read-heavy** workloads and scale-out systems where lock coordination is the bottleneck.
+
+Examples (Postgres):
+```sql
+-- Pessimistic: lock the rows, transfer is atomic
+BEGIN;
+SELECT balance FROM accounts WHERE id = 1 FOR UPDATE;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+COMMIT;
+
+-- Optimistic: version check (MVCC-style CAS)
+SELECT balance, version FROM accounts WHERE id = 1;
+UPDATE accounts
+   SET balance = balance - 100, version = version + 1
+ WHERE id = 1 AND version = 7;   -- check rows affected; 0 → conflict, retry
+```
+Optimistic maps naturally to MVCC (readers never block writers; Postgres `SERIALIZABLE` uses SSI to abort on conflict); pessimistic maps to explicit locks.

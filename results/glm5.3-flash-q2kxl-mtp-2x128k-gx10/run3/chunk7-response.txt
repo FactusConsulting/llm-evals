@@ -1,0 +1,251 @@
+# Application Architecture
+
+**AA1 — Monolith vs Microservices**
+A monolith is a single deployable unit where all functionality (UI, business logic, data access) lives in one codebase/process. Microservices split the system into independently deployable services, each owning a business capability and its own data.
+Three problems microservices introduce that monoliths don't:
+1. **Distributed data consistency** — no local transactions; you need Sagas/outbox patterns instead of ACID across entities.
+2. **Network as a point of failure** — every call can fail, time out, or be slow; you need retries, circuit breakers, timeouts, and latency budgets.
+3. **Operational complexity** — N services means N pipelines, N runtimes, distributed logging/tracing, versioning, and orchestration infrastructure (Kubernetes, service mesh) that a monolith never needs.
+
+**AA2 — Synchronous vs Asynchronous Communication**
+- **Synchronous**: the caller blocks (or holds a request thread) until the callee responds. The caller and callee must both be up at the same moment. Example: REST over HTTP or gRPC.
+- **Asynchronous**: the sender doesn't wait; work is handed off via messages/events, decoupling the parties in time. Example: Kafka (event streaming) or RabbitMQ (message queues). HTTP can also be used asynchronously (fire-and-forget, webhooks), but the canonical examples are message brokers.
+
+**AA3 — API Gateway vs Reverse Proxy**
+A **reverse proxy** (nginx, HAProxy) is a generic L7 traffic component: TLS termination, load balancing, caching, compression, static content, header rewriting. An **API Gateway** (Kong, Apigee, Azure API Management) adds API-specific concerns: authentication/authorization (API keys, OAuth/OIDC), rate limiting and quotas, request/response transformation, versioning, developer portal, per-consumer analytics.
+Can a gateway replace a reverse proxy? **Functionally, mostly yes** — gateways route HTTP too. But: (1) reverse proxies are optimized for raw throughput and general web traffic, while gateways add per-request policy evaluation latency; (2) gateways are overkill/expensive for non-API traffic (static sites, marketing pages); (3) many organizations deliberately layer: LB → reverse proxy/ingress → gateway for API routes only. Best practice is often both, each doing what it's good at.
+
+**AA4 — Saga Pattern**
+A Saga implements a distributed transaction as a **sequence of local transactions**, each with a **compensating action**. If step N fails, previously completed steps are compensated in reverse order (e.g., "reserve inventory" compensated by "release inventory").
+- **Choreography**: services publish events and react to each other's events; no central coordinator. Appropriate for simple flows with few participants (2–4 steps); low coupling, but the flow logic is scattered and hard to see.
+- **Orchestration**: a central coordinator (e.g., Temporal, Camunda, a saga orchestrator service) commands each step and handles compensation. Appropriate for complex, long-running, or regulated flows where you need visibility, centralized retry/timeout logic, and easier change management. Trade-off: the orchestrator is a critical component (must be HA) and risks becoming a god-service.
+
+**AA5 — CQRS + Event Sourcing**
+**CQRS** separates the write model (commands, optimized for business rules) from the read model (queries, optimized for display — denormalized views, caches, search indexes). **Event Sourcing** stores state as an append-only log of domain events; current state is derived by replaying events.
+They pair naturally because events are the perfect input for building read-model projections: an event published by the write side updates one or more read models asynchronously.
+What it solves that CRUD doesn't: (1) independent scaling and optimization of reads vs writes; (2) a full audit/history for free (the event log *is* the history); (3) the ability to build new read models/projections retroactively by replaying events; (4) write models can model complex invariants without being dragged down by query-shaped schemas. Cost: eventual consistency in read models, more infrastructure, and harder debugging — don't use it by default.
+
+**AA6 — Circuit Breaker**
+A Circuit Breaker prevents cascading failure by tracking failures against a downstream and **failing fast** once the error rate is too high. Three states:
+- **Closed**: normal operation; failures are counted.
+- **Open**: threshold exceeded; calls fail immediately without hitting the dependency, giving it time to recover.
+- **Half-Open**: after a cooldown, a limited number of trial requests are let through; success closes the breaker, failure reopens it.
+Difference from retry: retries handle **transient** failures on individual calls (with backoff/jitter); a breaker handles **systemic** outages by stopping the retry storm entirely. Use both together: wrap retryable calls in retries, and have the breaker trip when retries are exhausting themselves — otherwise retries against a dead service amplify the outage.
+
+**AA7 — Multi-Tenant Isolation Models**
+1. **Shared DB, shared schema (tenant ID column)**: *Cheapest* (one DB, one schema, easy migrations). *Weakest isolation* — a missing WHERE clause leaks data; requires row-level security (e.g., Postgres RLS) and rigorous query discipline. *Highest noisy-neighbor risk* — one tenant's heavy query starves everyone. Operationally simple. Best for high tenant counts with low per-tenant cost.
+2. **Shared DB, schema per tenant**: Better isolation and per-tenant backup/restore; moderate noisy-neighbor containment (can prioritize schemas/connections). *Operational complexity explodes at scale*: thousands of schemas make migrations slow and risky, connection pooling is harder, and cross-tenant analytics is painful. Practical up to hundreds of tenants, not thousands.
+3. **Separate DB per tenant**: *Strongest isolation* (security, compliance, per-tenant SLAs, restore a single tenant's data). *Highest cost* (compute, connection limits) and most operational overhead (fleet management, per-tenant migrations, connection pooling via proxies like PgBouncer). Noisy-neighbor risk lowest. Best for few, large, compliance-sensitive enterprise tenants.
+Real-world answer: **tiered model** — most tenants on shared schema, premium tenants on dedicated DBs.
+
+**AA8 — Consistency for "Never Oversell"**
+**Eventual consistency** allows replicas to temporarily diverge; **strong consistency** guarantees all reads reflect the latest committed write (linearizability). For inventory, eventual consistency risks overselling, so use **strong consistency on the stock counter**:
+- **Data store**: a single-leader relational database (Postgres/SQL Server) with **serializable** isolation, or a consensus-based distributed SQL store (CockroachDB, Spanner-style) if it must span regions.
+- **Pattern**: never do read-then-write. Use an **atomic conditional update**: `UPDATE stock SET qty = qty - 1 WHERE sku = ? AND qty >= 1` — check rows affected; if 0, reject. This is race-free and idempotent-friendly.
+- **Scale**: partition/shard by SKU so hot products get dedicated leaders; queue writes per SKU to serialize them; add a short-lived **reservation** (hold stock during checkout with TTL) instead of holding locks across a payment call; use **idempotency keys** so payment retries don't double-decrement.
+- Accept eventual consistency only for non-authoritative views (search, recommendations, "X people looking" counters).
+
+**AA9 — Sidecar Proxy / Service Mesh**
+A **sidecar** is a proxy deployed alongside each service instance (same pod/VM), intercepting all inbound/outbound traffic. In **Istio**, Envoy sidecars are injected per pod; iptables rules redirect traffic through them. Envoy enforces routing, retries, timeouts, mTLS, and telemetry transparently.
+- **Data plane**: the Envoy sidecars actually forwarding traffic and enforcing policy.
+- **Control plane**: **istiod** — configures sidecars via xDS (discovery of services, routes, policies) and issues/rotates workload certificates.
+mTLS between sidecars gives you: **workload identity** (each service gets a short-lived cert tied to its service account, rotated automatically), **mutual authentication** (the server knows *who called it* — app-level TLS typically only encrypts and authenticates the server), uniform encryption for legacy apps that can't be modified, and defense against compromised pods spoofing other services. Application-level TLS alone doesn't solve identity, cert rotation, or consistent policy across a polyglot estate.
+
+**AA10 — Strangler Fig Migration (.NET Framework → .NET 8)**
+The Strangler Fig pattern incrementally replaces a system by routing functionality to new implementations until the old one is strangled and removed.
+Concrete strategy:
+1. Put a **routing facade** (YARP reverse proxy, or nginx) in front of the monolith; all traffic enters through it.
+2. Identify a **bounded context** with low coupling (e.g., notifications or reporting) and build it as a .NET 8 service with its own schema.
+3. Route `/api/notifications/*` at the proxy to the new service; everything else still hits the monolith.
+4. Handle the **shared database**: either the new service reads via a view/ACL over the legacy DB, or use the **change-data-capture/sync** pattern (Debezium or SQL Server CDC) to populate the new service's store, with dual-write during cutover.
+5. Verify with shadow traffic/canary, then **delete the old code** from the monolith — the deletion step is what makes strangling work.
+6. Repeat per bounded context; retire the monolith last (or leave a thin shell).
+Key supporting patterns: Branch by Abstraction, Anti-Corruption Layer around the legacy model, parallel-run verification.
+
+**AA11 — 12-Factor App**
+A methodology for cloud-native apps. Key factors:
+1. **Codebase** — one repo per deployable, tracked in VCS; enables CI/CD per service.
+2. **Config** — store config in environment, not code; same artifact promotes dev→prod.
+3. **Dependencies** — explicitly declare (lockfiles); reproducible builds.
+4. **Backing services** — DB, queue, cache attached as resources via URLs/credentials; swappable without code change.
+5. **Build/Release/Run** — strict separation; immutable releases with unique IDs; enables rollback.
+6. **Processes** — stateless, share-nothing; state goes to backing services; enables horizontal scaling.
+7. **Port binding** — self-contained services listening on a port (no app-server packaging); container-friendly.
+8. **Disposability** — fast startup and graceful shutdown; enables scaling, deploys, and crash recovery.
+9. **Dev/Prod parity** — similar environments reduce "works on my machine."
+10. **Logs** — treat as event streams to stdout; the platform handles routing/aggregation.
+These matter because cloud platforms schedule, move, and kill instances constantly — only apps built this way scale and recover automatically.
+
+**AA12 — Event-Driven (Kafka) vs Request-Driven (REST/gRPC)**
+- **Coupling**: REST is temporally coupled — consumer must be up when producer calls. Kafka decouples in time; producers/consumers evolve independently. But Kafka couples participants to a shared **schema/topic contract**.
+- **Scalability**: Kafka partitions enable massive parallel consumption and replay; consumers scale independently. REST scales by adding instances but the caller bears load spikes.
+- **Debugging**: REST is easy — one request/response, immediate errors. Event-driven is hard: flows span async hops, state is eventual, "where did this event come from?" requires tracing and schema registries.
+- **Ordering**: REST preserves per-connection order naturally. Kafka guarantees order **only within a partition** (and only per producer/key); global ordering is not provided.
+- **Failure handling**: REST returns errors synchronously — caller decides. Kafka consumers need retry topics, dead-letter queues, poison-pill handling, and **idempotent consumers** (at-least-once delivery).
+Choose **Kafka** for high-throughput event distribution, audit/analytics pipelines, decoupled workflows, and replay needs. Choose **REST/gRPC** for synchronous user-facing interactions, strong consistency, and simple request/response semantics. Most systems use both.
+
+**AA13 — Load Balancing, L4 vs L7**
+A load balancer distributes traffic across backend servers for scalability and fault tolerance. **Layer 4** (transport) routes on IP address/port/connection — fast, no content inspection. **Layer 7** (application) inspects HTTP: paths, headers, cookies — enabling content-based routing, session affinity via cookies, and header rewriting.
+L7 required example: routing `/api/orders/*` to the orders service and `/api/payments/*` to the payments service on the same VIP (path-based routing) — impossible at L4.
+
+**AA14 — Message Queue vs Log-Based Broker**
+A **message queue** (RabbitMQ): messages are consumed and **deleted** once acknowledged; supports point-to-point work distribution, complex routing (exchanges), per-message acks. A **log-based broker** (Kafka): an append-only, partitioned, retained log; consumers track their own **offsets**, can **replay** history, and multiple independent consumer groups can read the same data.
+Pick a **queue** for work distribution (jobs, tasks), complex routing, per-message semantics, and when messages are transient. Pick **Kafka** for event streaming, high throughput, event sourcing, fan-out to many consumers, and when you need replay/retention. Queues delete; logs remember.
+
+**AA15 — Container vs VM**
+A VM virtualizes hardware: a hypervisor runs a full guest OS per VM — strong isolation but heavy (GBs, minutes to boot). A container is **OS-level virtualization**: processes share the host kernel, isolated via namespaces (PID, network, mount) and limited by cgroups — image sizes of MBs, millisecond startup, high density.
+Containers are popular for microservices because each service can be packaged with exactly its dependencies, started/stopped/scaled in seconds, and runs identically on any host — a perfect fit for immutable, horizontally scaled deployments.
+
+**AA16 — Stateless vs Stateful**
+**Stateless** services keep no client state in the instance — any request can hit any replica (state lives in the request or an external store). **Stateful** services hold data locally (databases, caches, brokers).
+Stateless services scale horizontally trivially: add replicas behind a load balancer, no data migration, kill/schedule freely (great for autoscaling and Kubernetes). Stateful services need replication, sharding, and careful data placement.
+Examples: stateless — a REST API service or image resizer; stateful — PostgreSQL, Redis, Kafka broker.
+
+**AA17 — ORM**
+An ORM maps database tables to application objects and translates object operations into SQL. Examples: **Hibernate** (Java), **Entity Framework Core** (.NET), SQLAlchemy (Python), GORM (Go).
+Trade-offs: ORMs give productivity, type safety, DB-portability, and automatic protection from SQL injection; but they add the **N+1 query problem**, leaky abstractions (the generated SQL surprises you), impedance mismatch for complex queries, and can hide performance costs. Raw SQL gives full control, optimal queries, and access to DB-specific features, at the cost of boilerplate and manual mapping. Pragmatic rule: ORM for routine CRUD, raw/hand-tuned SQL for complex or hot-path queries.
+
+**AA18 — Bulkhead Pattern**
+Bulkheads isolate resources so a failure in one compartment doesn't sink the ship. In microservices, this means **partitioning pools of resources per dependency or workload**:
+- **Thread pools**: give calls to Service A and Service B separate thread pools (Hystrix-style). If B hangs and exhausts its pool, A's calls still proceed.
+- **Connection pools**: separate DB connection pools per tenant class or per downstream.
+- **Deployment groups**: separate node pools/deployments for CPU-bound vs IO-bound workloads, or per-tenant-tier clusters, so a memory-hungry batch job can't evict latency-critical API pods.
+Example: in Kubernetes, run the report-generation service in its own deployment with its own resource limits and node pool, so a 10-minute report can never starve the checkout API.
+
+**AA19 — OT vs CRDT for Collaborative Editing**
+- **Operational Transformation**: edits are operations (insert/delete at position) that are **transformed** against concurrent operations so all replicas converge. Guarantees: with correct transformation properties (TP2), strong convergence; typically deployed with a **central authoritative server** (Google Docs), which simplifies consistency but adds round-trip latency for every edit and makes offline editing very hard. Correct OT is notoriously difficult to implement (the TP2 proof problem).
+- **CRDTs**: data structures whose operations **commute/merge** deterministically without coordination (e.g., sequence CRDTs like RGA/LSEQ used by Yjs, Automerge). Guarantees: strong **eventual** convergence, no central server required; supports peer-to-peer and offline editing naturally. Costs: higher metadata/memory overhead, tombstones, harder garbage collection, and slightly larger payloads.
+**Choice for offline editing: CRDT.** Offline means no central authority is available to serialize and transform operations; CRDTs merge concurrent edits deterministically when connectivity returns, without conflicts or a coordinator. OT fundamentally assumes a server-mediated session.
+
+**AA20 — Distributed Tracing in Polyglot Microservices**
+- **Context propagation**: standards diverge — **W3C Trace Context** (`traceparent`/`tracestate` headers, the modern standard) vs **B3** (`X-B3-TraceId` etc., Zipkin's legacy). In a polyglot estate, every language's instrumentation must emit and propagate the same headers, or traces break at language boundaries. Standardize on W3C; configure compatibility/propagators for legacy B3.
+- **Sampling**: **head-based** decides at trace start (cheap, predictable cost, but may drop the one interesting slow trace). **Tail-based** buffers the whole trace and decides at the end — you can keep 100% of errors and p99-slow traces while sampling the rest; costs memory/latency at the collector. Common strategy: tail-based with error/latency rules + low-rate baseline.
+- **Storage/querying**: **Jaeger** stores spans and supports rich search by service/tags; **Tempo** (Grafana) uses cheap object storage and trace-ID-first lookup, pairing with metrics/logs (exemplars) to find trace IDs. Choose based on query patterns: ad-hoc search → Jaeger; huge volume, trace-ID-driven → Tempo.
+- **Async messaging**: a request that produces a Kafka message and continues isn't "waiting" on the consumer — the consumer's work happens later, possibly on another trace. Use **links** (`follows_from`-style) rather than child spans, and produce **produce/consume spans** around the broker.
+- **Trace continuity through Kafka**: inject the trace context into **Kafka message headers** at the producer (OpenTelemetry instrumentation for kafka-clients does this), extract it at the consumer, and create the consumer span linked to the producer span. Without header propagation, the trace dies at the broker — this is the #1 continuity gap in event-driven systems.
+
+---
+
+# On-Premise Infrastructure Architecture
+
+**OP1 — Hypervisor Types**
+- **Type 1 (bare-metal)**: runs directly on hardware; the OS *is* the hypervisor. Lower overhead, the enterprise standard. Examples: **VMware ESXi, Microsoft Hyper-V, KVM (Proxmox VE), Xen**.
+- **Type 2 (hosted)**: runs atop a general-purpose OS as an application. Easier for desktops/testing. Examples: **VMware Workstation, Oracle VirtualBox, Parallels Desktop**.
+
+**OP2 — SAN vs NAS**
+- **SAN** provides **block** storage (LUNs — disks appear locally attached). Protocols: **FC (Fibre Channel), iSCSI, FCoE**. Use for databases, VM clusters (shared storage for live migration), and anything needing low-latency block I/O and filesystem control by the host.
+- **NAS** provides **file** storage over the network. Protocols: **NFS, SMB/CIFS**. Use for file shares, home directories, media, backups, and general-purpose storage with simpler management.
+Rule of thumb: transactional/latency-sensitive workloads → SAN; shared files and simplicity → NAS.
+
+**OP3 — 3-Tier vs Leaf-Spine**
+Traditional **core/distribution/access** is a campus design: traffic funnels up through distribution to core; paths have variable hop counts; classic reliance on STP creates blocked links. **Leaf-spine** is a 2-tier fabric where every leaf connects to every spine in a full mesh with **ECMP**: any leaf-to-leaf path is exactly leaf→spine→leaf — uniform, predictable latency and bandwidth. It solves: (1) east-west traffic bottlenecks (virtualization, storage replication, microservices chatter) that 3-tier handles poorly; (2) unpredictable latency paths; (3) scale-out — add spines for bandwidth, leaves for ports, without redesign; (4) eliminates STP by routing at L3 in the fabric.
+
+**OP4 — HA Proxmox Cluster with Shared Storage**
+- **Nodes**: minimum 3 (odd number) for quorum; 2 nodes require a **QDevice** (or external quorum device) as a tiebreaker.
+- **Quorum**: Corosync maintains membership; a node without majority is fenced/read-only for cluster operations — prevents split-brain.
+- **Fencing**: Proxmox uses **self-fencing via watchdog** (each node must periodically confirm quorum or the watchdog reboots it) plus optional external fence agents (IPMI/PDU). A node suspected dead is power-cycled before its VMs are restarted elsewhere.
+- **Shared storage**: **Ceph (RBD)** is the gold standard — replicated across nodes, so live migration needs no storage copy and VM disks survive node loss. **iSCSI** shared LUN works but the SAN is a SPOF unless dual-headed. **NFS** is simplest but the NFS server is a single point of failure and slower for VM disks.
+- **Node failure sequence**: Corosync detects failure (~seconds), HA manager waits for the watchdog to confirm the node is truly fenced, then starts the HA-flagged VMs on remaining nodes. Expect roughly 1–2+ minutes of downtime for affected VMs; non-HA VMs on the dead node stay down until manually recovered.
+
+**OP5 — VLAN Trunking / 802.1Q**
+A **trunk** carries multiple VLANs over one link. **802.1Q** inserts a 4-byte tag into the Ethernet frame carrying the VLAN ID (1–4094); untagged frames belong to the port's **native VLAN**.
+Single NIC on 3 VLANs: configure the switch port as a **trunk** allowing the three VLANs, then on Linux create 802.1Q subinterfaces:
+```
+ip link add link eth0 name eth0.10 type vlan id 10
+ip link add link eth0 name eth0.20 type vlan id 20
+ip link add link eth0 name eth0.30 type vlan id 30
+```
+(Or persist via `/etc/network/interfaces` `vlan-raw-device`, systemd-networkd `.netdev` files, or nmcli.) Each subinterface gets its own IP/subnet; the switch side must match the allowed VLAN list.
+
+**OP6 — RAID Levels for a 6-Drive Database Server**
+- **RAID 1**: mirror, 2 drives, 50% capacity, survives 1 drive, simple.
+- **RAID 5**: stripe + single parity, needs 3+, survives 1 drive, write penalty, rebuild of large drives is slow and risky (UARE — URE during rebuild).
+- **RAID 6**: double parity, survives 2 drives, heavier write penalty.
+- **RAID 10**: striped mirrors, 50% capacity, high random IOPS, fast rebuilds, can lose multiple drives if they're in different mirrors.
+- **RAID Z2**: ZFS double-parity (RAID6-like) with checksums, self-healing, no write hole; great capacity, but parity writes and rebuilds (reslivers) are slower than mirrors.
+**Choice: RAID 10** on the 6 drives. Databases are random-I/O heavy and parity-based levels impose a write penalty on every transaction; RAID 10 gives the best IOPS, near-instant rebuilds (copy from mirror), and tolerance for multiple drive failures. Choose RAID Z2 only if capacity per drive matters more than IOPS and you're committed to ZFS (with SLOG for sync writes). Keep a hot spare regardless.
+
+**OP7 — Enterprise DNS Architecture (500 users)**
+- **Internal/AD DNS**: AD requires DNS — domain controllers host the AD domain with SRV records. Clients get these via DHCP. Run at least two DC/DNS servers per site.
+- **External authoritative**: public-facing zone hosted on external providers or DMZ-resilient servers, **DNSSEC-signed** (KSK/ZSK key management, scheduled rollovers, publish DS at registrar).
+- **Split-horizon**: same zone name resolves differently — internal DNS answers private IPs, external answers public IPs. Alternatively use an internal-only subdomain to avoid split-brain confusion.
+- **Resolvers/forwarders**: internal DNS servers forward internet queries to public resolvers (or root-hint recursion); **conditional forwarders** route `corp.example.com` to AD DNS and DMZ zones to DMZ resolvers. DMZ hosts should use DMZ-specific resolvers — never let the DMZ query internal DNS directly.
+- **Laptop office→VPN**: on the office network, DHCP hands out internal DNS; internal names resolve directly, external names via forwarders. On VPN, the VPN client pushes DNS settings — Windows uses **NRPT** (Name Resolution Policy Table) or split DNS so internal suffixes go through the tunnel while internet names go local. Failure modes to design for: cached answers pointing at private IPs after disconnect, VPN clients bypassing corporate DNS for public names, and DNSSEC validation chains that must work on both paths.
+
+**OP8 — Internal PKI Chain of Trust**
+- **Root CA**: self-signed apex of trust; kept **offline** (powered down, key in HSM or on removable media in a safe). It only signs subordinate CA certificates and CRLs.
+- **Subordinate/issuing CA**: online, issues end-entity certificates; compromise is recoverable because the root can revoke it.
+- **Revocation**: **CRL** — signed full list of revoked certs, published periodically (fast to distribute, potentially stale); **OCSP** — real-time per-cert status via responder; **OCSP stapling** lets servers present fresh status themselves. Publish CRL/AIA URLs on an always-available internal endpoint.
+- **Templates**: AD CS certificate templates define key size, key usage, EKU, validity, and enrollment permissions (e.g., "Web Server," "User," "Domain Controller").
+- **Auto-enrollment**: GPO + auto-enrollment lets domain members and users obtain/renew certificates from templates without manual requests.
+- **Compromise consequences**: a **compromised subordinate** — revoke it, reissue certs from a new subordinate; root still trusted, contained blast radius. A **compromised root** — catastrophic: everything it signed is untrustworthy, every trust store must be updated, effectively a full PKI rebuild. This is why the root stays offline and air-gapped.
+
+**OP9 — WAN Options for Hub-and-Spoke**
+- **MPLS**: carrier-managed private network; excellent reliability, SLA-backed latency, QoS support; expensive per site; slow to change.
+- **IPsec VPN over internet**: cheapest; latency and reliability are best-effort (subject to broadband); moderate management; strong crypto but no path control.
+- **SD-WAN**: aggregates multiple links (broadband + MPLS/LTE), **application-aware path selection** (steers VoIP to the best path in real time), central management, good security (integrated segmentation/encryption); moderate cost; the modern default.
+- **WireGuard mesh**: very cheap, modern cryptography, simple config, excellent performance; but self-managed, no SLA, no built-in application routing/QoS — best as an overlay for tech-capable teams or point solutions.
+**Recommendation for 50 users/site with VoIP**: **SD-WAN** — ideally with one MPLS circuit at the hub and broadband/LTE at spokes. SD-WAN's per-application path steering keeps VoIP on the lowest-jitter link, central policy management scales to many small sites, and cost is far below full MPLS. Pure MPLS is overkill at 50 users/site; pure VPN lacks the QoS/path control VoIP needs.
+
+**OP10 — iDRAC/iLO/IPMI (BMC)**
+These are **out-of-band management** controllers (Dell iDRAC, HPE iLO, generic IPMI): dedicated embedded computers with their own NIC, providing remote KVM console, virtual media, power control, and hardware telemetry **independent of the OS**.
+Critical because: when the OS is dead, the network config is broken, or the machine is powered off, you can still console in, mount ISOs, and power-cycle — the foundation of lights-out datacenter operations.
+If exposed to the internet: BMCs are notorious for default credentials, unpatched CVEs, and firmware backdoors — exposure means hands-on-keyboard access to your servers (often used for ransomware persistence). Isolate BMCs on a dedicated management VLAN, access only via VPN/jump host, enforce MFA, unique credentials, and firmware updates.
+
+**OP11 — LVM vs LVM-Thin vs ZFS**
+- **LVM**: classic volume manager on block devices (linear/striped/mirror). Snapshots are **copy-on-write with preallocated space** — cheap but degrade as the snapshot fills; fixed-size.
+- **LVM-Thin**: thin-provisioned pool; volumes and snapshots allocate on demand — cheap snapshots, overprovisioning, but requires monitoring (a full thin pool causes IO errors).
+- **ZFS**: filesystem + volume manager + CoW everywhere; **transactional snapshots** (consistent, cheap, unlimited), checksums with self-healing on redundant pools, compression, `zfs send/recv` replication, RAIDZ.
+Use **LVM** for simple block devices (VM disks, straightforward setups); **LVM-Thin** for overprovisioned VM disk images (common on Proxmox); **ZFS** when you need integrity checking, frequent snapshots, replication, or are building NAS/Ceph nodes.
+
+**OP12 — Surviving Site Failure with Ceph / Proxmox**
+A 3-node single-site cluster dies with the site. Options:
+- **Stretch cluster (2 sites + tiebreaker)**: CRUSH rules place one replica per site plus a witness/tiebreaker. Monitors must be spread — e.g., 1+1+1 across three locations (or 2 at site A, 1 arbiter at site B). Inter-site **latency must be low**: Ceph stretch guidance is roughly **≤10 ms RTT** (ideally ~5 ms) with high bandwidth, because every write waits for the remote replica.
+- **CRUSH rules**: define site-aware placement (e.g., `replicas_per_site`) so a full site loss still leaves a healthy copy.
+- **Split-brain**: if the inter-site link fails, each side may believe it's authoritative. With only 2 sites and no tiebreaker, **neither side can achieve quorum** — writes must stop (availability lost) or you risk divergent data. This is why **2-site Ceph without a tiebreaker is a bad idea**: you sacrifice either availability or consistency. Always add a third witness location (tiny — monitors/arbiter only) or use a QDevice-style arbiter.
+- **Pragmatic alternative**: **async DR** — RBD mirroring (or snapshot schedules) replicating to a second site. RPO = replication lag (minutes), RTO = manual failover time. Far more tolerant of distance/latency than a stretch cluster; often the right answer when sites are far apart.
+
+**OP13 — DHCP / DORA / Lease Expiry**
+DHCP assigns IPs via **DORA**: **D**iscover (client broadcasts), **O**ffer (server proposes IP/options), **R**equest (client formally requests the offered lease), **A**cknowledge (server confirms and commits the lease).
+When the DHCP server is unavailable: a Windows client tries to renew at **T1 (50% of lease)**, then rebinds at **T2 (87.5%)**. If the lease expires unrenewed, the client **loses its IP** and self-assigns an **APIPA** address (169.254.0.0/16) — link-local only, no gateway, no DNS, no off-subnet communication. It continues broadcasting Discover in the background and will reconfigure if a server reappears.
+
+**OP14 — Managed vs Unmanaged Switches**
+An **unmanaged** switch forwards frames with zero configuration — fine for a closet at home. A **managed** switch adds the features enterprises require: **VLANs and trunking**, STP/RSTP (loop protection), **LACP** bonding, **SNMP/telemetry**, port mirroring (for IDS/packet capture), **802.1X** port authentication, DHCP snooping/dynamic ARP inspection, ACLs, QoS, and remote (SSH/HTTPS) management. Without VLANs, monitoring, and authentication, an enterprise network is unmanageable and unsecurable — managed switches are non-negotiable.
+
+**OP15 — NTP and Clock Drift**
+NTP synchronizes clocks against authoritative sources (stratum hierarchy from GPS/radio-backed stratum-0 references). Accurate time is critical on-prem because: **Kerberos/AD** tolerates only ~5 minutes of skew (auth fails beyond it), TLS certificate validity windows break, log correlation across servers becomes impossible, database replication and distributed transactions can conflict, and cluster membership/heartbeat logic misjudges liveness.
+Clock drift in a cluster causes: authentication failures, duplicate/out-of-order events, split-brain detection errors, corrupted replication decisions, and monitoring alerts that fire in the wrong order. Every server should sync to internal NTP sources (which themselves sync to trusted upstreams) — never let each host wander to arbitrary internet sources.
+
+**OP16 — Physical vs VM vs Container**
+A **physical server** runs the OS directly on hardware — full resources, no hypervisor overhead, strongest isolation. A **VM** virtualizes hardware on a hypervisor — isolation and consolidation at the cost of a guest OS. A **container** shares the host kernel — lightest, fastest, weakest isolation.
+Run on **bare metal** when: hypervisor latency/overhead is unacceptable (HPC, DPDK/network functions, ultra-low-latency trading), you need direct NVMe/GPU passthrough without virtualization layers, licensing forbids virtualization, or the workload is a hypervisor/database node itself (ESXi, Ceph, Proxmox hosts are typically bare metal).
+
+**OP17 — UPS vs Generator vs ATS**
+A **UPS** (battery/flywheel) provides seconds-to-minutes of conditioned power — it bridges the gap and rides through short sags/outages. A **generator** provides minutes-to-days of fuel-based power for extended outages but takes time to start and stabilize. You need **both**: the UPS carries the load instantly while the generator starts; the generator sustains the outage beyond battery runtime.
+The **ATS (Automatic Transfer Switch)** detects utility failure, signals the generator to start, transfers the load when the generator is stable, and transfers back to utility when it returns — with the UPS absorbing every transition.
+
+**OP18 — Active-Passive vs Active-Active; PostgreSQL HA with Pacemaker/Corosync**
+**Active-passive**: one node serves; standby idles and takes over on failure (simpler, wasted capacity, failover downtime). **Active-active**: all nodes serve traffic simultaneously (full utilization, near-zero failover, but requires multi-master or load-balanced state — much more complex).
+For a PostgreSQL pair, implement **active-passive**:
+1. **Replication**: streaming replication from primary to standby (sync mode if zero-data-loss is required; async if you accept a small RPO).
+2. **Pacemaker/Corosync**: Corosync provides membership/quorum; Pacemaker manages resources — the PostgreSQL OCF resource agent (monitors replication, promotes the standby on failover), a **VIP** resource that moves with the primary, and **STONITH fencing** (IPMI/PDU agent) that power-cycles the failed node before promotion — fencing is mandatory to prevent two primaries and data corruption.
+3. **Failover behavior**: failure detected → failed node fenced → standby promoted → VIP reassigned → clients reconnect. Total downtime is typically seconds to a minute.
+4. **Two-node caveat**: with only 2 nodes, add a **QDevice** (or arbiter) for quorum, otherwise a network partition risks split-brain.
+
+**OP19 — Backup & Recovery Strategy (50 servers)**
+- **3-2-1 rule**: 3 copies of data, on 2 different media, 1 offsite. (Add "0 errors" via verification and "1 immutable/offline" for ransomware — the 3-2-1-1-0 model.)
+- **RPO/RTO**: define per system first — RPO (acceptable data loss) dictates backup frequency/replication; RTO (acceptable downtime) dictates restore speed and DR capability. A database may need RPO 15 min/RTO 1 h; a file share RPO 24 h/RTO 1 day.
+- **Backup types**: **full** (everything — slow, simple restore), **incremental** (changes since last backup of any type — fastest, long restore chains), **differential** (changes since last full — middle ground, restore = full + latest differential). Modern approach: full + incrementals forever with synthetic fulls.
+- **Deduplication**: target-side (appliance) or source-side; cuts storage and offsite transfer dramatically.
+- **Media**: **tape** — cheap per TB, offline/air-gapped (ransomware-proof), durable, but slow random access; **disk** — fast restores, but always-online (attackable); **cloud offsite** — true offsite copy, immutable buckets (Object Lock), but egress/restore costs and bandwidth planning.
+- **Immutability**: object-lock/WORM buckets, offline tapes, separate credentials/MFA on the backup server — assume the attacker gets domain admin.
+- **Test restores**: schedule automated restore drills (restore a VM/file/DB monthly, verify application consistency), run a full DR exercise annually. An untested backup is a hope, not a plan.
+- **Backup vs DR**: backup protects **data** (restore files/DBs after deletion or corruption); **disaster recovery** restores **service/infrastructure** (a whole site or platform) within RTO — requiring runbooks, alternate capacity, replication or restored backups onto new hardware, and DNS/network cutover. DR uses backups but is much bigger: backups answer "can I get my data back?"; DR answers "can my business keep running?"
+
+**OP20 — 802.1X Port-Based Access Control**
+- **Roles**: the **supplicant** is the client requesting access; the **authenticator** (switch/AP) mediates the port; the **authentication server** (RADIUS — Cisco ISE, NPS, FreeRADIUS) validates credentials and returns policy.
+- **Flow**: port is in "unauthorized" state; only EAPOL traffic allowed → authenticator relays EAP to RADIUS → on success, RADIUS returns Access-Accept (+ attributes) → port opens.
+- **EAP methods**: **EAP-TLS** — mutual certificate authentication, strongest (client + server certs), requires PKI and device cert deployment; **PEAP** (PEAP-MSCHAPv2) — server cert only, inner password auth tunneled inside TLS; easier to deploy but password-based.
+- **RADIUS & dynamic VLAN**: RADIUS returns `Tunnel-Type`/`Tunnel-Private-Group-ID` attributes; the switch assigns the port to that VLAN dynamically — e.g., staff → corporate VLAN, contractors → guest VLAN.
+- **Failed authentication**: the port stays unauthorized (traffic blocked) or is dropped into a **quarantine/remediation VLAN** with limited access (patching, captive portal).
+- **MAB (MAC Authentication Bypass)**: for devices without supplicants (printers, IoT, cameras). The switch waits briefly for 802.1X; if none starts, it forwards the device's **MAC address** to RADIUS, which looks it up and returns a VLAN. Weaker security — MACs are spoofable — so MAB is a fallback, ordered after 802.1X (802.1X → MAB), ideally paired with DHCP fingerprinting/profiling for assurance.
