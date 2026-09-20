@@ -182,6 +182,14 @@ def main() -> int:
     print(f"\n{correct}/{len(records)} = {summary['percentage']}%"
           f"   errors={errors} truncated={truncated}"
           f"   {summary['wall_seconds']}s")
+    if truncated:
+        # A truncated generation has no "Answer:" line, so it scores zero. On a
+        # thinking model that is a budget problem, not a wrong answer: the hard
+        # suite's per-case budget is 4096, which GLM-5.3-Flash can spend entirely
+        # on reasoning. Do not compare a run with truncations against one without.
+        print(f"  WARNING: {truncated} of {len(records)} generations hit the token "
+              f"limit and scored zero.\n"
+              f"  Re-run with --max-tokens 16000 (or higher) before using this number.")
     for s, v in summary["by_source"].items():
         print(f"  {s:<26} {v['ok']:>3}/{v['n']:<3} {v['pct']:>5.1f}%")
     print(f"-> {outdir}/results.json")

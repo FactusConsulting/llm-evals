@@ -41,6 +41,11 @@ the subsets are small enough that a few cases swing a percentage point.
 `--source 'GPQA Diamond'` and `--limit N` narrow a run; `--suite hard-smoke` is
 the 12-case check that the endpoint and the harness still work.
 
+**For a thinking model, pass `--max-tokens 16000`.** The hard suite's per-case
+budget is 4096, which GLM-5.3-Flash can spend entirely on reasoning; it then
+emits no `Answer:` line and scores zero. The runner warns when any generation
+hits the limit — a run with truncations is not comparable to one without.
+
 ## Why cases.json is not committed
 
 `cases.json` holds the answer keys. Committing it would put benchmark answers in
