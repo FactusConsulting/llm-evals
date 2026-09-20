@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import time
+import uuid
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -23,6 +24,26 @@ import grade  # noqa: E402
 
 SYSTEM_PROMPT = ("You are solving a hard benchmark question. Reason carefully. "
                  "The final answer must follow the requested format exactly.")
+
+
+def system_prompt() -> str:
+    """ds4's system prompt plus a per-request nonce.
+
+    Without it every case sends a byte-identical system prompt, llama-server
+    picks a slot by longest-common-prefix similarity and restores that slot's KV
+    state. The server logs the moment it happens:
+
+        selected slot by LCP similarity, f_sim_best = 1.000 (> 0.100 thold)
+
+    The restore has a corner case that corrupts generation. Measured on
+    GPQA Diamond/recoiTJPGUmzAkief: 128 s and 1610 tokens sent on its own,
+    against 58000+ tokens and still running after 75 minutes as the fourth case
+    of a run — same prompt, same sampling, same token budget.
+
+    run-chunk-validated.sh has carried this nonce for the knowledge suite since
+    2026-04. This runner was written without it.
+    """
+    return f"SESSION={uuid.uuid4()}\n{SYSTEM_PROMPT}"
 
 # ds4-eval's own default. A per-case budget from the hard suite overrides it,
 # which is also ds4's precedence when --max-tokens is not given explicitly.
@@ -71,7 +92,7 @@ def ask(url: str, model: str, key: str, prompt: str, max_tokens: int,
         temperature: float, timeout: int) -> dict:
     body = json.dumps({
         "model": model,
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+        "messages": [{"role": "system", "content": system_prompt()},
                      {"role": "user", "content": prompt}],
         "temperature": temperature,
         "max_tokens": max_tokens,
