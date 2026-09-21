@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Collect everything the gx10 campaign produced into one comparison.
+
+Reads whatever exists under external/results/gx10-3way/ and prints a table per
+suite; with --json it writes the collected numbers for a chart. A suite that has
+not run is reported as missing rather than as zero — a partial campaign must
+read as partial.
+"""
+import argparse
+import glob
+import json
+import statistics
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+ROOT = REPO / "external" / "results" / "gx10-3way"
+MODELS = {
+    "glm": "GLM-5.3-Flash UD-Q2_K_XL",
+    "dsv4": "DeepSeek-V4-Flash UD-IQ3_XXS",
+    "qwen": "Qwen3.8-Flash-Next UD-Q4_K_XL",
+}
+# Knowledge-suite judge.json locations (run dirs), per model key.
+KNOWLEDGE = {
+    "glm": REPO / "results" / "glm5.3-flash-q2kxl-mtp-2x128k-gx10",
+    "dsv4": REPO / "results" / "dsv4-flash-IQ3_XXS-262k-gx10",
+    "qwen": REPO / "results" / "gx10-3way-qwen",
+}
+
+
+def load(p: Path):
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def ds4(key: str, suite: str) -> dict | None:
+    runs = []
+    for seed in (1, 2):
+        d = load(ROOT / key / f"ds4-{suite}-seed{seed}" / "results.json")
+        if d:
+            runs.append(d)
+    if not runs:
+        return None
+    out = {"runs": []}
+    per_case = {}
+    for d in runs:
+        s, cases = d["summary"], d["cases"]
+        tok = sum(c.get("completion_tokens") or 0 for c in cases)
+        sec = sum(c.get("seconds") or 0 for c in cases)
+        out["runs"].append({
+            "seed": s.get("seed"), "done": s["total"], "correct": s["correct"],
+            "pct": s["percentage"], "forced": s.get("forced", 0),
+            "out_of_budget": sum(1 for c in cases if c["finish_reason"] == "length"),
+            "tokens": tok, "hours": round(sec / 3600, 2),
+            "median_tokens": int(statistics.median(
+                [c.get("completion_tokens") or 0 for c in cases])) if cases else 0,
+            "by_source": {k: v["pct"] for k, v in s["by_source"].items()},
+        })
+        for c in cases:
+            per_case.setdefault((c["source"], c["id"]), []).append(bool(c["correct"]))
+    full = [v for v in per_case.values() if len(v) == len(runs)]
+    out["mean_pct"] = round(statistics.mean(r["pct"] for r in out["runs"]), 2)
+    out["complete"] = all(r["done"] == (92 if suite == "core" else 50) for r in out["runs"])
+    if len(runs) == 2:
+        out["stable_correct"] = sum(1 for v in full if all(v))
+        out["unstable"] = sum(1 for v in full if any(v) and not all(v))
+        out["stable_wrong"] = sum(1 for v in full if not any(v))
+    ok = sum(r["correct"] for r in out["runs"])
+    out["tokens_per_correct"] = round(sum(r["tokens"] for r in out["runs"]) / ok) if ok else None
+    return out
+
+
+def bfcl(key: str):
+    d = load(ROOT / key / "bfcl" / "summary.json")
+    if not d:
+        return None
+    cats = d["categories"]
+    scored = sum(c["scored"] for c in cats.values())
+    correct = sum(c["correct"] for c in cats.values())
+    return {"overall_pct": round(100 * correct / scored, 2) if scored else None,
+            "scored": scored, "truncated": d.get("truncated", 0),
+            "errors": d.get("inference_errors", 0),
+            "by_category": {k: round(100 * c["accuracy"], 1) for k, c in sorted(cats.items())}}
+
+
+def tau2(key: str):
+    d = load(ROOT / key / "tau2" / "summary.json")
+    if not d:
+        return None
+    return {"avg_reward": d["avg_reward"], "pass_hat_k": d["pass_hat_k"],
+            "judged": d["simulations_judged"], "expected": d["simulations_expected"],
+            "user_llm": d["user_llm"], "terminations": d["terminations"]}
+
+
+def loop(key: str):
+    fs = glob.glob(str(REPO / "loop-detection" / "results" / f"gx10-3way-{key}-run1" / "*-score.json"))
+    if key == "glm" and not fs:   # GLM's passes predate the campaign
+        fs = glob.glob(str(REPO / "loop-detection" / "results" /
+                           "glm5.3-flash-q2kxl-mtp-2x128k-gx10-run1" / "*-score.json"))
+    if not fs:
+        return None
+    scores = [load(Path(f)) for f in fs]
+    flagged = {}
+    for f, s in zip(fs, scores):
+        if s and s.get("spiral_flags"):
+            flagged[Path(f).name.split("-2026")[0]] = s["spiral_flags"]
+    return {"scenarios": len(fs), "flagged": len(flagged),
+            "empty": sum(1 for s in scores if s and s.get("empty_response")),
+            "flags": flagged}
+
+
+def knowledge(key: str):
+    fs = sorted(glob.glob(str(KNOWLEDGE[key] / "run*" / "judge.json")))
+    if not fs:
+        return None
+    ps = [load(Path(f))["totals"]["percentage"] for f in fs]
+    b = [load(Path(f)).get("chunk9_breakdown", {}).get("part_b", {}).get("pct") for f in fs]
+    b = [x for x in b if x is not None]
+    return {"runs": len(ps), "mean_pct": round(statistics.mean(ps), 2),
+            "range_pp": round(max(ps) - min(ps), 2),
+            "part_b_pct": round(statistics.mean(b), 1) if b else None}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--json", help="write the collected numbers here")
+    args = ap.parse_args()
+    data = {}
+    for key, name in MODELS.items():
+        data[key] = {"name": name, "ds4_core": ds4(key, "core"), "ds4_hard": ds4(key, "hard"),
+                     "bfcl": bfcl(key), "tau2": tau2(key), "loop": loop(key),
+                     "knowledge": knowledge(key)}
+
+    def cell(v, fmt="{}"):
+        return "—" if v is None else fmt.format(v)
+
+    print(f"{'':<26}" + "".join(f"{MODELS[k][:24]:>26}" for k in MODELS))
+    rows = [
+        ("ds4 core  mean %", lambda m: (m["ds4_core"] or {}).get("mean_pct")),
+        ("ds4 core  unstable", lambda m: (m["ds4_core"] or {}).get("unstable")),
+        ("ds4 hard  mean %", lambda m: (m["ds4_hard"] or {}).get("mean_pct")),
+        ("ds4 hard  unstable", lambda m: (m["ds4_hard"] or {}).get("unstable")),
+        ("ds4 tokens/correct", lambda m: (m["ds4_core"] or {}).get("tokens_per_correct")),
+        ("BFCL overall %", lambda m: (m["bfcl"] or {}).get("overall_pct")),
+        ("tau2 avg reward", lambda m: (m["tau2"] or {}).get("avg_reward")),
+        ("loop flagged /12", lambda m: (m["loop"] or {}).get("flagged")),
+        ("knowledge mean %", lambda m: (m["knowledge"] or {}).get("mean_pct")),
+        ("knowledge Part B %", lambda m: (m["knowledge"] or {}).get("part_b_pct")),
+    ]
+    for label, get in rows:
+        print(f"{label:<26}" + "".join(f"{cell(get(data[k])):>26}" for k in MODELS))
+    for key in MODELS:
+        for suite in ("ds4_core", "ds4_hard"):
+            d = data[key][suite]
+            if d and not d["complete"]:
+                done = ", ".join(f"seed{r['seed']}: {r['done']}" for r in d["runs"])
+                print(f"  note: {key} {suite} is partial ({done})")
+    if args.json:
+        Path(args.json).write_text(json.dumps(data, indent=1, ensure_ascii=False))
+        print(f"-> {args.json}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
