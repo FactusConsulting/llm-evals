@@ -107,7 +107,7 @@ def make_case(source: str, cid: str, **extra) -> dict:
 
 def sampling_of(mode, **overrides):
     ns = SimpleNamespace(mode=mode, nonce=None, temperature=None, top_p=None,
-                         min_p=None, seed=None)
+                         min_p=None, seed=None, reasoning_budget=0)
     for k, v in overrides.items():
         setattr(ns, k, v)
     return run.resolve_sampling(ns)
@@ -119,7 +119,7 @@ def run_one(case: dict, model: str, sampling: dict, no_force: bool = False,
     TEMP_LOG.clear()
     args = SimpleNamespace(url=URL, model=model, api_key="none", timeout=10,
                            max_tokens=max_tokens, think_budget=think_budget,
-                           no_force=no_force, suite="core")
+                           reasoning_budget=0, no_force=no_force, suite="core")
     blob = {"rev": "0" * 40, "repo": "antirez/ds4"}
     outdir = Path(tempfile.mkdtemp(prefix="ds4-runner-v2-test-"))
     _tmp_dirs.append(outdir)
@@ -240,7 +240,8 @@ run.write_results = _spy
 multi_cases = [make_case("GPQA Diamond", "m1"), make_case("GPQA Diamond", "m2"),
               make_case("GPQA Diamond", "m3")]
 multi_args = SimpleNamespace(url=URL, model="plain", api_key="none", timeout=10,
-                             max_tokens=200, think_budget=0, no_force=False, suite="core")
+                             max_tokens=200, think_budget=0, reasoning_budget=0,
+                             no_force=False, suite="core")
 multi_outdir = Path(tempfile.mkdtemp(prefix="ds4-runner-v2-test-multi-"))
 _tmp_dirs.append(multi_outdir)
 run.execute(multi_cases, multi_args, gate, {"rev": "0" * 40, "repo": "antirez/ds4"},
@@ -257,6 +258,26 @@ check("snapshot reads n_ctx per slot", snap["n_ctx"], [131072])
 bad_snap = run.server_snapshot("http://127.0.0.1:1", "none")  # nothing listens here
 check("a failed snapshot call yields null fields, not an exception",
       bad_snap, {"build_info": None, "n_slots": None, "n_ctx": None, "params": None})
+
+budget_body = run.request_body("m", [], 100, {"reasoning_budget": 65536})
+check("a reasoning budget is sent as llama-server's two fields",
+      (budget_body.get("reasoning_budget_tokens"), budget_body.get("reasoning_budget_message")),
+      (65536, run.BUDGET_MESSAGE))
+check("no reasoning budget sends neither field",
+      [k for k in run.request_body("m", [], 100, {"reasoning_budget": 0}) if "budget" in k], [])
+
+run.RETRY_PAUSE = 0
+dead_args = SimpleNamespace(url="http://127.0.0.1:9", model="plain", api_key="none", timeout=2,
+                            max_tokens=200, think_budget=0, reasoning_budget=0,
+                            no_force=False, suite="core")
+dead_outdir = Path(tempfile.mkdtemp(prefix="ds4-runner-v2-test-dead-"))
+_tmp_dirs.append(dead_outdir)
+dead_records, dead_summary = run.execute([make_case("GPQA Diamond", "d1")], dead_args, gate,
+                                         {"rev": "0" * 40, "repo": "antirez/ds4"},
+                                         {"build_info": None}, dead_outdir)
+check("a dropped connection is retried before the case is given up",
+      (dead_records[0]["retries"], bool(dead_records[0]["error"]), dead_summary["errors"]),
+      (run.RETRIES, True, 1))
 
 
 def main() -> int:
