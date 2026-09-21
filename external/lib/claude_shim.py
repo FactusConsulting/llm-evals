@@ -51,14 +51,24 @@ def render(messages: list) -> tuple[str, str]:
 
 
 def call_claude(system: str, prompt: str) -> dict:
+    # Nothing from the request reaches the command line: the system prompt goes
+    # through a file this process names itself, the user prompt through stdin.
+    # The argv is built only from this server's own startup arguments.
+    with tempfile.NamedTemporaryFile("w", dir=WORKDIR, prefix="system-", suffix=".txt",
+                                     delete=False) as f:
+        f.write(system or "You are a helpful assistant.")
+        system_file = f.name
     cmd = ["claude", "-p", "--model", ARGS.model, "--effort", ARGS.effort,
-           "--system-prompt", system or "You are a helpful assistant.",
+           "--system-prompt-file", system_file,
            "--tools", "", "--strict-mcp-config", "--mcp-config", str(EMPTY_MCP),
            "--setting-sources", "", "--output-format", "json",
            "--no-session-persistence"]
     t0 = time.time()
-    proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                          cwd=WORKDIR, timeout=ARGS.timeout)
+    try:
+        proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                              cwd=WORKDIR, timeout=ARGS.timeout)
+    finally:
+        Path(system_file).unlink(missing_ok=True)
     out = proc.stdout
     try:
         data = json.loads(out[out.index("{"):])
