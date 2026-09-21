@@ -13,9 +13,11 @@ against honest variance; see README.md.
 """
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -39,6 +41,19 @@ SYSTEM_PROMPT = ("You are solving a hard benchmark question. Reason carefully. "
 # zero exactly like a wrong answer. Pass --max-tokens explicitly, and raise
 # --timeout with it or the client gives up before the budget does.
 DEFAULT_MAX_TOKENS = 16000
+
+# llama-server's reasoning budget: after N thinking tokens it injects this
+# message, closes the thinking block, and the model answers from what it has.
+BUDGET_MESSAGE = ("\n\nI have used my thinking budget. I must stop here and give "
+                  "my final answer now.")
+BUDGET_PROBE_TOKENS = 64
+BUDGET_PROBE_QUESTION = ("How many ordered triples (a,b,c) of positive integers satisfy "
+                         "a+b+c=30 with a*b*c divisible by 12?")
+
+# A dropped connection costs the case, not the run: retry it, after a pause
+# long enough for the server to notice and cancel the orphaned generation.
+RETRIES = 2
+RETRY_PAUSE = 60
 
 # The trailing instruction is what makes grading deterministic; it is quoted
 # from ds4_eval.c's build_question_prompt so a score is comparable to ds4's.
@@ -104,6 +119,7 @@ def resolve_sampling(args) -> dict:
         else:
             out[key] = default
     out["mode"] = args.mode
+    out["reasoning_budget"] = args.reasoning_budget
     return out
 
 
@@ -172,10 +188,33 @@ def request_body(model: str, messages: list, max_tokens: int, sampling: dict,
         body["min_p"] = sampling["min_p"]
     if sampling.get("seed") is not None:
         body["seed"] = sampling["seed"]
+    if sampling.get("reasoning_budget"):
+        body["reasoning_budget_tokens"] = sampling["reasoning_budget"]
+        body["reasoning_budget_message"] = BUDGET_MESSAGE
     if stream:
         body["stream"] = True
         body["stream_options"] = {"include_usage": True}
     return body
+
+
+class _KeepAliveConnection(http.client.HTTPConnection):
+    """Without keepalive a half-open connection is only noticed at --timeout,
+    which has to outlast a whole generation."""
+
+    def connect(self):
+        super().connect()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 20)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6)
+
+
+class _KeepAliveHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_KeepAliveConnection, req)
+
+
+OPENER = urllib.request.build_opener(_KeepAliveHandler)
 
 
 def _headers(key: str) -> dict:
@@ -225,7 +264,7 @@ def post_stream(url: str, key: str, body: dict, timeout: int) -> dict:
     n_pieces = 0
     t0 = time.time()
     last_progress = t0
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with OPENER.open(req, timeout=timeout) as r:
         for raw in r:
             if not raw.startswith(b"data: "):
                 continue
@@ -284,6 +323,19 @@ def force_closure(url: str, model: str, key: str, sys_msg: str, user_msg: str,
     return post_stream(url, key, body, timeout)
 
 
+def budget_honoured(url: str, model: str, key: str):
+    """True when the endpoint enforces reasoning_budget_tokens, False when it
+    ignores the field, None when the probe failed. An endpoint that ignores it
+    still answers, so without this a run would silently measure without a budget."""
+    body = request_body(model, [{"role": "user", "content": BUDGET_PROBE_QUESTION}], 400,
+                        {"reasoning_budget": BUDGET_PROBE_TOKENS, "seed": 0})
+    try:
+        r = post_stream(url, key, body, 600)
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    return BUDGET_MESSAGE.strip() in r["reasoning"]
+
+
 def write_results(outdir: Path, summary: dict, records: list) -> None:
     (outdir / "results.json").write_text(json.dumps(
         {"summary": summary, "cases": records}, indent=1, ensure_ascii=False))
@@ -303,6 +355,9 @@ def summarise(records, args, sampling, blob, started, t0, snapshot) -> dict:
         "temperature": sampling["temperature"], "top_p": sampling["top_p"],
         "min_p": sampling["min_p"], "seed": sampling["seed"],
         "max_tokens": args.max_tokens, "think_budget": args.think_budget,
+        "reasoning_budget": args.reasoning_budget,
+        "budget_hits": sum(1 for r in records if r.get("budget_hit")),
+        "retried": sum(1 for r in records if r.get("retries")),
         "force": not args.no_force, "server": snapshot,
         "started": started.isoformat(),
         "finished": datetime.now(timezone.utc).isoformat(),
@@ -343,28 +398,42 @@ def execute(cases, args, sampling, blob, snapshot, outdir) -> tuple:
         err = None
         prompt_tokens = completion_tokens = None
         estimated = False
-        try:
-            body = request_body(args.model,
-                                [{"role": "system", "content": sys_msg},
-                                 {"role": "user", "content": user_msg}],
-                                phase1_budget, sampling)
-            r1 = post_stream(args.url, args.api_key, body, args.timeout)
-            content, reasoning = r1["content"], r1["reasoning"]
-            finish = r1["finish_reason"]
-            prompt_tokens, completion_tokens, estimated = phase_usage(
-                r1["usage"], sys_msg + user_msg, content + reasoning)
+        retries = 0
+        while True:
+            forced = False
+            err = None
+            try:
+                body = request_body(args.model,
+                                    [{"role": "system", "content": sys_msg},
+                                     {"role": "user", "content": user_msg}],
+                                    phase1_budget, sampling)
+                r1 = post_stream(args.url, args.api_key, body, args.timeout)
+                content, reasoning = r1["content"], r1["reasoning"]
+                finish = r1["finish_reason"]
+                prompt_tokens, completion_tokens, estimated = phase_usage(
+                    r1["usage"], sys_msg + user_msg, content + reasoning)
 
-            if not args.no_force and finish == "length" and not has_answer_line(content):
-                forced = True
-                r2 = force_closure(args.url, args.model, args.api_key, sys_msg, user_msg,
-                                   reasoning, content, sampling, args.timeout)
-                content = r2["content"]
-                finish = r2["finish_reason"] or finish
-                _, extra_tokens, est2 = phase_usage(r2["usage"], "", r2["content"])
-                completion_tokens += extra_tokens
-                estimated = estimated or est2
-        except (urllib.error.URLError, OSError, KeyError, ValueError) as e:
-            err = f"{type(e).__name__}: {e}"
+                if not args.no_force and finish == "length" and not has_answer_line(content):
+                    forced = True
+                    r2 = force_closure(args.url, args.model, args.api_key, sys_msg, user_msg,
+                                       reasoning, content, sampling, args.timeout)
+                    content = r2["content"]
+                    finish = r2["finish_reason"] or finish
+                    _, extra_tokens, est2 = phase_usage(r2["usage"], "", r2["content"])
+                    completion_tokens += extra_tokens
+                    estimated = estimated or est2
+            except urllib.error.HTTPError as e:
+                err = f"{type(e).__name__}: {e}"
+            except (urllib.error.URLError, OSError, KeyError, ValueError) as e:
+                err = f"{type(e).__name__}: {e}"
+                if retries < RETRIES:
+                    retries += 1
+                    print(f"    connection lost ({err}); retry {retries}/{RETRIES} "
+                          f"in {RETRY_PAUSE}s", flush=True)
+                    time.sleep(RETRY_PAUSE)
+                    continue
+            break
+        if err:
             errors += 1
 
         g = grade.grade(case, content)
@@ -378,6 +447,7 @@ def execute(cases, args, sampling, blob, snapshot, outdir) -> tuple:
             "reasoning_chars": len(reasoning), "content_chars": len(content),
             "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
             "estimated": estimated, "forced": forced,
+            "budget_hit": BUDGET_MESSAGE.strip() in reasoning, "retries": retries,
             "repeated_lines": repeated_lines, "repeated_sentences": repeated_sentences,
             "error": err, "response": content,
         })
@@ -423,6 +493,9 @@ def main() -> int:
     ap.add_argument("--think-budget", type=int, default=0,
                     help="cap on the first phase's tokens, before any forced "
                     "closure; default is the resolved --max-tokens budget")
+    ap.add_argument("--reasoning-budget", type=int, default=0,
+                    help="llama-server reasoning budget in tokens: thinking is cut "
+                    "there and the model has to answer; 0 sends nothing")
     ap.add_argument("--no-force", action="store_true",
                     help="disable the two-phase think-closure follow-up")
     ap.add_argument("--timeout", type=int, default=1800)
@@ -446,6 +519,14 @@ def main() -> int:
     outdir = Path(args.out)
     outdir.mkdir(parents=True, exist_ok=True)
     snapshot = server_snapshot(args.url, args.api_key)
+    if args.reasoning_budget:
+        snapshot["reasoning_budget_honoured"] = budget_honoured(
+            args.url, args.model, args.api_key)
+        print(f"  reasoning budget {args.reasoning_budget}: "
+              f"honoured={snapshot['reasoning_budget_honoured']}")
+        if snapshot["reasoning_budget_honoured"] is False:
+            print("  WARNING: the endpoint ignores reasoning_budget_tokens; this run "
+                  "measures without a budget.", file=sys.stderr)
 
     records, summary = execute(cases, args, sampling, blob, snapshot, outdir)
     correct, truncated, forced = summary["correct"], summary["truncated"], summary["forced"]
