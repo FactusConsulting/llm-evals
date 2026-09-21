@@ -114,6 +114,14 @@ case that hits the ceiling with no `Answer:` line gets one forced follow-up
 turn asking for exactly one final line (see README.md); `truncated` in the
 summary counts cases where even that did not produce a clean stop.
 
+**On llama-server, also pass `--reasoning-budget 65536`.** The server cuts the
+thinking there, injects a closing message, and the model answers from what it
+has — so a runaway generation ends in an answer instead of a blank. The run
+probes at start that the endpoint enforces it (`reasoning_budget_honoured` in
+the summary); `budget_hit` marks the cases it cut. The forced follow-up turn
+does not rescue those cases: a model at maximum reasoning effort starts thinking
+again and runs out of its 512 tokens.
+
 Two ceilings still bound the budget: context (`n_ctx` per slot minus the
 prompt) and your own timeout (budget ÷ generation speed, measured at the top —
 per-token time grows with context).

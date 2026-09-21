@@ -108,6 +108,21 @@ only the first phase's tokens (default: the resolved `--max-tokens` budget),
 so the cost of a wide sweep can be bounded independently of how much room a
 model gets before closure kicks in.
 
+### Reasoning budget
+
+`--reasoning-budget N` sends llama-server's `reasoning_budget_tokens` and a
+closing message with every case: after N thinking tokens the server injects
+the message, closes the thinking block, and the model has to answer. It is the
+server's own mechanism, so it works the same way in production
+(`--reasoning-budget` on the server). At start the run sends one probe with a
+64-token budget and records `reasoning_budget_honoured` — an endpoint that
+ignores the field still answers, and would otherwise be measured without a
+budget unnoticed. `budget_hit` marks each case that was cut; `budget_hits` in
+the summary counts them.
+
+A connection that drops mid-generation is retried twice (`retries` per case,
+`retried` in the summary); an HTTP status is not.
+
 Two ceilings still bound the first-phase budget: context (`n_ctx` per slot
 minus the prompt) and your own `--timeout` (budget ÷ generation speed,
 measured at the top — per-token time grows with context). **A run with
