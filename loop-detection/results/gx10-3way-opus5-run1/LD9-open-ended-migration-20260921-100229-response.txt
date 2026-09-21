@@ -1,0 +1,42 @@
+# Postgres 14 → 16 Upgrade Plan: Payments Service
+
+## Key Risks and Prerequisites
+
+- **Deadline.** Postgres 14 reaches end of life in November 2026. DigitalOcean will force-upgrade clusters on its own schedule after that, so this upgrade should finish in October.
+- **Downtime.** DigitalOcean's in-place major upgrade uses `pg_upgrade`. It causes a write outage of several minutes, and it cannot be rolled back in place. Rollback means restoring a pre-upgrade backup or fork, which loses any writes made after the upgrade.
+- **Read-only node.** If "one replica" means a DigitalOcean read-only node, it likely has to be removed before the upgrade and recreated afterwards. Confirm this in the current DigitalOcean docs. If it means one application pod, the whole service goes down during the cutover.
+- **Driver.** psycopg2 2.9.3 speaks the v3 wire protocol and works with PG16. Check whether the service uses `psycopg2-binary`, because that package bundles its own libpq. Also confirm that SCRAM auth works from the pod.
+- **Behavior changes (PG15/16).**
+  - The `public` schema no longer grants CREATE to all users, but only in newly created databases.
+  - Some deprecated functions and features were removed.
+  - Extensions must have PG16-compatible versions.
+  - Planner statistics are not carried over by `pg_upgrade`. Run `ANALYZE` afterwards or expect slow queries at first.
+- **Payments-specific.** In-flight transactions, idempotency, and any queue or webhook consumers must tolerate a write outage. Check your PSP and reconciliation SLAs.
+
+## Migration Plan
+
+1. List the installed extensions and their versions (`SELECT * FROM pg_extension`). Confirm that each is supported on DigitalOcean PG16.
+2. Record the psycopg2 package variant and its bundled libpq version (`psycopg2.__libpq_version__`) from a running pod.
+3. Search the codebase and migrations for removed or changed PG15/16 features. These include `public` schema grants, `pg_stat_*` column renames, and removed functions.
+4. Capture baseline metrics: p95 latency of the top 20 queries (`pg_stat_statements`), connection count, and DB size.
+5. Fork the production cluster from its latest backup into a staging cluster.
+6. Run the DigitalOcean major-version upgrade on the staging fork and record the actual downtime.
+7. Run `ANALYZE` on the staging fork and compare query plans and latency against the baseline.
+8. Point a staging deployment of the payments service at the upgraded fork. Run the full integration suite and a synthetic payment flow end to end.
+9. Write the rollback runbook: fork from the pre-upgrade backup, repoint the connection secret, and replay or reconcile any writes lost in the gap.
+10. **[Approval]** Get sign-off on the maintenance window and the tolerated downtime, based on the duration measured in step 6.
+11. **[External coordination]** Notify the PSP and partner integrations, customer support, and the finance/reconciliation team of the window.
+12. At window start, scale the payments deployment to zero, or enable maintenance mode, to stop writes cleanly.
+13. Drain or pause the background workers and queue consumers that write to the DB.
+14. Trigger an on-demand backup and confirm it completed.
+15. Remove the read-only node if the DigitalOcean upgrade requires it.
+16. **[Approval]** Get go/no-go from the on-call lead and a payments owner, then trigger the major-version upgrade.
+17. Wait until the cluster reports `online` and `SELECT version()` returns 16.x.
+18. Run `ANALYZE` (or `vacuumdb --analyze-in-stages`) on all databases.
+19. Run `ALTER EXTENSION ... UPDATE` for any extension that requires it.
+20. Recreate the read-only node, if one was removed, and verify it is replicating.
+21. Scale the payments deployment back up and resume the workers.
+22. Run smoke tests: one real low-value transaction, one refund, and a webhook receipt.
+23. Monitor error rate, p95 latency, and connection count against the baseline for 60 minutes.
+24. **[Approval]** Get sign-off from the payments owner to close the window. If the metrics breach thresholds, execute the rollback runbook from step 9.
+25. Keep the pre-upgrade backup and the staging fork for 7 days, then delete the fork.

@@ -1,0 +1,37 @@
+# Diagnosis and Escalation for `pkg/storage` Build Failure
+
+## Why attempts 1 and 2 failed
+
+1. **`*sql.DB` already has `Close() error`.** The standard library defines `func (db *DB) Close() error`. The compiler says the method exists but has the wrong signature. So `Store` must declare `Close` with a different signature, such as `Close(ctx context.Context) error`, `Close()` with no return, or a custom error type. Adding another `Close() error` repeats the signature that is already being rejected.
+2. **The wrapper is never passed to `NewCache`.** The error points to `store.go:47:15`, where the variable `db` has type `*sql.DB`. Whatever methods the wrapper has, line 47 still passes the raw `*sql.DB`. Methods cannot be added to `*sql.DB` itself because it is a type from another package. The stub therefore had no effect on the failing expression.
+
+Attempt 2 was identical to attempt 1, so it could not produce a different result. I will not try a third variation of that fix.
+
+## Fix structure (correct once the signature is known)
+
+```go
+// store.go
+type sqlStore struct {
+	*sql.DB
+}
+
+// Signature MUST match Store's Close exactly. Example if Store wants Close(ctx):
+func (s *sqlStore) Close(ctx context.Context) error {
+	return s.DB.Close()
+}
+
+// line 47:
+cache := NewCache(&sqlStore{DB: db})   // pass the wrapper, not raw db
+```
+
+Because the wrapper defines its own `Close`, it hides the embedded `(*sql.DB).Close`. The wrapper then satisfies `Store` as long as the signature matches and no other interface methods are missing.
+
+## Escalation: I cannot apply a definitive fix yet
+
+The error text does not show the required signature of `Store.Close`. Guessing it would repeat the same guess-and-retry loop. I need:
+
+1. **The `Store` interface definition**, with the full method set and exact `Close` signature. It is probably in `pkg/storage/*.go`. Running `grep -n "type Store interface" -A 20 pkg/storage` would find it.
+2. **`store.go` lines 30–55**, to confirm what `db` is at line 47 and whether a wrapper type already exists from commits abc1 and abc2.
+3. **The full compiler output from `go build ./pkg/storage` or `go vet`.** Go normally prints `have Close() error` / `want ...` lines, and those seem to have been cut from the CI log.
+
+With item 1 alone I can finalize the method signature above. That would be a single fix, after which I would stop.

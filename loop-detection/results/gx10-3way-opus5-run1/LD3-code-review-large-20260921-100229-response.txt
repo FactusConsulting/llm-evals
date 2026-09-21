@@ -1,0 +1,53 @@
+# Review: `cache` package
+
+**Verdict: Request changes (blocking).** The package does not compile. The background goroutine also leaks, and every `Cache` instance is pinned in memory for the life of the process.
+
+Line numbers count the `// cache/cache.go` header as line 1.
+
+## Issues
+
+1. **`cache/cache.go:5`: unused import `"context"` breaks the build.** Go rejects unused imports, so `go build` and `go test` both fail. The tests cannot have been run against this PR. Remove the import, or use it for the shutdown mechanism in issue 2.
+
+2. **`cache/cache.go:26` and `cache/cache.go:52-64`: `evict` leaks a goroutine on every `New()` call.**
+   - The loop has no exit condition.
+   - Each `New()` leaks one goroutine.
+   - The goroutine holds a reference to `c`, so the `Cache` and its whole map are never garbage collected.
+   - Each test in `cache_test.go` leaks one, and `goleak` would flag them.
+
+   Fix: add a `Close()` method, or have `New` accept a `context.Context`. Use a `time.Ticker` with a `select` on a done channel instead of `time.Sleep`, and call `ticker.Stop()` on exit.
+
+3. **`cache/cache.go:30-34`: the cache has no size bound, which allows memory exhaustion.**
+   - Nothing limits how many entries the map holds.
+   - Expired entries are only reclaimed once per minute.
+   - If keys come from request data (user IDs, URLs, headers), an attacker can grow the map without limit within one sweep interval.
+
+   Add a max-entries cap with an eviction policy such as LRU, or document that keys must come from a bounded set.
+
+4. **`cache/cache.go:54-62`: the sweep holds the lock for an O(n) scan.**
+   - All of `Get`, `Set`, and `Delete` block while the full map is scanned.
+   - On a large cache this causes periodic latency spikes.
+   - The 1-minute interval is hard-coded and unrelated to `ttl`. With a 100 ms TTL, dead entries sit in memory up to 600 times longer than their lifetime.
+
+   Make the interval configurable or derive it from `ttl`. Consider sharding the map or sweeping in batches.
+
+5. **`cache/cache.go:21`: `ttl` is not validated.**
+   - `ttl <= 0` makes every entry expired immediately, so the cache silently does nothing.
+   - A very large `ttl` effectively disables eviction.
+
+   Reject or clamp invalid values, and document the chosen behavior.
+
+6. **`cache/cache.go:40-41`: `Get` does not remove expired entries it finds.** It reports a miss but leaves the entry in the map until the next sweep. Delete it on this path (under the lock) so memory is reclaimed without waiting for the sweep.
+
+7. **`cache/cache.go:32`: `Set` on an existing key silently resets its TTL.** This may be intended, but it must be documented. Callers who expect a fixed expiry from first insert will be surprised.
+
+8. **`cache/cache_test.go` has several gaps:**
+   - **Flaky timing in `TestSetGet`.** The test relies on wall-clock sleeps (100 ms TTL, 200 ms sleep). On a loaded CI runner, the first `Get` can already miss. Inject a clock (a `now func() time.Time` field) and advance it deterministically.
+   - **No test for the eviction path.** Nothing checks that `evict` actually removes entries, so the goroutine code is untested.
+   - **No concurrency test.** Add a test with parallel `Set`/`Get`/`Delete` calls and run it under `go test -race`.
+   - **No cleanup.** Once `Close()` exists, each test should call `t.Cleanup(c.Close)`.
+
+## Nits
+
+1. `cache/cache.go:11,30,36`: use `any`, or better, generics (`Cache[K comparable, V any]`), so callers don't need type assertions.
+2. `cache/cache.go:16`: use `sync.RWMutex` with `RLock` in `Get`, since reads will dominate in a cache.
+3. `cache/cache.go:31-33,37-39,47-49`: use `defer c.mu.Unlock()` for consistency and safety if these functions grow.

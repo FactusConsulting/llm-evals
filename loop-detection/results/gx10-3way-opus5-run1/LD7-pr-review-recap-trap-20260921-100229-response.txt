@@ -1,0 +1,81 @@
+## Blocking
+
+**1. The signing key is random per process, so tokens won't survive restarts or work across replicas** (`auth/jwt.go`, `init()`)
+- Each restart generates a new key, which invalidates every issued token and logs out all users on every deploy.
+- With more than one instance behind a load balancer, a token issued by instance A fails validation on instance B.
+- Load the key from config or a secret manager. Consider adding a `kid` header so you can rotate keys without a hard cutover.
+
+**2. The `rand.Read` error is ignored in `init()`**
+- If it fails, `jwtSecret` may be all zeros, and tokens become forgeable by anyone.
+- This goes away if you fix #1. If any runtime key generation remains, fail hard on error.
+
+**3. Tokens can't be revoked now that Redis is gone**
+- With stateless 24h tokens, logout, password reset, account suspension and role downgrade don't take effect until the token expires.
+- `Role` is embedded in the token, so a demoted admin keeps admin rights for up to 24 hours.
+- Options:
+  - Short-lived access tokens (5–15 min) plus refresh tokens.
+  - A denylist keyed on `jti`.
+  - A per-user `token_version` checked on sensitive operations.
+- Was this tradeoff accepted deliberately? The PR description presents removing Redis as a pure win.
+
+**4. `GenerateRefreshToken` has no storage or validation path in this diff**
+- A refresh token only works if the server can look it up, rotate it, and revoke it. That needs a store, which is the thing Redis was providing.
+- Where are refresh tokens persisted? Are they hashed at rest? Is there rotation with reuse detection?
+- If this lives in the unshown part of the diff, please point me to it. If it isn't implemented, the function is dead code and #3 has no mitigation at all.
+
+## High
+
+**5. The signing algorithm isn't checked in the keyfunc**
+- The keyfunc returns the secret without checking `t.Method`.
+- v4 does reject `none` here, and a `[]byte` key blocks the classic RS/HS confusion attack. Explicit enforcement is still the expected pattern and guards against future key-type changes.
+- Add `if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok { return nil, fmt.Errorf(...) }`, or use a parser with `jwt.WithValidMethods([]string{"HS256"})`.
+
+**6. No `iss` or `aud` claims are set or validated**
+- Any other service sharing this secret (now or later) could mint tokens this service accepts.
+- Set both claims and verify them in `ValidateToken`.
+
+**7. Migration and rollout plan is missing**
+- Every existing session cookie becomes invalid at deploy, and every client must switch from cookies to `Authorization` headers at the same moment.
+- Is there a dual-read period where the middleware accepts either mechanism? Are mobile or third-party clients coordinated?
+
+**8. Client-side token storage and CSRF/XSS posture are unclear**
+- Moving from an (ideally `HttpOnly`) cookie to a bearer header means browser clients must hold the token in JS-accessible storage. Any XSS then becomes token theft.
+- If browsers are a client, why not keep an `HttpOnly; Secure; SameSite` cookie carrying the JWT?
+- If the header approach is intentional, has the CSRF middleware been removed or adjusted to match?
+
+## Medium
+
+**9. The `Bearer` scheme isn't enforced** (`middleware.go`)
+- `strings.TrimPrefix` passes the whole header through when the prefix is missing, so `Authorization: Basic ...` reaches the JWT parser.
+- RFC 7235 says the scheme is case-insensitive, so `bearer <token>` is valid but won't match.
+- Check the prefix explicitly and return 401 if it's absent.
+
+**10. `context.WithValue` uses bare string keys**
+- `"userID"` and `"role"` can collide with any other package's keys, and `go vet` / staticcheck will flag them (SA1029).
+- Use an unexported key type and provide accessor helpers such as `auth.UserIDFrom(ctx)`.
+
+**11. Downstream handlers may break**
+- The old code loaded a full `user` from the session store. The new code only puts `userID` and `role` into the context.
+- Any handler that read the user object from context will now get nil. Were all call sites updated?
+
+**12. Token lifetime is long and there's no clock-skew handling**
+- 24h is long for a non-revocable bearer credential; see #3.
+- No leeway is configured, so small clock differences between instances will cause spurious rejections of freshly issued tokens.
+
+## Low
+
+**13. `ValidateToken` returns a misleading error**
+- It returns `jwt.ErrSignatureInvalid` whenever `!token.Valid` or the type assertion fails, which confuses debugging and log analysis.
+
+**14. The 401 response has no `WWW-Authenticate: Bearer` header**
+- Use `http.StatusUnauthorized` instead of the literal `401`.
+
+**15. The library version is outdated**
+- `golang-jwt/jwt/v4` is superseded by v5, which has stricter validation defaults and first-class parser options. Is there a reason to adopt v4 in new code?
+
+**16. Test coverage for failure paths isn't visible**
+- Needed cases: expired token, tampered signature, wrong algorithm, `alg: none`, missing or malformed header, wrong scheme, and a token signed with a different key.
+
+**17. Confirm Redis is actually unused elsewhere**
+- Is Redis still used for rate limiting, caching or anything else?
+- If so, "removes Redis dependency" is inaccurate. If not, confirm the `go.mod` and deployment manifests are cleaned up in this PR.
