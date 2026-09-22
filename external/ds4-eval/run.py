@@ -55,6 +55,13 @@ BUDGET_PROBE_QUESTION = ("How many ordered triples (a,b,c) of positive integers 
 RETRIES = 2
 RETRY_PAUSE = 60
 
+# Silence this long on an open stream is a stall, not thinking: seen twice on
+# GLM-5.3-Flash, the server kept generating (n_decoded climbing past the
+# reasoning budget) while the stream carried nothing, and the case ended with
+# no answer after an hour. Closing the connection cancels the generation; the
+# case goes to the forced closure with whatever reasoning did arrive.
+STALL_SECONDS = 600
+
 # The trailing instruction is what makes grading deterministic; it is quoted
 # from ds4_eval.c's build_question_prompt so a score is comparable to ds4's.
 TAIL = {
@@ -264,39 +271,46 @@ def post_stream(url: str, key: str, body: dict, timeout: int) -> dict:
     n_pieces = 0
     t0 = time.time()
     last_progress = t0
-    with OPENER.open(req, timeout=timeout) as r:
-        for raw in r:
-            if not raw.startswith(b"data: "):
-                continue
-            payload = raw[6:].strip()
-            if payload == b"[DONE]":
-                break
-            try:
-                d = json.loads(payload)
-            except ValueError:
-                continue
-            if d.get("usage"):
-                usage = d["usage"]
-            choices = d.get("choices") or []
-            if choices:
-                delta = choices[0].get("delta") or {}
-                content_piece = delta.get("content")
-                reasoning_piece = delta.get("reasoning_content")
-                if content_piece:
-                    content_parts.append(content_piece)
-                    n_pieces += 1
-                if reasoning_piece:
-                    reasoning_parts.append(reasoning_piece)
-                    n_pieces += 1
-                fr = choices[0].get("finish_reason")
-                if fr:
-                    finish_reason = fr
-            now = time.time()
-            if now - last_progress > PROGRESS_INTERVAL:
-                dl, ds = repetition_stats("".join(reasoning_parts))
-                print(f"    ... {n_pieces} tokens so far, {dl + ds} repeats so far "
-                      f"({now - t0:.0f}s)", flush=True)
-                last_progress = now
+    # The socket timeout is per read: --timeout bounds the connect and the
+    # first byte, and after that STALL_SECONDS of silence ends the stream.
+    with OPENER.open(req, timeout=min(timeout, STALL_SECONDS)) as r:
+        try:
+            for raw in r:
+                if not raw.startswith(b"data: "):
+                    continue
+                payload = raw[6:].strip()
+                if payload == b"[DONE]":
+                    break
+                try:
+                    d = json.loads(payload)
+                except ValueError:
+                    continue
+                if d.get("usage"):
+                    usage = d["usage"]
+                choices = d.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    content_piece = delta.get("content")
+                    reasoning_piece = delta.get("reasoning_content")
+                    if content_piece:
+                        content_parts.append(content_piece)
+                        n_pieces += 1
+                    if reasoning_piece:
+                        reasoning_parts.append(reasoning_piece)
+                        n_pieces += 1
+                    fr = choices[0].get("finish_reason")
+                    if fr:
+                        finish_reason = fr
+                now = time.time()
+                if now - last_progress > PROGRESS_INTERVAL:
+                    dl, ds = repetition_stats("".join(reasoning_parts))
+                    print(f"    ... {n_pieces} tokens so far, {dl + ds} repeats so far "
+                          f"({now - t0:.0f}s)", flush=True)
+                    last_progress = now
+        except TimeoutError:
+            print(f"    stalled: nothing received for {STALL_SECONDS}s after "
+                  f"{n_pieces} tokens; cancelling", flush=True)
+            finish_reason = "stall"
     return {"content": "".join(content_parts), "reasoning": "".join(reasoning_parts),
             "finish_reason": finish_reason, "usage": usage, "elapsed": time.time() - t0}
 
@@ -358,6 +372,7 @@ def summarise(records, args, sampling, blob, started, t0, snapshot) -> dict:
         "reasoning_budget": args.reasoning_budget,
         "budget_hits": sum(1 for r in records if r.get("budget_hit")),
         "retried": sum(1 for r in records if r.get("retries")),
+        "stalled": sum(1 for r in records if r.get("stalled")),
         "force": not args.no_force, "server": snapshot,
         "started": started.isoformat(),
         "finished": datetime.now(timezone.utc).isoformat(),
@@ -399,6 +414,7 @@ def execute(cases, args, sampling, blob, snapshot, outdir) -> tuple:
         prompt_tokens = completion_tokens = None
         estimated = False
         retries = 0
+        stalled = False
         while True:
             forced = False
             err = None
@@ -410,10 +426,12 @@ def execute(cases, args, sampling, blob, snapshot, outdir) -> tuple:
                 r1 = post_stream(args.url, args.api_key, body, args.timeout)
                 content, reasoning = r1["content"], r1["reasoning"]
                 finish = r1["finish_reason"]
+                stalled = finish == "stall"
                 prompt_tokens, completion_tokens, estimated = phase_usage(
                     r1["usage"], sys_msg + user_msg, content + reasoning)
 
-                if not args.no_force and finish == "length" and not has_answer_line(content):
+                if (not args.no_force and finish in ("length", "stall")
+                        and not has_answer_line(content)):
                     forced = True
                     r2 = force_closure(args.url, args.model, args.api_key, sys_msg, user_msg,
                                        reasoning, content, sampling, args.timeout)
@@ -448,11 +466,12 @@ def execute(cases, args, sampling, blob, snapshot, outdir) -> tuple:
             "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
             "estimated": estimated, "forced": forced,
             "budget_hit": BUDGET_MESSAGE.strip() in reasoning, "retries": retries,
+            "stalled": stalled,
             "repeated_lines": repeated_lines, "repeated_sentences": repeated_sentences,
             "error": err, "response": content,
         })
         mark = "ok " if records[-1]["correct"] else ("ERR" if err else "x  ")
-        flag = " FORCED" if forced else ""
+        flag = (" STALLED" if stalled else "") + (" FORCED" if forced else "")
         print(f"  [{i:>3}/{len(cases)}] {mark} {label:<34} "
               f"{g['got']!r} vs {g['expected']!r}  {elapsed:.0f}s{flag}", flush=True)
         write_results(outdir, summarise(records, args, sampling, blob, started, t0, snapshot),

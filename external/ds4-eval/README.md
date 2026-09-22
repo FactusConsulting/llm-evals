@@ -123,6 +123,16 @@ the summary counts them.
 A connection that drops mid-generation is retried twice (`retries` per case,
 `retried` in the summary); an HTTP status is not.
 
+### Stalls
+
+Ten minutes of silence on an open stream ends it: the connection is closed,
+which cancels the generation, and the case goes to the forced closure with
+the reasoning that did arrive. `stalled` marks the case, and the summary
+counts them. Seen on GLM-5.3-Flash: the server keeps generating while the
+stream carries nothing, and without the cut the case runs to the ceiling and
+scores zero after an hour. `--timeout` bounds only the connect and the first
+byte.
+
 Two ceilings still bound the first-phase budget: context (`n_ctx` per slot
 minus the prompt) and your own `--timeout` (budget ÷ generation speed,
 measured at the top — per-token time grows with context). **A run with
