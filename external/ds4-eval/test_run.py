@@ -8,7 +8,7 @@ import sys
 import tempfile
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -48,6 +48,10 @@ SCENARIOS = {
 CEILING_FIRST = sse(delta(reasoning_content="round and round " * 400), finish("length"),
                     usage_chunk(40, 4096))
 CEILING_FORCED = sse(delta(content="Answer: 42"), finish("stop"), usage_chunk(4200, 8))
+# "stall": the first call streams one delta and then goes silent; the forced
+# follow-up answers.
+STALL_FIRST = sse(delta(reasoning_content="thinking, then nothing "))
+STALL_FORCED = sse(delta(content="Answer: 7"), finish("stop"), usage_chunk(900, 5))
 
 
 class MockHandler(BaseHTTPRequestHandler):
@@ -71,6 +75,12 @@ class MockHandler(BaseHTTPRequestHandler):
         TEMP_LOG.append(payload.get("temperature"))
         if model == "ceiling":
             body = CEILING_FORCED if len(messages) >= 4 else CEILING_FIRST
+        elif model == "stall":
+            if len(messages) < 4:
+                self._write(STALL_FIRST.split(b"data: [DONE]")[0], "text/event-stream")
+                time.sleep(3)  # longer than the test's STALL_SECONDS
+                return
+            body = STALL_FORCED
         else:
             body = SCENARIOS.get(model, SCENARIOS["plain"])
         self._write(body, "text/event-stream")
@@ -87,7 +97,9 @@ class MockHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
 
-_server = HTTPServer(("127.0.0.1", 0), MockHandler)
+# Threaded so a handler that holds a stalled stream open does not block the
+# forced follow-up on a second connection.
+_server = ThreadingHTTPServer(("127.0.0.1", 0), MockHandler)
 threading.Thread(target=_server.serve_forever, daemon=True).start()
 URL = f"http://127.0.0.1:{_server.server_port}"
 
@@ -278,6 +290,13 @@ dead_records, dead_summary = run.execute([make_case("GPQA Diamond", "d1")], dead
 check("a dropped connection is retried before the case is given up",
       (dead_records[0]["retries"], bool(dead_records[0]["error"]), dead_summary["errors"]),
       (run.RETRIES, True, 1))
+
+run.STALL_SECONDS = 1
+stall_rec, stall_sum, _ = run_one(make_case("AIME2025", "s1", choice=[], answer_kind="integer", answer="7"),
+                                  "stall", gate)
+check("a silent stream is cut off as a stall and sent to the forced closure",
+      (stall_rec["stalled"], stall_rec["forced"], stall_rec["correct"], stall_sum["stalled"]),
+      (True, True, True, 1))
 
 
 def main() -> int:
