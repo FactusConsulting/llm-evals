@@ -51,6 +51,42 @@ GX10/vLLM launch config is in [`configs/vllm-gx10-serving.md`](configs/vllm-gx10
 The GX10 GGUF runs (122B Q5, Nemotron, GLM-5.3) have no Ansible profile beyond the run
 dir's `run-chunk.sh` — that box is a playground.
 
+## gx10 three-way campaign, September 2026 — the external suites
+
+Three fleet candidates for gx10 through the whole [`RUNBOOK.md`](RUNBOOK.md) regime, and
+Claude Opus 5 through the same as a reference. Two seeds at temperature 1.0, a 65,536-token
+reasoning budget, no answer counts as wrong. Chart: [`external/results/gx10-3way/comparison.html`](external/results/gx10-3way/comparison.html);
+numbers: [`report.json`](external/results/gx10-3way/report.json).
+
+| | GLM-5.3-Flash UD-Q2_K_XL | DeepSeek-V4-Flash UD-IQ3_XXS ᵈ | Qwen3.8-Flash-Next UD-Q4_K_XL | Opus 5 ʳ |
+|---|---|---|---|---|
+| Knowledge (370) | 98.69% | 98.11% | **98.78%** | 99.59% |
+| Knowledge Part B (code/IaC) | 73.3% | 70.0% | **90.0%** | 85.0% |
+| GPQA Diamond | 87.5% | 91.7% | **93.8%** | 83.3% |
+| SuperGPQA | **84.0%** | 80.0% | 80.0% | 86.0% |
+| AIME 2025 | 96.0% | 98.0% | **100%** | 100% |
+| Code review (COMPSEC) | 97.1% | 94.1% | **100%** | 100% |
+| MMLU-Pro | **95.0%** | 91.7% | 91.7% | 98.3% |
+| OlympiadBench | 60.0% | 65.0% | **70.0%** | 100% |
+| ds4 core, mean of 2 seeds | 90.8% | 90.8% | **92.9%** | 91.8% |
+| ds4 hard, mean of 2 seeds | 88.0% | 87.0% | **91.0%** | 99.0% |
+| Unstable cases (of 142) | 13 | 12 | **4** | 2 |
+| BFCL (tool calling) | 80.0% | **83.2%** | 77.1% | 85.0% ʳ |
+| tau2 avg reward / pass^2 | 0.74 / 0.60 | 0.62 / 0.45 | **0.85 / 0.75** | 0.82 / 0.65 ʳ |
+| Loop flags /12 | 2 | 0 | 0 | 1 |
+| Tokens per correct answer | 15,078 | 6,337 | 12,395 | 699 |
+
+**Qwen3.8-Flash-Next** is the strongest of the three on reasoning, the most stable across
+seeds, and the best on tau2 — its one weakness is multi-turn tool calling (BFCL multi-turn
+43% vs 73–87%). **GLM** is the most thorough on the knowledge suite and SuperGPQA at 2–3× the
+tokens. **DeepSeek** is the fastest and cleanest (no loops) and best local on BFCL, but
+clearly worst on tau2. Opus 5 separates only on the hard suite.
+
+ᵈ DeepSeek ran without its dSpark draft at 262k context: the card's 1M context plus the
+draft OOMs the host on the current llama.cpp master. The draft changes speed, not answers.
+ʳ Opus 5 through `external/lib/claude_shim.py`; BFCL and tau2 use the shim's prompted tool
+calling, so they are a lower bound. One GPQA case is refused by its safety filter.
+
 ## vLLM vs llama.cpp — same model, both engines
 
 How each model serves on **vLLM (GX10)** versus its **llama.cpp** serving. The question
