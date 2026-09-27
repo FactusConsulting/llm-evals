@@ -8,11 +8,11 @@
 **Answer:**
 Kubernetes Pod Security Standards (PSS) are enforced by the built-in PodSecurity admission controller on a per-namespace basis via the `pod-security.kubernetes.io/enforce=<level>` label. The three levels are Privileged, Baseline, and Restricted.
 
-Under **Baseline**, the primary constraint related to root is that `hostNetwork`, `hostPID`, privilege escalation via `allowPrivilegeEscalation` and certain capabilities are restricted, but running as UID 0 is still permitted. Under **Restricted**, the rules tighten considerably: the pod/container `securityContext` MUST set `runAsNonRoot: true`, `allowPrivilegeEscalation: false`, drop ALL capabilities (and add back only `NET_BIND_SERVICE` if needed), and set `seccompProfile.type` to `RuntimeDefault` or `Localhost`.
+Under **Baseline**, the constraints are host namespaces (`hostNetwork`, `hostPID`), privileged containers, added capabilities and host paths; `allowPrivilegeEscalation` is not restricted, and running as UID 0 is still permitted. Under **Restricted**, the rules tighten considerably: the pod/container `securityContext` MUST set `runAsNonRoot: true`, `allowPrivilegeEscalation: false`, drop ALL capabilities (and add back only `NET_BIND_SERVICE` if needed), and set `seccompProfile.type` to `RuntimeDefault` or `Localhost`.
 
 The key interaction is between the `runAsNonRoot` flag and the container image's `USER` directive. When `runAsNonRoot: true` is set but no explicit `runAsUser` is provided, the kubelet refuses to start the container if it cannot positively verify at admission/runtime that the image's effective UID is non-zero. The kubelet reads the OCI image config and inspects the `Config.User` field:
 
-- If the field is empty or `"root"` or `"0"`, the container will be blocked with a `CreateContainerConfigError` or fail liveness with `container has runAsNonRoot and image will run as root`.
+- If the field is empty or `"root"` or `"0"`, the container is blocked with `CreateContainerConfigError: container has runAsNonRoot and image will run as root`.
 - If the field is a numeric UID != 0, it passes.
 - If it is a username like `nobody`, the kubelet cannot resolve the UID before start and fails the check.
 
