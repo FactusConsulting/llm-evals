@@ -58,7 +58,7 @@ After scoring, the scheduler writes `.spec.nodeName` via a `Bind` call; kubelet 
 
 ### K7 — Hard
 **Answer:**
-Scheduling is based on **requests**, not limits. The node has 4 GiB allocatable, 3.5 GiB already requested, leaving 500 MiB. The pod requests 256 MiB, which fits, so the scheduler places it on the node (assuming no other filter fails).
+Scheduling is based on **requests**, not limits. The node has 4 GiB allocatable, 3.5 GiB already requested, leaving 512 MiB. The pod requests 256 MiB, which fits, so the scheduler places it on the node (assuming no other filter fails).
 
 At runtime the pod uses 600 MiB, which exceeds its 512 MiB memory limit. Memory limits are enforced by the kernel cgroup. Memory is incompressible, so the kernel OOM-killer kills the container with exit code 137 and kubelet records `State.Terminated.Reason: OOMKilled`. The pod's `restartPolicy` (default `Always` for Deployment-managed pods) then restarts the container; repeated kills drive it into `CrashLoopBackOff`. Note the node itself is fine — only the offending container is killed, because the cgroup limit scopes the OOM to that container.
 
@@ -155,9 +155,9 @@ Problems solved: encoding human SRE knowledge as software, declarative lifecycle
 
 ### K18 — Hard
 **Answer:**
-etcd uses the **Raft** consensus algorithm and provides **strong (linearizable) consistency** for reads and writes by default. Every write must be committed to a majority (quorum) of the etcd members (⌈N/2⌉+1): 2 of 3, 3 of 5. Linearizable reads also go through the leader. `kube-apiserver` fronts etcd and offers two read modes: default strong (`ResourceVersion=""`) and cache/quorum-bypassing (`ResourceVersion="0"`, eventually consistent).
+etcd uses the **Raft** consensus algorithm and provides **strong (linearizable) consistency** for reads and writes by default. Every write must be committed to a majority (quorum) of the etcd members (⌊N/2⌋+1): 2 of 3, 3 of 5. Linearizable reads also go through the leader. `kube-apiserver` fronts etcd and offers two read modes: default strong (`ResourceVersion=""`) and cache/quorum-bypassing (`ResourceVersion="0"`, eventually consistent).
 
-**Losing quorum:** If fewer than ⌈N/2⌉+1 members are alive, etcd cannot elect a leader or accept writes. The cluster becomes **read-only from cache** at best: `kube-apiserver` serves stale data from its watch cache, but no new writes, pod scheduling, lease renewals, or controller reconciliations succeed. Existing pods keep running (kubelet works off its local cache), but the control plane is effectively frozen. Node leases eventually expire and the cluster looks degraded.
+**Losing quorum:** If fewer than ⌊N/2⌋+1 members are alive, etcd cannot elect a leader or accept writes. The cluster becomes **read-only from cache** at best: `kube-apiserver` serves stale data from its watch cache, but no new writes, pod scheduling, lease renewals, or controller reconciliations succeed. Existing pods keep running (kubelet works off its local cache), but the control plane is effectively frozen. Node leases eventually expire and the cluster looks degraded.
 
 **Recovery from losing 2 of 3 etcd members permanently:**
 1. Stop the remaining etcd member.
@@ -438,10 +438,10 @@ Additionally, Cassandra uses **read repair** (sync/async), **hinted handoff** (b
 
 **Handshake (TLS 1.3, simplified):**
 1. **ClientHello:** client sends supported TLS versions, cipher suites, a random nonce, its key-share (ECDHE public keys), SNI, and extensions.
-2. **ServerHello:** server picks the version and cipher, sends its random nonce and its key-share. Both sides now derive the handshake traffic secret via ECDHE; subsequent handshake messages are encrypted.
-3. **Server `Certificate`:** server sends its X.509 certificate chain.
-4. **Server `CertificateVerify`:** server signs a transcript hash with its certificate's private key — proves it **owns** the private key matching the cert.
-5. **Server `CertificateRequest`:** server asks the client for a cert, optionally constraining acceptable CAs / signature algorithms. This is what turns the handshake into mTLS.
+2. **ServerHello:** server picks the version and cipher, sends its random nonce and its key-share. Both sides now derive the handshake traffic secret via ECDHE; subsequent handshake messages are encrypted (`EncryptedExtensions` comes first).
+3. **Server `CertificateRequest`:** server asks the client for a cert, optionally constraining acceptable CAs / signature algorithms. This is what turns the handshake into mTLS. In TLS 1.3 it precedes the server's own certificate.
+4. **Server `Certificate`:** server sends its X.509 certificate chain.
+5. **Server `CertificateVerify`:** server signs a transcript hash with its certificate's private key — proves it **owns** the private key matching the cert.
 6. **Server `Finished`:** MAC over the handshake transcript.
 7. **Client `Certificate`:** client sends its X.509 cert chain.
 8. **Client `CertificateVerify`:** client signs the transcript hash with its private key, proving possession.

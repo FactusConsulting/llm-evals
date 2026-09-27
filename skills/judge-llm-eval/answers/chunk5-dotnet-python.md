@@ -543,7 +543,7 @@ Workarounds:
 - **`multiprocessing`** / `concurrent.futures.ProcessPoolExecutor`: separate processes, each with its own interpreter and GIL. True parallelism, but IPC costs (pickling).
 - **C extensions** that release the GIL (numpy, pandas, PyTorch, polars, numba).
 - **`asyncio`** for I/O concurrency without threads.
-- **PEP 703 / free-threaded CPython** (3.13+ experimental, 3.14 GA target): optional `--disable-gil` build.
+- **PEP 703 / free-threaded CPython**: experimental in 3.13, officially supported from 3.14 (PEP 779); a separate `--disable-gil` build (`python3.14t`), still optional.
 - **Subinterpreters per PEP 684** (3.12+): each interpreter has its own GIL.
 
 ---

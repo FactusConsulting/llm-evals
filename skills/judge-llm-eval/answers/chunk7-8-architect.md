@@ -183,7 +183,7 @@ A highly available Proxmox cluster architecture:
 
 **Node count:** Minimum 3 nodes for quorum (Proxmox uses Corosync for cluster quorum — needs a majority, so 3 nodes tolerates 1 failure, 5 tolerates 2). Add a QDevice (tiebreaker) if running 2 nodes in a small setup.
 
-**Quorum:** Corosync maintains quorum via heartbeat on the cluster network. If a node loses quorum (network partition), it stops its VMs to prevent split-brain (the `pvecm` quorum daemon handles this).
+**Quorum:** Corosync maintains quorum via heartbeat on the cluster network. A node that loses quorum (network partition) gets a read-only cluster filesystem and, if it runs HA-managed VMs, self-fences via the watchdog (`pve-ha-lrm` loses its lock, the node reboots after ~60 s) so those VMs can be restarted elsewhere; non-HA VMs keep running.
 
 **Fencing:** Proxmox uses watchdog-based fencing — if a node becomes unresponsive, the watchdog timer triggers a reboot. For hardware-level fencing, configure IPMI/iDRAC fencing so the cluster can forcibly power-cycle a hung node.
 
@@ -219,7 +219,7 @@ Or persist via `/etc/network/interfaces` with `vlan-raw-device` or systemd-netwo
 **Answer:**
 **RAID 1** mirrors data across 2 drives — 50% capacity, excellent read performance, survives 1 drive failure. **RAID 5** stripes data with distributed parity across N drives — survives 1 failure, (N-1)/N capacity, poor write performance due to parity calculation. **RAID 6** like RAID 5 but with double parity — survives 2 simultaneous failures, (N-2)/N capacity, even worse write performance. **RAID 10** mirrors then stripes — survives at least 1 failure (possibly more depending on which drives), 50% capacity, excellent read/write performance. **RAID Z2** (ZFS) is analogous to RAID 6 — double parity, survives 2 failures, but with ZFS's checksumming and self-healing.
 
-**For a database server with 6 drives: choose RAID 10.** Reasoning: databases are write-heavy and latency-sensitive. RAID 5/6 have a write penalty (read-modify-write cycle for small random writes) that kills database performance. RAID 10 gives the best write IOPS (writes go to mirrored pairs, no parity calculation), survives 1 drive failure minimum, and rebuilds are fast (just copy from mirror, not reconstruct from parity across all drives). The trade-off is 50% capacity vs 67% for RAID 5 or 83% for RAID 6, but for a database, performance and fast rebuilds outweigh capacity.
+**For a database server with 6 drives: choose RAID 10.** Reasoning: databases are write-heavy and latency-sensitive. RAID 5/6 have a write penalty (read-modify-write cycle for small random writes) that kills database performance. RAID 10 gives the best write IOPS (writes go to mirrored pairs, no parity calculation), survives 1 drive failure minimum, and rebuilds are fast (just copy from mirror, not reconstruct from parity across all drives). The trade-off is 50% capacity vs 83% for RAID 5 or 67% for RAID 6, but for a database, performance and fast rebuilds outweigh capacity.
 
 ### OP7 — Hard
 **Answer:**
@@ -283,7 +283,7 @@ If IPMI/iDRAC is exposed to the internet, it's a critical security risk: these i
 **Answer:**
 **Stretch cluster / DR for 3-node Proxmox + Ceph across two sites:**
 
-**The problem:** Ceph needs a majority of OSDs (Object Storage Daemons) to write data. With a 2-site deployment, if the inter-site link fails, neither site has a majority — split-brain. Writes halt on both sides. This is why 2-site Ceph without a tiebreaker is a bad idea.
+**The problem:** Ceph's monitors need a Paxos majority to keep the cluster map, and a pool needs `min_size` replicas reachable to accept writes. With a 2-site deployment, if the inter-site link fails, neither site has a monitor majority — writes halt on both sides. This is why 2-site Ceph without a tiebreaker is a bad idea.
 
 **Stretch cluster solution (Ceph 16+):**
 - 2 data sites (Site A, Site B) plus 1 tiebreaker/witness site (Site C) with a single monitor
@@ -570,13 +570,13 @@ Prevents voluntary disruptions (node drain, cluster upgrade) from taking down to
 
 ### CL11 — Medium
 **Answer:**
-**Object storage (S3, Azure Blob, GCS):** Stores unstructured data as objects (blobs) in a flat namespace (buckets/containers) with metadata. Accessed via HTTP REST API. Infinitely scalable, pay-per-use, 11-16 nines durability. No file locking, eventual consistency for overwrites (strong for new objects in S3). Use for: static assets, backups, data lakes, media storage, log archives, ML training data.
+**Object storage (S3, Azure Blob, GCS):** Stores unstructured data as objects (blobs) in a flat namespace (buckets/containers) with metadata. Accessed via HTTP REST API. Infinitely scalable, pay-per-use, 11 nines durability. No file locking; S3 has been strongly consistent for all operations, including overwrites, since December 2020. Use for: static assets, backups, data lakes, media storage, log archives, ML training data.
 
 **Block storage (EBS, Azure Managed Disk, GCP Persistent Disk):** Provides raw block devices attached to VMs. The VM OS formats it with a filesystem. High IOPS, low latency. Can only be attached to one VM at a time (except EBS multi-attach). Use for: database storage, VM boot disks, any workload needing a traditional filesystem with high performance.
 
 **File storage (EFS, Azure Files, GCP Filestore):** Provides a shared NFS/SMB filesystem accessible by multiple instances simultaneously. Managed NFS with automatic scaling. Lower IOPS than block storage but enables shared access. Use for: shared content (web server assets), home directories, legacy applications that require a POSIX filesystem shared across machines, lift-and-shift of on-prem file shares.
 
-**Durability and availability:** S3 standard: 99.999999999% (11 nines) durability, 99.99% availability. EBS: 99.999% durability, 99.99% availability (within an AZ). EFS: 99.999999999% (11 nines) durability, 99.99% availability.
+**Durability and availability:** S3 standard: 99.999999999% (11 nines) durability, 99.99% availability. EBS: 99.8–99.9% durability for gp2/gp3 (0.1–0.2% annual failure rate), 99.999% for io2; 99.99% availability (within an AZ). EFS: 99.999999999% (11 nines) durability, 99.99% availability.
 
 ### CL12 — Hard
 **Answer:**

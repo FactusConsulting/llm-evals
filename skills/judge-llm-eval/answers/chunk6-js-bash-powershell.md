@@ -1403,7 +1403,7 @@ The `@(...)` form is idiomatic and safe whether the expression returns 0, 1, or 
 $null[0]     # $null (PowerShell returns $null for any index into $null, no error by default)
 @()[0]       # $null (index out of bounds on empty array → $null, no error)
 ```
-Both silently produce `$null` in default (non-strict) mode. With `Set-StrictMode -Version 3.0` (or `Latest`), indexing out of bounds or indexing `$null` becomes an error, which is much safer for scripts. Similarly, enumerating `$null` with `foreach` iterates zero times in modern PS; in legacy strict mode or older versions it could be an error.
+Both silently produce `$null` in default (non-strict) mode. With `Set-StrictMode -Version 3.0` (or `Latest`), an out-of-bounds index on an array becomes an error; `$null[0]` still yields `$null`. Similarly, enumerating `$null` with `foreach` iterates zero times in modern PS; in legacy strict mode or older versions it could be an error.
 
 ### PS10 — Easy
 **Answer:**
@@ -1825,7 +1825,7 @@ Built-in resources cover `File`, `Registry`, `Service`, `User`, `Group`, `Window
 **Windows PowerShell 5.1 vs PowerShell 7+**:
 - **DSC 1.1** shipped with Windows PowerShell 5.1 and is tightly tied to the MOF compiler, the WMI/CIM-based LCM, and Windows. It still works on Windows Server.
 - **DSC 2.x** (project *DSCv2* / `PSDesiredStateConfiguration` 2.0.5+) decouples DSC from the inbox LCM: configurations are compiled by the new module, and it runs cross-platform (Windows, Linux, macOS) on PS 7+. The class-based resource model is emphasized.
-- **DSCv3** (currently preview, Microsoft) is a complete rewrite: a standalone cross-platform engine (`dsc` binary written in Rust), language-agnostic resources (PowerShell, Bash, JSON-schema-driven), JSON/YAML instead of MOF. It's the direction Microsoft is pushing; still new as of 2026.
+- **DSCv3** (GA since v3.0 in 2025, Microsoft) is a complete rewrite: a standalone cross-platform engine (`dsc` binary written in Rust), language-agnostic resources (PowerShell, Bash, JSON-schema-driven), JSON/YAML instead of MOF. It's the direction Microsoft is pushing; the resource ecosystem is still thin as of 2026.
 - Azure **Machine Configuration** (formerly Azure Policy Guest Configuration) is the Azure-hosted successor to Azure Automation DSC — it uses the newer engine under the hood.
 
 **What replaced DSC in modern IaC?** In practice, the industry largely moved to:
@@ -1835,4 +1835,4 @@ Built-in resources cover `File`, `Registry`, `Service`, `User`, `Group`, `Window
 - **Azure Machine Configuration / Azure Policy Guest Configuration** — Microsoft's managed successor to Azure Automation DSC for Azure VMs and Arc-enabled servers, still uses DSC under the hood but fronted by Azure Policy.
 - **DSCv3** is trying to win back this space by being lightweight, cross-platform, and IaC-toolable.
 
-Azure Automation DSC was officially **retired** in 2023 for new onboarding, with Machine Configuration as the successor — a strong signal that classic (v1) DSC is legacy, and most new Windows configuration work happens in Ansible, Bicep + custom script extensions, or Machine Configuration.
+Azure Automation State Configuration is being **retired** (end of support 30 September 2027), with Azure Machine Configuration as the successor — a strong signal that classic (v1) DSC is legacy, and most new Windows configuration work happens in Ansible, Bicep + custom script extensions, or Machine Configuration.
