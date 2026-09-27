@@ -69,6 +69,12 @@ See `rubric.md` for per-scenario pass/partial/spiral criteria and correct answer
   --judge-url http://192.168.2.170:8000
 ```
 
+`--reasoning-budget N` sends llama-server's per-request thinking budget, so a
+reasoning model stops thinking after N tokens and answers inside `--max-tokens`
+(32768 by default; a budget of half that leaves the answer the other half).
+Without it, a model that thinks past the cap returns no content and the
+scenario is skipped as truncated.
+
 The `--judge-url` endpoint is called after each response to score Completion, Accuracy, and Economy using the rubric. Use a strong judge (Claude Opus or similar) for reliable results. The 27B model can self-judge in a pinch but will be lenient on its own outputs.
 
 ### Both models
