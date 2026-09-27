@@ -27,6 +27,7 @@ JUDGE_URL=""         # If set, send each response to judge for rubric scoring
 VERBOSE=0
 MAX_TOKENS=32768   # must fit thinking + content for reasoning models; 4096 starved content (finish=length, empty answer) and the parser then silently saved the chain-of-thought, which the spiral check mis-flagged as looping. 20480 still truncated on heavy-reasoning scenarios (LD2/LD3) where thinking ran away — bumped to 32768 and the scenario loop made fault-tolerant so one truncation no longer aborts the whole pass
 TEMPERATURE=0.1
+REASONING_BUDGET=""   # llama-server: thinking tokens before the server closes the block; must leave room under MAX_TOKENS for the answer
 PARALLEL=0           # Run all scenarios in parallel (default: sequential)
 DELAY_BETWEEN=0      # Seconds to sleep between scenarios (courtesy gap for shared server)
 
@@ -40,6 +41,7 @@ while [[ $# -gt 0 ]]; do
     --judge-url)    JUDGE_URL="$2";    shift 2 ;;
     --max-tokens)   MAX_TOKENS="$2";   shift 2 ;;
     --temperature)  TEMPERATURE="$2";  shift 2 ;;
+    --reasoning-budget) REASONING_BUDGET="$2"; shift 2 ;;
     --parallel)     PARALLEL=1;        shift ;;
     --delay-between) DELAY_BETWEEN="$2"; shift 2 ;;
     --verbose|-v)   VERBOSE=1;         shift ;;
@@ -84,6 +86,9 @@ payload = {
     'max_tokens': $MAX_TOKENS,
     'temperature': $TEMPERATURE,
 }
+if '$REASONING_BUDGET':
+    payload['reasoning_budget_tokens'] = int('$REASONING_BUDGET')
+    payload['reasoning_budget_message'] = '\\n\\nI have used my thinking budget. I must stop here and give my final answer now.'
 print(json.dumps(payload))
 " <<< "$prompt")
 

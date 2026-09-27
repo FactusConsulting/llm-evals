@@ -39,23 +39,24 @@ See `judge-summary.md` for the full tables. Headline:
 
 ## What the quant costs
 
-Q2_K_XL is a 2-bit quant of a model whose f16 weights would not fit on this box at all.
-The damage it does is narrow and visible:
+Less than the first reading of these results suggested. The three failure classes
+below were first booked to Q2_K_XL; the Opus 5 reference run (September 2026) loses
+SC4-B, SC6-B and SC9-B in exactly the same way, so they are properties of the tasks
+and the judging, not of the 2-bit weights.
 
-1. **Syntax compression.** The model writes `variable "storage" { type = string, default = "500Gi" }`
-   and `import ( "context", "time", )`. Both are rejected by their own tools. The intent,
-   the resource schema and the logic are right; the separators are not. This is the single
-   largest score contributor and it hit SC4-B and SC9-B in all three runs.
-2. **Exact identifiers drift.** `AddFilter` for `AddEndpointFilter`, `ICustomRule` for
-   `IScriptRule`, `pods/logs` for `pods/log`, `-generate-resource-out` for
-   `-generate-config-out`, several ATT&CK-for-ICS technique IDs. The prose around them is
-   correct — it is the token-exact name that slips.
-3. **Cosmetic token leaks.** A single Chinese word ("横向") appeared mid-English-sentence in
-   SC9-A in all three runs, and a few proper nouns garbled ("MagP" for Maglev). Judges did
-   not score these; they are the clearest fingerprint of the 2-bit quant.
+1. **Syntax compression.** `variable "storage" { type = string, default = "500Gi" }` and
+   `import ( "context", "time", )` — comma-separated HCL and Go that the formatters
+   reject. Opus is marked down on the same sub-questions for HCL "as written" that
+   does not parse. Not the quant.
+2. **Exact identifiers drift.** `AddFilter` for `AddEndpointFilter`, `pods/logs` for
+   `pods/log`, several ATT&CK-for-ICS technique IDs. Shared with Opus on the same
+   sub-questions; a 2-bit model does it a little more often.
+3. **Cosmetic token leaks.** A Chinese word mid-sentence in SC9-A in all three runs, a
+   few garbled proper nouns. Only Q2 does this. Judges did not score it.
 
 What the quant does **not** cost: reasoning, architecture, trade-off analysis, knowledge
-breadth. Chunks 1, 4 and 7 were 100% in every run.
+breadth. Chunks 1, 4 and 7 were 100% in every run, and the three-way campaign puts the
+model within 0.1 pp of the Q4 Qwen3.8 on the same rubric.
 
 ## Practical consequence
 

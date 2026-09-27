@@ -317,24 +317,31 @@ def post_stream(url: str, key: str, body: dict, timeout: int) -> dict:
 
 def force_closure(url: str, model: str, key: str, sys_msg: str, user_msg: str,
                   reasoning: str, content: str, sampling: dict, timeout: int) -> dict:
-    """One follow-up turn for a case that hit the token ceiling mid-reasoning
-    with no Answer: line: the original exchange, the truncated reasoning as an
-    assistant turn, and a request for exactly one final line."""
+    """Closure for a case that hit the token ceiling mid-reasoning with no
+    Answer: line. First as a prefill: the truncated reasoning, ending in
+    "Answer:", is sent as the last assistant message and the model completes
+    it, so the answer comes from the same turn. A server that does not
+    continue an assistant message opens a fresh thinking block instead; then
+    it gets the reasoning as a finished turn and an instruction to close."""
     tail = reasoning if reasoning else content
     if len(tail) > REASONING_KEEP_CHARS:
         tail = tail[-REASONING_KEEP_CHARS:]
-    messages = [
-        {"role": "system", "content": sys_msg},
-        {"role": "user", "content": user_msg},
-        {"role": "assistant", "content": tail},
-        {"role": "user", "content": FORCE_INSTRUCTION},
-    ]
     # Greedy, whatever phase 1 sampled with. This turn extracts a conclusion from
     # reasoning that already exists; sampling noise here adds variance to the
     # score without measuring anything about the model.
     greedy = {**sampling, "temperature": 0.0}
-    body = request_body(model, messages, FORCE_MAX_TOKENS, greedy)
-    return post_stream(url, key, body, timeout)
+    exchange = [{"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg}]
+
+    prefill = exchange + [{"role": "assistant", "content": tail.rstrip() + "\n\nAnswer:"}]
+    r = post_stream(url, key, request_body(model, prefill, FORCE_MAX_TOKENS, greedy), timeout)
+    if not r["reasoning"] and r["content"].strip():
+        r["content"] = "Answer:" + r["content"]  # the prefill is not echoed
+        return r
+
+    turn = exchange + [{"role": "assistant", "content": tail},
+                       {"role": "user", "content": FORCE_INSTRUCTION}]
+    return post_stream(url, key, request_body(model, turn, FORCE_MAX_TOKENS, greedy), timeout)
 
 
 def budget_honoured(url: str, model: str, key: str):
@@ -571,7 +578,16 @@ def main() -> int:
     for s, v in summary["by_source"].items():
         print(f"  {s:<26} {v['ok']:>3}/{v['n']:<3} {v['pct']:>5.1f}%")
     print(f"-> {outdir}/results.json")
-    return 1 if errors else 0
+    # A case that errored is a record with error set and correct=False; the
+    # run still measured. Exit non-zero only when nothing did, so a caller
+    # keeps a mostly-complete results.json instead of re-running over it.
+    if errors == len(records):
+        print(f"  ERROR: every case failed ({records[-1]['error']})", file=sys.stderr)
+        return 1
+    if errors:
+        print(f"  WARNING: {errors} of {len(records)} cases errored and scored zero.",
+              file=sys.stderr)
+    return 0
 
 
 if __name__ == "__main__":

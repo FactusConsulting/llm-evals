@@ -99,14 +99,23 @@ reproducibility rather than variance.
 ### Think-closure
 
 A case that hits its token ceiling mid-reasoning with no `Answer:` line gets
-one follow-up turn: the original exchange, the truncated reasoning (the last
-6000 characters, if it ran longer) as an assistant turn, and a request for
-exactly one final line, capped at 512 tokens. The case is graded from that
-follow-up and marked `forced: true`; the summary's `forced` count says how
-many cases needed it. `--no-force` turns this off. `--think-budget N` caps
+closed in a second call: the original exchange plus the truncated reasoning
+(the last 6000 characters, if it ran longer) ending in `Answer:`, sent as the
+last assistant message for the server to complete, capped at 512 tokens. A
+server that does not continue an assistant message opens a fresh thinking
+block instead; then the reasoning goes back as a finished turn with an
+instruction to write one final line. The case is graded from that call and
+marked `forced: true`; the summary's `forced` count says how many cases
+needed it. `--no-force` turns this off. `--think-budget N` caps
 only the first phase's tokens (default: the resolved `--max-tokens` budget),
 so the cost of a wide sweep can be bounded independently of how much room a
 model gets before closure kicks in.
+
+The exit code is 0 when the run measured something, even if some cases
+errored (they are records with `error` set, counted in the summary's
+`errors`); 1 only when every case failed. A driver that re-runs on non-zero
+would otherwise overwrite a results.json that is one dropped connection short
+of complete.
 
 ### Reasoning budget
 

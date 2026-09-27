@@ -44,14 +44,19 @@ SCENARIOS = {
     "no-usage": sse(delta(content="Answer: A"), finish("stop")),
 }
 # "ceiling": the first call (2 messages) hits the token cap with no Answer:
-# line; the forced follow-up (4 messages) answers cleanly.
+# line; the prefill (3 messages, the last one assistant) is completed.
+# "ceiling-noprefill": the server ignores the prefill and opens a fresh
+# thinking block, so the instruction turn (4 messages) has to answer.
 CEILING_FIRST = sse(delta(reasoning_content="round and round " * 400), finish("length"),
                     usage_chunk(40, 4096))
+CEILING_PREFILLED = sse(delta(content=" 42"), finish("stop"), usage_chunk(4200, 2))
+CEILING_FRESH_THINK = sse(delta(reasoning_content="let me start over"), finish("length"),
+                          usage_chunk(4200, 512))
 CEILING_FORCED = sse(delta(content="Answer: 42"), finish("stop"), usage_chunk(4200, 8))
-# "stall": the first call streams one delta and then goes silent; the forced
-# follow-up answers.
+# "stall": the first call streams one delta and then goes silent; the prefill
+# answers.
 STALL_FIRST = sse(delta(reasoning_content="thinking, then nothing "))
-STALL_FORCED = sse(delta(content="Answer: 7"), finish("stop"), usage_chunk(900, 5))
+STALL_FORCED = sse(delta(content=" 7"), finish("stop"), usage_chunk(900, 5))
 
 
 class MockHandler(BaseHTTPRequestHandler):
@@ -74,9 +79,11 @@ class MockHandler(BaseHTTPRequestHandler):
         REQUEST_LOG.append((model, len(messages)))
         TEMP_LOG.append(payload.get("temperature"))
         if model == "ceiling":
-            body = CEILING_FORCED if len(messages) >= 4 else CEILING_FIRST
+            body = {2: CEILING_FIRST, 3: CEILING_PREFILLED}.get(len(messages), CEILING_FORCED)
+        elif model == "ceiling-noprefill":
+            body = {2: CEILING_FIRST, 3: CEILING_FRESH_THINK}.get(len(messages), CEILING_FORCED)
         elif model == "stall":
-            if len(messages) < 4:
+            if len(messages) < 3:
                 self._write(STALL_FIRST.split(b"data: [DONE]")[0], "text/event-stream")
                 time.sleep(3)  # longer than the test's STALL_SECONDS
                 return
@@ -217,11 +224,18 @@ check("estimated completion tokens are positive", rec3["completion_tokens"] > 0,
 ceiling_case = make_case("AIME2025", "p4", choice=[], answer_kind="integer", answer="42")
 rec4, summ4, _ = run_one(ceiling_case, "ceiling", gate)
 log_after_forced = list(REQUEST_LOG)  # snapshot: REQUEST_LOG itself keeps mutating
-check("length-with-no-answer triggers exactly one follow-up",
-      log_after_forced, [("ceiling", 2), ("ceiling", 4)])
+check("length-with-no-answer triggers one prefill and nothing else",
+      log_after_forced, [("ceiling", 2), ("ceiling", 3)])
 check("the case is marked forced", rec4["forced"], True)
-check("grading uses the forced answer", rec4["got"], "42")
+check("grading uses the completed prefill", rec4["got"], "42")
 check("summary counts the forced case", summ4["forced"], 1)
+
+rec4b, _, _ = run_one(ceiling_case, "ceiling-noprefill", gate)
+log_after_fallback = list(REQUEST_LOG)
+check("a prefill answered with fresh reasoning falls back to the instruction turn",
+      log_after_fallback, [("ceiling-noprefill", 2), ("ceiling-noprefill", 3),
+                           ("ceiling-noprefill", 4)])
+check("the fallback answer is graded", rec4b["got"], "42")
 
 rec5, _, _ = run_one(ceiling_case, "ceiling", gate, no_force=True)
 log_after_no_force = list(REQUEST_LOG)
