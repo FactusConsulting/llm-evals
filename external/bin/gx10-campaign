@@ -21,7 +21,7 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 HOMELAB="${HOMELAB:-$HOME/source/homelab}"
-HOST="${GX10_URL:-http://192.168.2.173:30000}"
+HOST="${GX10_URL:-https://gx10-1dd1.lwa.dk}"
 OUT="$REPO/external/results/gx10-3way"
 STATUS="$OUT/STATUS"
 PI_CONFIG="${PI_CONFIG:-$HOME/.pi/agent/models.json}"
@@ -62,8 +62,15 @@ if [[ "${1:-}" == "status" ]]; then
   exit 0
 fi
 
+# The fleet key, which gx10 and the router both take. Exported for the runners,
+# which read LLAMA_API_KEY; bfcl and tau2 carry it to the eval server on the
+# ssh session's stdin, never in a file there.
+LLAMA_API_KEY="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['providers']['homelab']['apiKey'])" "$PI_CONFIG")" \
+  || { echo "no fleet key in $PI_CONFIG" >&2; exit 1; }
+export LLAMA_API_KEY
+
 served_alias() {
-  curl -s --max-time 15 "$HOST/v1/models" 2>/dev/null |
+  curl -s --max-time 15 -H @<(printf 'Authorization: Bearer %s\n' "$LLAMA_API_KEY") "$HOST/v1/models" 2>/dev/null |
     python3 -c "import json,sys; print(json.load(sys.stdin)['data'][0]['id'])" 2>/dev/null
 }
 
@@ -107,7 +114,7 @@ run_step() {
 }
 
 ds4() {  # <key> <alias> <suite> <seed>
-  "$REPO/external/ds4-eval/run.py" --url "$HOST" --model "$2" --api-key none \
+  "$REPO/external/ds4-eval/run.py" --url "$HOST" --model "$2" \
     --suite "$3" --mode served --seed "$4" \
     --max-tokens "$DS4_MAX_TOKENS" --timeout "$DS4_TIMEOUT" \
     --reasoning-budget "$DS4_REASONING_BUDGET" \
@@ -115,15 +122,12 @@ ds4() {  # <key> <alias> <suite> <seed>
 }
 
 bfcl() {  # <key> <alias>
-  env -u LLAMA_API_KEY EVAL_OUT="$OUT/$1/bfcl" "$REPO/external/bfcl/run.sh" "$2" "$HOST" \
+  EVAL_OUT="$OUT/$1/bfcl" "$REPO/external/bfcl/run.sh" "$2" "$HOST" \
     --threads 1 --max-tokens "$TOOL_MAX_TOKENS"
 }
 
 tau2() {  # <key> <alias>
-  # The simulator's key is read here and lives only in this process's environment.
-  local k
-  k="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['providers']['homelab']['apiKey'])" "$PI_CONFIG")" || return 1
-  env -u LLAMA_API_KEY TAU2_USER_API_KEY="$k" EVAL_OUT="$OUT/$1/tau2" \
+  TAU2_USER_API_KEY="$LLAMA_API_KEY" EVAL_OUT="$OUT/$1/tau2" \
     "$REPO/external/tau2/run.sh" "$2" "$HOST" \
     --num-tasks "$TAU2_TASKS" --num-trials "$TAU2_TRIALS" \
     --max-concurrency 1 --max-tokens "$TOOL_MAX_TOKENS"
@@ -131,7 +135,7 @@ tau2() {  # <key> <alias>
 
 loopdet() {  # <key> <alias>
   (cd "$REPO/loop-detection" && ./run-eval.sh --model-url "$HOST" \
-      --model-name "gx10-3way-$1-run1" --api-key dummy --delay-between 5 \
+      --model-name "gx10-3way-$1-run1" --delay-between 5 \
       --reasoning-budget "$LOOP_REASONING_BUDGET")
 }
 
@@ -142,7 +146,7 @@ knowledge() {  # <key> <alias> — one run; judged separately
   for i in 1 2 3 4 5 6 7 8 9; do
     [[ -s "$md/run1/chunk$i-response.txt" ]] && continue
     "$REPO/run-chunk-validated.sh" "$md"/chunks/chunk"$i"-*.txt \
-      "$md/run1/chunk$i-response.txt" "$HOST/v1/chat/completions" none "$2" || rc=1
+      "$md/run1/chunk$i-response.txt" "$HOST/v1/chat/completions" "$LLAMA_API_KEY" "$2" || rc=1
   done
   return $rc
 }

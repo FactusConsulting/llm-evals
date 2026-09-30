@@ -5,7 +5,7 @@ Prompts and grading follow antirez/ds4's ds4-eval, so the numbers mean the same
 thing. Nothing here is judged by a model: every case has a key and a
 deterministic comparison, which is the point — no judge noise, no judge cost.
 
-  ./run.py --url http://192.168.2.173:30000 --model glm5.3-flash \
+  LLAMA_API_KEY=... ./run.py --url https://gx10-59c7.lwa.dk --model glm5.3-flash \
            --suite core --mode gate --out results/glm5.3-flash-q2kxl/gate
 
 Two named sampling presets (--mode gate|measure) trade off reproducibility

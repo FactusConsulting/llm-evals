@@ -34,7 +34,7 @@ the subsets are small enough that a few cases swing a percentage point.
 ```bash
 ./fetch_cases.py                      # writes cases.json from a pinned ds4 revision
 ./test_grade.py && ./test_run.py      # grading port + runner, mock server only
-./run.py --url http://192.168.2.173:30000 --model glm5.3-flash \
+LLAMA_API_KEY=... ./run.py --url https://gx10-59c7.lwa.dk --model glm5.3-flash \
          --suite core --mode gate --out ../../results/<model>/ds4-core-gate
 ```
 
