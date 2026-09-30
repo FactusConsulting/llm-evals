@@ -9,8 +9,8 @@ wrong.
 A score without these four facts cannot be compared to anything later.
 
 ```bash
-HOST=http://192.168.2.173:30000        # the endpoint under test
-KEY=none                                # or the fleet key for llm.lwa.dk
+HOST=https://gx10-59c7.lwa.dk           # the endpoint under test
+KEY=...                                 # the fleet key; every host and llm.lwa.dk take it
 
 curl -sS -H "Authorization: Bearer $KEY" $HOST/v1/models | jq -r '.data[].id'
 curl -sS -H "Authorization: Bearer $KEY" $HOST/props | python3 -c "
