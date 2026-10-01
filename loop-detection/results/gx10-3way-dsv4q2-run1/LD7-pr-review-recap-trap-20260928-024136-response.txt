@@ -1,0 +1,29 @@
+**Review**
+
+- **Critical: JWT secret is ephemeral and unmanaged.** `jwtSecret` is generated in `init()` via `rand.Read` without checking the error, and it is never persisted or configurable. Every process restart invalidates all outstanding tokens, and multiple app instances will not share a secret. This breaks the stated goal of removing Redis for session storage—tokens become unusable after a deploy or in a multi-instance setup. Use a stable secret from environment/config (e.g., `os.Getenv("JWT_SECRET")`) and fail fast if it is missing.
+
+- **Security: Signing algorithm is not enforced.** In `ValidateToken`, the keyfunc returns `jwtSecret` regardless of the token's `alg` header. This allows algorithm-confusion attacks (e.g., `HS256` vs. `RS256`/`none`). The keyfunc must check `token.Method` is `*jwt.SigningMethodHMAC` before returning the secret.
+
+- **Security: `rand.Read` error is ignored in `init()`.** If `rand.Read` fails, `jwtSecret` will be all zeros, making tokens trivially forgeable. Handle the error (e.g., panic or return a startup error) rather than silently proceeding.
+
+- **Context keys are untyped strings.** `context.WithValue(r.Context(), "userID", ...)` and `"role"` use raw string keys, which can collide with other packages and are not type-safe. Define a custom context key type (e.g., `type contextKey int`) and use typed constants.
+
+- **Authorization header parsing is too permissive.** `strings.TrimPrefix(authHeader, "Bearer ")` will accept a header like `"Bearer"` (no token) or `"Basic abc"` (no trim) and attempt to validate the whole string. It also does not reject headers that do not start with `Bearer `. Validate the header format explicitly (e.g., `strings.SplitN(authHeader, " ", 2)` and check the scheme is `Bearer`).
+
+- **No revocation or user-status check.** Since Redis is removed, there is no way to revoke a token before its 24-hour expiry. A disabled or deleted user will retain access until expiration. Consider adding a short-lived access token with a refresh token flow, or at least a lightweight revocation check (e.g., a database lookup) for sensitive operations.
+
+- **Refresh token is generated but never used.** `GenerateRefreshToken` creates a token but there is no storage, validation, or rotation logic in the excerpt. If refresh tokens are intended, the flow is incomplete; if not, the function is dead code.
+
+- **Claims are not validated for required fields.** `UserID` and `Role` are never checked for emptiness. A token with empty strings would be accepted and stored in context, potentially leading to nil/empty values downstream.
+
+- **No issuer/audience validation.** `RegisteredClaims` only sets `ExpiresAt` and `IssuedAt`. Tokens from other services (if any) or with unexpected audiences would be accepted. Add `Issuer` and `Audience` claims and validate them in `ValidateToken`.
+
+- **Middleware does not distinguish between malformed and expired tokens.** All errors from `ValidateToken` are treated as `401 Unauthorized`. Consider returning `400 Bad Request` for malformed tokens and `401` for expired/invalid signatures to aid debugging.
+
+- **`jwt.ErrSignatureInvalid` is used as a fallback error.** If `token.Claims` is not `*Claims` or `token.Valid` is false, the code returns `jwt.ErrSignatureInvalid`, which is misleading. Return a more descriptive error (e.g., `jwt.ErrInvalidClaims` or a custom error).
+
+- **Token lifetime is hardcoded to 24 hours.** This may be too long for a session token, especially without revocation. Make the TTL configurable and consider shorter expiry for access tokens.
+
+- **`jwtSecret` is a package-level variable and not protected.** It is accessible within the package and could be accidentally logged or exposed. Use a private variable and consider a `getSecret()` function that reads from a secure source.
+
+- **No tests or documentation for the new auth flow.** Given the security-sensitive nature, add unit tests for token issuance/validation, algorithm enforcement, and middleware header handling.

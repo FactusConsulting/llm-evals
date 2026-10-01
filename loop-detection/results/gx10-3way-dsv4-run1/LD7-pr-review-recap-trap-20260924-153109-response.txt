@@ -1,0 +1,50 @@
+### PR Review
+
+#### Critical Issues
+
+- **JWT secret is generated at startup and never persisted.**  
+  `jwtSecret` is created in `init()` with `rand.Read` and the error is ignored. This means:
+  - Every process restart invalidates all issued tokens, forcing all users to log in again.
+  - In a multi-instance deployment, each instance has a different secret, so tokens issued by one instance are rejected by another.
+  - The secret cannot be rotated without a full outage.
+  - If `rand.Read` fails (unlikely but possible), the secret becomes all zeros, a severe security vulnerability.
+
+- **No token revocation mechanism.**  
+  The PR removes Redis session storage, but JWT tokens are stateless and cannot be revoked before expiration. There is no logout/blacklist implementation, so a stolen token remains valid for up to 24 hours. This is a significant security regression compared to server-side sessions.
+
+- **Refresh tokens are generated but never stored or validated.**  
+  `GenerateRefreshToken` returns a random string, but there is no persistence, no association with a user, no rotation logic, and no endpoint to exchange it for a new access token. As written, refresh tokens are useless and cannot be revoked.
+
+#### High-Risk Issues
+
+- **Signing algorithm is not enforced in `ValidateToken`.**  
+  The keyfunc returns `jwtSecret` for any token, without checking that the token’s `alg` is `HS256`. This opens the door to algorithm confusion attacks (e.g., `none` or other HMAC variants). The keyfunc should explicitly verify `t.Method == jwt.SigningMethodHS256`.
+
+- **Context keys are plain strings.**  
+  `context.WithValue` uses `"userID"` and `"role"` as keys. This is unsafe because any package can accidentally overwrite or read these values. Define a custom, unexported type for context keys.
+
+#### Medium Concerns
+
+- **Malformed `Authorization` header handling is fragile.**  
+  `strings.TrimPrefix(authHeader, "Bearer ")` silently strips the prefix only if present. If the header is `"Bearer"` (no space) or `"Bearer    "` (extra spaces), the token string becomes malformed and validation fails with a generic error. Better to parse the header explicitly and return a clear 401.
+
+- **No issuer or audience validation.**  
+  `Claims` only sets `ExpiresAt` and `IssuedAt`. Without `Issuer` or `Audience`, tokens can be replayed across different services or environments if the same secret is shared.
+
+- **24-hour expiration with no refresh flow.**  
+  Users will be forced to re-authenticate every day. The presence of `GenerateRefreshToken` suggests a refresh flow was intended, but it is not implemented in this PR.
+
+#### Low-Priority Issues
+
+- **`rand.Read` error ignored in `init()`.**  
+  Even though the chance of failure is low, the error should be handled (e.g., panic or fallback to a secure source) to avoid a zero-value secret.
+
+- **`ValidateToken` returns `jwt.ErrSignatureInvalid` for any invalid claims.**  
+  This error is misleading when the token is expired, malformed, or has invalid claims. Return a more descriptive error to aid debugging.
+
+#### Questions
+
+- How are refresh tokens meant to be used? Is there a `/refresh` endpoint planned? How will they be stored and revoked?
+- How will logout work without server-side session state? Is a token blacklist planned?
+- How is the JWT secret managed across deployments and restarts? Is there a configurable secret or a secrets manager integration?
+- Should the middleware also accept tokens from cookies for backward compatibility, or is the Authorization header the only intended method?

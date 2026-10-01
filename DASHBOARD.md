@@ -67,26 +67,31 @@ numbers: [`report.json`](external/results/gx10-3way/report.json).
 | AIME 2025 | 96.0% | 98.0% | **100%** | **100%** | 100% |
 | Code review (COMPSEC) | 97.1% | 94.1% | 97.1% | **100%** | 100% |
 | MMLU-Pro | **95.0%** | 91.7% | 90.0% | 91.7% | 98.3% |
-| OlympiadBench | 60.0% | 65.0% | **75.0%** | 70.0% | 100% |
+| OlympiadBench | 60.0% | 65.0% | 75.0% | **80.0%** | 100% |
 | ds4 core, mean of 2 seeds | 90.8% | 90.8% | 91.3% | **92.9%** | 91.8% |
 | ds4 hard, mean of 2 seeds | 88.0% | 87.0% | 88.0% | **91.0%** | 99.0% |
 | Unstable cases (of 142) | 13 | 12 | 12 | **4** | 2 |
 | BFCL (tool calling) | 80.0% | **83.2%** | 80.7% | 77.1% | 85.0% ʳ |
-| tau2 avg reward / pass^2 | 0.74 / 0.60 | 0.62 / 0.45 | 0.75 / 0.65 | **0.85 / 0.75** | 0.82 / 0.65 ʳ |
-| Loop flags /12 | 2 | 0 | 0 | 0 | 1 |
+| tau2 avg reward / pass^2 ᵘ | 0.74 / 0.60 | 0.62 / 0.45 | 0.75 / 0.65 | **0.85 / 0.75** | 0.82 / 0.65 ʳ |
+| tau2 reward, simulator failures excluded ᵘ | 0.78 | 0.67 | 0.79 | **0.85** | 0.82 ʳ |
+| Loop flags /12 ˡ | 2 | 0 | 0 | 0 | 1 |
 | Tokens per correct answer | 15,078 | 6,337 | 6,373 | 12,395 | 699 |
 
-**Qwen3.8-Flash-Next** is the strongest of the three on reasoning, the most stable across
-seeds, and the best on tau2 — its one weakness is multi-turn tool calling (BFCL multi-turn
-43% vs 73–87%). **GLM** is the most thorough on the knowledge suite and SuperGPQA at 2–3× the
-tokens. **DeepSeek** is the fastest and cleanest (no loops) and best local on BFCL, but
-clearly worst on tau2. Opus 5 separates only on the hard suite.
+**Qwen3.8-Flash-Next** is the most stable across seeds (4 unstable cases against 12–13) —
+the one gap in this table large enough to rest a decision on. It also leads on reasoning
+and tau2; its weakness is multi-turn tool calling (BFCL multi-turn 43% vs 63–87%). **GLM**
+and Qwen tie on the knowledge suite (0.09 pp apart); GLM leads SuperGPQA at 2–3× the
+tokens. **DeepSeek** is the fastest, best local on BFCL, and lowest on tau2. Opus 5
+separates only on the hard suite. Most other per-row gaps rest on one knowledge run, 20
+OlympiadBench cases or 40 tau2 simulations and are within noise.
 
 **IQ2_M vs IQ3_XXS** (DeepSeek, same regime, September 28): the 2-bit quant ties the 3-bit
-on ds4 (256/284 vs 254/284), wins tau2 (0.75 vs 0.62) and OlympiadBench, loses 2.5 pp on
-BFCL multi-turn and 0.7 pp on the knowledge suite — all within the two-seed noise except
-tau2. It runs with the dSpark draft at the full 262k window (30 tok/s, 20 GB free) in
-0.55× the wall time. The IQ2_M card is the one gx10 serves DeepSeek from.
+on ds4 (256/284 vs 254/284), scores higher on tau2 (0.75 vs 0.62; 0.79 vs 0.67 without
+simulator failures, not significant at 40 simulations) and OlympiadBench, and loses 2.5 pp
+on BFCL overall — 13.3 pp of it on multi-turn (19/30 vs 23/30) — and 0.7 pp on the
+knowledge suite. It ran with the dSpark draft at 262k on one slot (30 tok/s, 20 GB free) in
+0.60× the ds4 wall time. The served IQ2_M card runs 2×524,288 context, a configuration this
+campaign did not measure.
 
 ᵈ DeepSeek IQ3_XXS ran without its dSpark draft at 262k context: 98 GB of weights plus
 the 11 GB draft leave the host ~9 GB, and the driver fails contiguous allocations at
@@ -95,6 +100,16 @@ that margin (reboot on a 35k prompt). The draft changes speed, not answers.
 with DSpark. Knowledge judged after the answer-key corrections in #34.
 ʳ Opus 5 through `external/lib/claude_shim.py`; BFCL and tau2 use the shim's prompted tool
 calling, so they are a lower bound. One GPQA case is refused by its safety filter.
+ᵘ The tau2 user simulator is `workhorse` through LiteLLM, which falls back to `bigbrain` —
+the gx10 model under test — so in 8–13 of each model's 40 simulations the model also played
+the user (for Opus 5, DeepSeek did). Every `too_many_errors` zero is the simulator never
+giving the correct user ID; both `infrastructure_error`s are an empty simulator message.
+The second tau2 row drops those simulations.
+ˡ Loop flags are the runner's automatic flags. GLM's two are LD10 (Opus 5 gets the same
+one) and LD11, a false positive per its [verdict](results/glm5.3-flash-q2kxl-mtp-2x128k-gx10/verdict.md).
+The IQ2_M loop pass ran with a 16,384-token reasoning budget and the others without, so
+their empty-answer counts do not compare. GLM's ds4 seed-1 runs predate the stall
+detector, and most of its core seed 1 ran without the reasoning budget.
 
 ## vLLM vs llama.cpp — same model, both engines
 
