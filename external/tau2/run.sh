@@ -208,7 +208,14 @@ fi
 caveats=()
 [[ "$SELF_PLAY" == yes ]] && caveats+=("self-play: $MODEL was its own user simulator")
 judged="$(summary simulations_judged)"; expected="$(summary simulations_expected)"
-[[ "$judged" == "$expected" ]] || caveats+=("$judged of $expected simulations were judged; the rest never ran")
+infra_errors="$(summary terminations infrastructure_error)"
+if [[ "$judged" != "$expected" ]]; then
+  if [[ -n "$infra_errors" ]]; then
+    caveats+=("$judged of $expected simulations were judged; $infra_errors ended in infrastructure_error and are not scored")
+  else
+    caveats+=("$judged of $expected simulations were judged")
+  fi
+fi
 user_errors="$(summary terminations user_error)"
 [[ -n "$user_errors" ]] && caveats+=("$user_errors simulations ended in user_error — the simulator's failure, scored as the agent's")
 cut_agent="$(summary truncated_turns agent)"; cut_user="$(summary truncated_turns user)"
