@@ -1,0 +1,23 @@
+## Code Review: `cache` package — new caching layer
+
+**Verdict: Request changes** (must-fix items below; do not merge as-is)
+
+### Must fix
+
+1. **cache.go:5 — Package does not compile.** `"context"` is imported but never used. This is a hard compile error in Go, which also means the tests as submitted cannot have run. Remove the import or use it (a context-aware evictor would be the natural use — see next item).
+
+2. **cache.go:26, 52–64 — Unstoppable goroutine; `Cache` is never garbage-collectable.** `New` spawns `go c.evict()` with no shutdown path. Two consequences: (a) one leaked goroutine per cache for the process lifetime; (b) the goroutine keeps `c` reachable, so any `Cache` dropped by its caller is never GC'd — unbounded memory growth in programs that create caches dynamically (including every test run). Add a `Stop()`/`Close()` (done channel or `context.Context`), replace `time.Sleep` with `time.Ticker`, and `select` on the stop signal.
+
+3. **cache.go:54 — Eviction interval is fixed at 1 minute regardless of TTL.** Expired entries are pinned in memory for up to a minute after expiry. With short TTLs (the tests use 100ms) a workload writing many keys accumulates unbounded memory between sweeps. Derive the interval from `ttl` (e.g., `ttl/2`, clamped to a sane minimum) and/or delete lazily on expired `Get` (cache.go:40).
+
+4. **cache.go:21–28 — No validation of `ttl`.** `New(0)` stores `expiresAt = now` (cache.go:32), so the entry's validity at read time (cache.go:40) depends on clock granularity — nondeterministic. Negative TTL is dead on arrival. Reject `ttl <= 0` in `New` or document behavior. Also decide boundary semantics: `time.Now().After(...)` is strict, so an entry is still valid at the exact expiry instant (same issue at cache.go:58).
+
+5. **cache.go:43 — `Get` hands out shared mutable state.** Values are stored and returned as `interface{}` by reference; for pointers/slices/maps, one goroutine mutating a value it `Set` while another `Get`s it is a data race the cache cannot prevent. At minimum document that values must be treated as immutable; consider noting it on the type.
+
+6. **cache_test.go — No concurrency test.** The type advertises thread safety via its mutex, but nothing exercises it. Add a test with concurrent `Set`/`Get`/`Delete` and require it to run under `-race`.
+
+### Nits
+
+1. cache.go:11,30,36 — Use `any` instead of `interface{}` (Go 1.18+).
+2. cache.go:16 — `Get` is read-only; `sync.RWMutex` would allow concurrent reads instead of serializing them.
+3. cache_test.go:16 — `time.Sleep`-based expiry assertion is timing-flaky on loaded CI; poll with a deadline instead.

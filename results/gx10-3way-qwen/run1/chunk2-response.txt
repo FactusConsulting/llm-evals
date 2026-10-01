@@ -1,0 +1,834 @@
+# Kubernetes
+
+## K1 — Easy: What is the difference between a Deployment and a StatefulSet?
+A **Deployment** manages stateless workloads. Pods are interchangeable, can be created/deleted in any order, and rolling updates are used to replace pods gradually.
+
+A **StatefulSet** manages stateful workloads. It provides:
+- Stable, unique pod names, e.g. `db-0`, `db-1`
+- Stable persistent storage per pod
+- Ordered creation and deletion
+- Ordered scaling
+- A governing headless Service for stable DNS names
+
+Use Deployments for stateless apps; use StatefulSets for databases, message queues, or other workloads needing stable identity/storage.
+
+---
+
+## K2 — Easy: How does a Kubernetes Service of type ClusterIP route traffic to pods?
+A `ClusterIP` Service creates an internal virtual IP address inside the cluster.
+
+Traffic flow:
+1. A pod sends traffic to the Service’s `ClusterIP:port`.
+2. `kube-proxy` on the node intercepts that traffic using `iptables`, `IPVS`, or `nftables`.
+3. The rule DNATs the traffic to one of the pod IPs listed in the Service’s `Endpoints` or `EndpointSlice`.
+4. The selected pod receives the request.
+
+The Service itself does not run a proxy; routing is implemented by node-level networking rules.
+
+---
+
+## K3 — Medium: Explain the difference between a PersistentVolume, a PersistentVolumeClaim, and a StorageClass. How do they relate?
+- **PersistentVolume, PV**: A cluster-level storage resource representing actual storage, such as a disk, NFS export, or cloud volume.
+- **PersistentVolumeClaim, PVC**: A user’s request for storage, specifying size, access modes, and optionally a `storageClassName`.
+- **StorageClass**: Defines how storage should be dynamically provisioned, including the provisioner and parameters.
+
+Relationship:
+- A PVC requests storage.
+- If a matching PV exists, Kubernetes binds the PVC to that PV.
+- If no matching PV exists and the PVC references a StorageClass, the provisioner dynamically creates a PV and binds it to the PVC.
+
+---
+
+## K4 — Medium: A pod is stuck in CrashLoopBackOff. Describe your troubleshooting steps.
+1. **Check pod events**  
+   Run `kubectl describe pod <name>` and look for scheduling errors, image pull failures, probe failures, or OOMKilled events.
+
+2. **Inspect container logs**  
+   Use `kubectl logs <pod>` and `kubectl logs <pod> --previous` to see why the container exited.
+
+3. **Check resource limits**  
+   Look for `OOMKilled`, CPU throttling, or memory limit issues.
+
+4. **Verify configuration and dependencies**  
+   Check environment variables, ConfigMaps, Secrets, command/args, volume mounts, permissions, and whether required services or databases are reachable.
+
+5. **Validate image and entrypoint**  
+   Confirm the image exists, the tag is correct, and the container command actually starts a long-running process.
+
+---
+
+## K5 — Medium: What is the role of CoreDNS in a Kubernetes cluster? What happens to DNS resolution if the CoreDNS pods are down?
+**CoreDNS** is the default cluster DNS server. It resolves:
+- Kubernetes Service names, e.g. `my-service.namespace.svc.cluster.local`
+- Pod DNS names
+- External domains by forwarding queries to upstream DNS servers
+
+If CoreDNS pods are down:
+- Pods cannot resolve in-cluster Service names.
+- Applications that rely on DNS-based service discovery fail.
+- External DNS resolution may also fail if pods use the cluster DNS server.
+- Some clients may temporarily succeed using cached DNS entries.
+
+---
+
+## K6 — Hard: Explain how the Kubernetes scheduler decides which node to place a pod on. Cover filtering, scoring, and at least 3 specific factors.
+The Kubernetes scheduler watches for pods that do not have a `nodeName` assigned.
+
+It performs two main phases:
+
+### 1. Filtering
+The scheduler removes nodes that cannot run the pod.
+
+Examples:
+- Insufficient CPU or memory requests
+- Node selector mismatch
+- Node affinity requirements not satisfied
+- Taints not tolerated by the pod
+- Volume constraints, such as zone or access mode
+- Host port conflicts
+- Unschedulable nodes
+
+### 2. Scoring
+The scheduler ranks feasible nodes by preference.
+
+Examples:
+- Least requested CPU/memory
+- Balanced resource usage
+- Image locality, preferring nodes that already have the image
+- Preferred node affinity
+- Pod affinity and anti-affinity
+- Spread across zones or failure domains
+
+After scoring, the scheduler binds the pod to the highest-scoring node.
+
+---
+
+## K7 — Hard: You have a pod with requests.memory: 256Mi and limits.memory: 512Mi. The node has 4GB RAM with 3.5GB already requested. Will the pod be scheduled? What happens if it actually uses 600Mi at runtime?
+Yes, the pod will likely be scheduled.
+
+Kubernetes schedules based on **requests**, not limits.
+
+Node remaining requestable memory:
+
+```text
+4GB - 3.5GB = 0.5GB = 512Mi
+```
+
+Pod requests:
+
+```text
+256Mi
+```
+
+Since `256Mi <= 512Mi`, the pod fits.
+
+If the pod actually uses `600Mi`, it exceeds its memory limit of `512Mi`. The container’s cgroup memory limit is enforced, and the container will be **OOMKilled**. Kubernetes may then restart it depending on the restart policy.
+
+---
+
+## K8 — Hard: Explain the full lifecycle of a request hitting a Kubernetes Ingress backed by an NGINX ingress controller, all the way to the application pod.
+Example flow:
+
+1. **Client request**
+   - A client resolves the application domain and sends an HTTP/HTTPS request.
+
+2. **External load balancer**
+   - The DNS record points to a cloud load balancer.
+   - The load balancer forwards traffic to the ingress controller’s Service, often a `LoadBalancer` or `NodePort` Service.
+
+3. **kube-proxy / iptables / IPVS**
+   - On the node receiving the traffic, `kube-proxy` rules forward the Service traffic to an NGINX ingress controller pod.
+
+4. **NGINX ingress controller**
+   - The NGINX pod receives the request.
+   - It matches the request against Ingress rules, such as host and path.
+   - The Ingress resource tells NGINX which backend Kubernetes Service should handle the request.
+
+5. **Service and Endpoints**
+   - The ingress controller watches Services and Endpoints/EndpointSlices.
+   - It resolves the backend Service to a list of ready application pod IPs.
+
+6. **Proxy to application pod**
+   - NGINX proxies the request directly to one of the application pod IPs on the target port.
+
+7. **Application pod responds**
+   - The application pod processes the request and returns the response back through NGINX to the client.
+
+---
+
+## K9 — Medium: What is a NetworkPolicy? If no NetworkPolicy exists in a namespace, what is the default behavior? What happens when you apply one that selects certain pods?
+A **NetworkPolicy** controls network traffic between pods, namespaces, IP blocks, or external endpoints.
+
+Default behavior:
+- If no NetworkPolicy exists in a namespace, all ingress and egress traffic is allowed by default, assuming the CNI plugin does not impose its own default deny.
+
+When you apply a NetworkPolicy that selects certain pods:
+- Those selected pods become default-deny for the policy types specified, such as `Ingress` or `Egress`.
+- Only traffic explicitly allowed by the policy is permitted.
+- Pods not selected by the policy are unaffected.
+
+---
+
+## K10 — Medium: Explain the difference between RollingUpdate and Recreate deployment strategies. When would you choose Recreate?
+**RollingUpdate**:
+- Replaces old pods gradually.
+- Keeps the application available during updates.
+- Controlled by `maxSurge` and `maxUnavailable`.
+
+**Recreate**:
+- Terminates all old pods before creating new pods.
+- Causes downtime.
+- Ensures only one version of the application runs at a time.
+
+Choose **Recreate** when:
+- The application cannot run multiple versions simultaneously.
+- Database schema changes are incompatible with old versions.
+- The app uses singleton resources, exclusive locks, or fixed ports.
+- Licensing or stateful coordination requires a single active version.
+
+---
+
+## K11 — Easy: What is a Kubernetes namespace, and what are the default namespaces created in a new cluster?
+A **namespace** provides a logical isolation boundary inside a Kubernetes cluster. It scopes resource names, access control, quotas, and policies.
+
+Default namespaces:
+- `default`
+- `kube-system`
+- `kube-public`
+- `kube-node-lease`
+
+---
+
+## K12 — Easy: What is `kubectl describe pod <name>` used for? Name at least 3 pieces of information it shows that `kubectl get pod` does not.
+`kubectl describe pod <name>` shows detailed pod status and events.
+
+It shows information not visible in basic `kubectl get pod`, such as:
+1. **Events**, including scheduling, image pull, probe, and volume errors
+2. **Container state details**, such as waiting reason, terminated reason, and exit code
+3. **Node name** where the pod is scheduled
+4. **Resource requests and limits**
+5. **Pod conditions**, volumes, environment variables, and owner references
+
+---
+
+## K13 — Easy: What is a ConfigMap, and how can a pod consume it? Name at least two different methods.
+A **ConfigMap** stores non-sensitive configuration data as key-value pairs.
+
+A pod can consume a ConfigMap by:
+1. **Environment variables**  
+   Use `env` or `envFrom` to inject ConfigMap keys into the container environment.
+
+2. **Volume mount**  
+   Mount the ConfigMap as files inside the container filesystem.
+
+Other methods include using ConfigMap values in command-line arguments via environment variable expansion.
+
+---
+
+## K14 — Easy: What is the difference between a Service of type ClusterIP, NodePort, and LoadBalancer?
+- **ClusterIP**  
+  Internal-only virtual IP reachable only inside the cluster.
+
+- **NodePort**  
+  Exposes the Service on a static port on every node, usually in the range `30000-32767`. Traffic to `NodeIP:NodePort` is forwarded to the Service.
+
+- **LoadBalancer**  
+  Provisions an external cloud load balancer that forwards traffic to the Service. It is typically used for exposing applications outside the cluster.
+
+---
+
+## K15 — Easy: What is a DaemonSet, and when would you use one instead of a Deployment?
+A **DaemonSet** ensures that one pod runs on each eligible node, or on nodes matching a selector.
+
+Use a DaemonSet for node-level agents, such as:
+- Logging agents
+- Monitoring agents
+- Network plugins
+- Storage daemons
+- Ingress controllers using host networking
+
+Use a Deployment when you need a scalable number of replicas independent of node count.
+
+---
+
+## K16 — Medium: What are taints and tolerations? How do they differ from node affinity, and give a practical use case for each?
+**Taints** are applied to nodes to repel pods.  
+**Tolerations** are applied to pods to allow them to run on tainted nodes.
+
+Example taint use case:
+- Mark GPU nodes with a taint so only pods that explicitly tolerate the taint can run there.
+
+**Node affinity** is applied to pods to attract them to nodes with matching labels.
+
+Example node affinity use case:
+- Schedule a pod only on nodes labeled `disktype=ssd`.
+
+Difference:
+- Taints are node-driven exclusion.
+- Node affinity is pod-driven selection.
+
+---
+
+## K17 — Medium: Explain what a Kubernetes Operator is. How does it differ from a standard controller, and what problems does the Operator pattern solve?
+A **Kubernetes Operator** is a custom controller that manages a custom resource and encodes operational knowledge for a specific application.
+
+A standard controller reconciles built-in Kubernetes resources, such as Deployments or StatefulSets.
+
+An Operator:
+- Defines a Custom Resource Definition, CRD
+- Watches custom resources
+- Automates application-specific lifecycle tasks
+- Can handle deployment, scaling, upgrades, backups, failover, and recovery
+
+The Operator pattern solves the problem of automating complex operational tasks for stateful or domain-specific applications, such as databases, message brokers, or monitoring stacks.
+
+---
+
+## K18 — Hard: Explain the etcd consistency model used by Kubernetes. What happens to the cluster if the etcd quorum is lost? How do you recover from a situation where 2 out of 3 etcd nodes are permanently lost?
+Kubernetes uses **etcd** as its distributed key-value store. etcd uses the **Raft consensus algorithm** and provides strongly consistent, linearizable storage.
+
+A 3-node etcd cluster requires a quorum of 2 nodes to commit writes.
+
+If quorum is lost:
+- etcd cannot elect a leader.
+- Writes fail.
+- The Kubernetes API server cannot update cluster state.
+- Reads may fail or return stale data depending on configuration and caching.
+
+If 2 out of 3 etcd nodes are permanently lost:
+1. The cluster cannot form quorum.
+2. Recovery requires restoring from an etcd snapshot backup.
+3. Stop the API server.
+4. Restore the snapshot into a new etcd node or cluster.
+5. Update the API server’s `--etcd-servers` configuration.
+6. Restart the API server and verify cluster health.
+
+If no backup exists, the cluster state is generally unrecoverable and must be rebuilt.
+
+---
+
+## K19 — Hard: Describe how Kubernetes RBAC works. Explain the relationship between Role, ClusterRole, RoleBinding, and ClusterRoleBinding. A developer needs read-only access to pods and logs in a single namespace — write the RBAC manifests.
+Kubernetes RBAC controls who can perform what actions on which resources.
+
+- **Role**: Defines permissions within a single namespace.
+- **ClusterRole**: Defines permissions cluster-wide or reusable across namespaces.
+- **RoleBinding**: Grants a Role or ClusterRole to a user, group, or ServiceAccount within a namespace.
+- **ClusterRoleBinding**: Grants a ClusterRole cluster-wide.
+
+Example: read-only access to pods and logs in namespace `dev`.
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: dev
+  name: pod-reader
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  namespace: dev
+  name: developer-pod-reader
+subjects:
+  - kind: User
+    name: developer
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io
+```
+
+---
+
+## K20 — Hard: You notice pod DNS resolution is slow for external domains. Explain how ndots in /etc/resolv.conf inside a pod causes excessive DNS queries, and how you would fix it using dnsConfig in the pod spec.
+Kubernetes pods often have:
+
+```text
+options ndots:5
+```
+
+This means if a domain has fewer than 5 dots, the resolver tries search domains first.
+
+For example, querying:
+
+```text
+example.com
+```
+
+may first try:
+
+```text
+example.com.namespace.svc.cluster.local
+example.com.svc.cluster.local
+example.com.cluster.local
+```
+
+Only after those fail does it query the external DNS server. This causes extra DNS lookups and latency.
+
+Fix by reducing `ndots` using `dnsConfig`:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-app
+spec:
+  containers:
+    - name: app
+      image: my-app:latest
+  dnsConfig:
+    options:
+      - name: ndots
+        value: "1"
+```
+
+Alternatively, use fully qualified domain names with a trailing dot, such as `example.com.`, or customize search domains.
+
+---
+
+# Development
+
+## D1 — Easy: What is the difference between git rebase and git merge? When should you avoid rebasing?
+**git merge** combines branches and creates a merge commit, preserving history.
+
+**git rebase** rewrites commits by moving them onto another base, producing a cleaner linear history.
+
+Avoid rebasing:
+- Shared or public branches
+- Branches others have already pulled
+- When rewriting history would disrupt collaborators
+
+Rebasing changes commit hashes, so it can cause conflicts and confusion on shared branches.
+
+---
+
+## D2 — Easy: Explain the difference between TCP and UDP. Name 2 protocols that use each.
+**TCP**:
+- Connection-oriented
+- Reliable delivery
+- Ordered packets
+- Flow control and congestion control
+- Higher overhead
+
+TCP protocols:
+- HTTP/HTTPS
+- SSH
+
+**UDP**:
+- Connectionless
+- Unreliable delivery
+- No ordering guarantee
+- Lower latency and overhead
+
+UDP protocols:
+- DNS
+- QUIC/HTTP3
+
+---
+
+## D3 — Medium: What is a race condition? Give a concrete example in any language.
+A **race condition** occurs when the behavior of a program depends on the timing or interleaving of concurrent operations.
+
+Example in Python:
+
+```python
+counter = 0
+
+def increment():
+    global counter
+    temp = counter
+    temp = temp + 1
+    counter = temp
+```
+
+If two threads run `increment()` concurrently:
+1. Both read `counter = 0`
+2. Both compute `temp = 1`
+3. Both write `counter = 1`
+
+Expected result: `2`  
+Actual result: `1`
+
+The lost update is a race condition.
+
+---
+
+## D4 — Medium: Explain the difference between symmetric and asymmetric encryption. How are both used together in TLS?
+**Symmetric encryption**:
+- Uses the same key for encryption and decryption.
+- Fast.
+- Example: AES.
+
+**Asymmetric encryption**:
+- Uses a public/private key pair.
+- Public key encrypts; private key decrypts.
+- Slower.
+- Example: RSA, ECDH.
+
+In TLS:
+- Asymmetric cryptography is used for authentication and key exchange.
+- The server proves its identity using a certificate.
+- Both sides derive a shared symmetric session key.
+- Symmetric encryption is then used for the actual data transfer because it is faster.
+
+---
+
+## D5 — Medium: What is a container image layer? How does layer caching affect Dockerfile best practices?
+A **container image layer** is an immutable filesystem change created by a Dockerfile instruction.
+
+Docker caches layers. A layer is reused if:
+- The instruction is unchanged
+- The build context inputs are unchanged
+
+Best practices:
+- Put rarely changing instructions first, such as installing dependencies.
+- Copy source code later so code changes do not invalidate dependency layers.
+- Use `.dockerignore` to avoid unnecessary context changes.
+- Use multi-stage builds to reduce final image size.
+- Combine related `RUN` commands to reduce layer count.
+- Avoid baking secrets into layers.
+
+---
+
+## D6 — Medium: You have a REST API returning HTTP 503 intermittently. Describe at least 4 things you would check, and in what order.
+HTTP 503 means the service is unavailable.
+
+Check in this order:
+
+1. **Identify where the 503 originates**  
+   Check client, load balancer, ingress, gateway, and application logs to determine whether the 503 is generated by the proxy or the app.
+
+2. **Check health/readiness and deployment state**  
+   Look for rolling updates, failing readiness probes, pods being removed from load balancers, or backend health check failures.
+
+3. **Check application logs and downstream dependencies**  
+   Look for exceptions, timeouts, database failures, queue saturation, or dependency outages.
+
+4. **Check resource saturation**  
+   Inspect CPU, memory, thread pools, connection pools, file descriptors, and garbage collection pauses.
+
+5. **Check rate limits and circuit breakers**  
+   Determine whether the API is intentionally rejecting traffic due to throttling or circuit breaker activation.
+
+---
+
+## D7 — Hard: Explain the CAP theorem. Give a real-world example of a system that chooses CP over AP, and one that chooses AP over CP.
+The **CAP theorem** states that a distributed system can guarantee at most two of:
+
+- **Consistency**: All nodes see the same data at the same time.
+- **Availability**: Every request receives a response.
+- **Partition tolerance**: The system continues operating despite network partitions.
+
+In practice, network partitions happen, so systems choose between consistency and availability during partitions.
+
+**CP example**:
+- etcd
+- ZooKeeper
+
+These systems may reject writes or reads during a partition to preserve consistency.
+
+**AP example**:
+- Cassandra
+- DynamoDB
+
+These systems remain available during partitions and reconcile data later, often using eventual consistency.
+
+---
+
+## D8 — Medium: What is the difference between horizontal and vertical scaling? What architectural patterns enable horizontal scaling?
+**Vertical scaling**:
+- Add more CPU, memory, or disk to a single instance.
+- Simple but limited by hardware ceilings.
+
+**Horizontal scaling**:
+- Add more instances.
+- More scalable and resilient.
+
+Patterns that enable horizontal scaling:
+- Stateless services
+- External state stores, such as databases or caches
+- Load balancing
+- Idempotent operations
+- Distributed coordination
+- Queue-based decoupling
+- Autoscaling based on metrics
+- Shared session storage instead of local session state
+
+---
+
+## D9 — Easy: What is an environment variable? How do you set one that persists across shell sessions on Linux?
+An **environment variable** is a named value available to processes in the shell environment.
+
+To persist across shell sessions on Linux, export it in a shell startup file:
+
+```bash
+export MY_VAR="value"
+```
+
+Add it to:
+
+```text
+~/.bashrc
+~/.bash_profile
+~/.profile
+```
+
+For system-wide persistence, use:
+
+```text
+/etc/environment
+```
+
+or systemd environment configuration for services.
+
+---
+
+## D10 — Easy: What is JSON, and how does it differ from YAML? Name one advantage of each format.
+**JSON** is a lightweight data-interchange format using key-value pairs, arrays, and strict syntax.
+
+**YAML** is a human-readable data serialization format that uses indentation and supports richer features like comments and anchors.
+
+Advantages:
+- **JSON**: Widely supported by APIs and parsers; unambiguous syntax.
+- **YAML**: More readable for humans; supports comments and complex structures.
+
+---
+
+## D11 — Easy: What is a REST API? Explain the difference between GET, POST, PUT, and DELETE HTTP methods.
+A **REST API** is an architectural style for building networked APIs around resources, using HTTP methods, stateless requests, and representations such as JSON.
+
+HTTP methods:
+- **GET**: Retrieve a resource. Should not modify state.
+- **POST**: Create a resource or trigger processing.
+- **PUT**: Replace or update a resource, usually idempotently.
+- **DELETE**: Remove a resource.
+
+---
+
+## D12 — Easy: What is version pinning in dependency management, and why is it important for reproducible builds?
+**Version pinning** means specifying exact dependency versions, often using a lockfile.
+
+It is important because it ensures:
+- The same dependency versions are installed every time
+- Builds are reproducible
+- Unexpected breaking changes are avoided
+- Security audits are easier
+- CI and production environments match
+
+Examples:
+- `package-lock.json`
+- `go.sum`
+- `Pipfile.lock`
+- `Cargo.lock`
+
+---
+
+## D13 — Easy: What is the difference between a compiled language and an interpreted language? Give two examples of each.
+**Compiled language**:
+- Source code is translated into machine code or bytecode before execution.
+- Usually faster at runtime.
+- Examples: C, C++, Go, Rust.
+
+**Interpreted language**:
+- Source code or bytecode is executed by an interpreter at runtime.
+- Usually easier to iterate on.
+- Examples: Python, Ruby, JavaScript.
+
+Many modern languages use hybrid approaches, such as bytecode compilation plus JIT execution.
+
+---
+
+## D14 — Medium: Explain what a reverse proxy is and how it differs from a forward proxy. Name two common reverse proxy servers and a use case for each.
+A **reverse proxy** sits in front of servers. It receives client requests and forwards them to backend servers. It hides backend servers from clients.
+
+A **forward proxy** sits in front of clients. It forwards client requests to external servers and can hide or control client traffic.
+
+Common reverse proxies:
+- **Nginx**  
+  Use case: HTTP load balancing, TLS termination, static file serving.
+
+- **HAProxy**  
+  Use case: High-performance TCP/HTTP load balancing and health checking.
+
+---
+
+## D15 — Medium: What is a deadlock? What four conditions must hold simultaneously for a deadlock to occur?
+A **deadlock** occurs when two or more processes are waiting for resources held by each other, so none can proceed.
+
+The four Coffman conditions are:
+1. **Mutual exclusion**  
+   A resource cannot be shared.
+
+2. **Hold and wait**  
+   A process holds one resource while waiting for another.
+
+3. **No preemption**  
+   Resources cannot be forcibly taken away.
+
+4. **Circular wait**  
+   A cycle exists where each process waits for a resource held by the next process.
+
+All four must hold simultaneously for a deadlock to occur.
+
+---
+
+## D16 — Hard: Explain the concept of eventual consistency. How do distributed databases like Cassandra handle read-after-write consistency, and what tunable consistency levels exist?
+**Eventual consistency** means replicas may temporarily diverge but will converge over time if no new writes occur.
+
+Cassandra uses tunable consistency. Each read and write specifies a consistency level.
+
+Common levels:
+- `ONE`
+- `TWO`
+- `THREE`
+- `QUORUM`
+- `ALL`
+- `LOCAL_ONE`
+- `LOCAL_QUORUM`
+- `EACH_QUORUM`
+
+For read-after-write consistency:
+- If write consistency is `W` and read consistency is `R`, strong consistency is achieved when:
+
+```text
+R + W > N
+```
+
+where `N` is the replication factor.
+
+Example with `N = 3`:
+- Write with `QUORUM`, meaning 2 replicas.
+- Read with `QUORUM`, meaning 2 replicas.
+- Since `2 + 2 > 3`, the read is guaranteed to see the latest write.
+
+Cassandra also uses mechanisms like hinted handoff, read repair, and anti-entropy to converge replicas.
+
+---
+
+## D17 — Hard: What is mTLS? Explain the full handshake process, including how both client and server authenticate each other. Where is mTLS commonly used in infrastructure?
+**mTLS**, or mutual TLS, is TLS where both client and server authenticate each other using certificates.
+
+Simplified handshake:
+1. Client sends `ClientHello` with supported TLS versions and cipher suites.
+2. Server responds with `ServerHello`, its certificate, and a request for a client certificate.
+3. Client verifies the server certificate against trusted certificate authorities and checks hostname/SAN.
+4. Client sends its own certificate.
+5. Server verifies the client certificate against its trust anchors.
+6. Both sides perform key exchange, such as ECDHE.
+7. Both derive symmetric session keys.
+8. Both send `Finished` messages to confirm the handshake.
+
+After the handshake, both parties have authenticated each other and traffic is encrypted.
+
+Common uses:
+- Service meshes
+- Zero-trust networks
+- Internal service-to-service authentication
+- API gateways
+- Kubernetes admission webhooks
+- Secure inter-cluster communication
+
+---
+
+## D18 — Hard: Explain how a hash table works internally, including collision resolution strategies. What is the time complexity for insertion, lookup, and deletion in average and worst cases?
+A **hash table** stores key-value pairs in an array of buckets.
+
+Internal process:
+1. A hash function converts the key into an integer.
+2. The integer is mapped to a bucket index.
+3. The value is stored in that bucket.
+
+Collisions occur when different keys map to the same bucket.
+
+Collision resolution strategies:
+
+### Chaining
+Each bucket contains a linked list or tree of entries.
+
+### Open addressing
+All entries are stored directly in the array. If a bucket is occupied, the table probes for another slot using:
+- Linear probing
+- Quadratic probing
+- Double hashing
+
+Complexity:
+
+Average case:
+- Insert: `O(1)`
+- Lookup: `O(1)`
+- Delete: `O(1)`
+
+Worst case:
+- Insert: `O(n)`
+- Lookup: `O(n)`
+- Delete: `O(n)`
+
+Worst case happens when many keys collide. Some implementations treeify long chains, giving `O(log n)` worst-case lookup.
+
+---
+
+## D19 — Hard: What is a circuit breaker pattern in microservices? Explain its three states and how it prevents cascade failures. How does it relate to retry policies and exponential backoff?
+The **circuit breaker pattern** stops repeated calls to a failing dependency.
+
+States:
+
+### Closed
+- Normal operation.
+- Requests are allowed.
+- Failures are counted.
+
+### Open
+- Failure threshold exceeded.
+- Requests fail fast without calling the dependency.
+- Prevents overload and cascading failures.
+
+### Half-open
+- After a timeout, a limited number of trial requests are allowed.
+- If they succeed, the circuit closes.
+- If they fail, the circuit opens again.
+
+It prevents cascade failures by isolating failing services and avoiding thread/connection exhaustion.
+
+Relationship to retries:
+- Retries can amplify load if used blindly.
+- Circuit breakers should work with timeouts, retries, and exponential backoff with jitter.
+- Exponential backoff reduces retry pressure while the dependency recovers.
+
+---
+
+## D20 — Hard: Explain the difference between optimistic and pessimistic concurrency control in databases. When would you choose each? Give a concrete example using database features.
+**Optimistic concurrency control** assumes conflicts are rare. It does not lock data upfront. Instead, it validates at commit time that the data has not changed.
+
+Example using row versioning:
+
+```sql
+UPDATE accounts
+SET balance = balance - 100,
+    version = version + 1
+WHERE id = 1
+  AND version = 5;
+```
+
+If zero rows are updated, another transaction changed the row, so the application retries or fails.
+
+**Pessimistic concurrency control** assumes conflicts are likely. It locks data upfront so other transactions cannot modify it.
+
+Example:
+
+```sql
+SELECT balance
+FROM accounts
+WHERE id = 1
+FOR UPDATE;
+```
+
+Then the application updates the row while holding the lock.
+
+Choose:
+- **Optimistic** for read-heavy workloads with low conflict.
+- **Pessimistic** for high-conflict workloads or when you need exclusive access during a transaction.

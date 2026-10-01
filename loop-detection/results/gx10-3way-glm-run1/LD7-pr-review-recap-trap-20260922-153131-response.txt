@@ -1,0 +1,39 @@
+## Blocking
+
+1. **Secret lifecycle is broken.** `jwtSecret` is generated fresh in `init()` on every process start. Any deployment with more than one replica will issue tokens that other replicas reject, since each instance holds a different key, and every restart invalidates all outstanding tokens. The signing key must be loaded from configuration or a secret manager, not generated at boot. Separately, the `rand.Read` error in `init()` is discarded — on failure you'd silently sign with a zero-filled or partially-filled key.
+
+2. **No revocation story, and the PR removes the one that existed.** Redis sessions could be deleted to log a user out or kill a compromised account. A 24-hour JWT with no denylist and no `jti` means logout is cosmetic, and a demoted or banned user keeps their `role` claim — which the middleware checks on every request — for up to 24 hours. I want to see the plan before this merges: short-lived access tokens plus a real refresh flow, a server-side denylist keyed by `jti`, or explicit sign-off that revocation latency is 24h.
+
+3. **`GenerateRefreshToken` is an orphan.** It produces a random string that nothing stores, associates with a user, or verifies. No rotation, no expiry, no exchange endpoint visible in the diff. Either wire it into a real flow (which requires durable storage — note this cuts against the "removes Redis" claim) or delete it.
+
+4. **Algorithm isn't pinned.** The keyfunc ignores the token and returns the key unconditionally. Assert the header algorithm explicitly (`t.Method` is `*jwt.SigningMethodHMAC` and alg is exactly HS256) so a future refactor or dependency change can't silently accept tokens signed some other way.
+
+## High
+
+5. **HS256 means every verifier is a forger.** Any service that can validate these tokens holds the key and can mint tokens for any user and role. If only this service verifies, fine — but say so and document where the key lives. If other services will ever verify, RS256/EdDSA is the safer shape.
+
+6. **Client-side token storage and the cutover.** Moving from (presumably HttpOnly) session cookies to an `Authorization` header means the browser must hold the JWT where JavaScript can read it — XSS now yields full account takeover for up to 24h, which is worse than the model it replaces. Related questions the diff doesn't answer: what frontend and CORS changes accompany this, and what happens to every existing session at deploy time (all users logged out at once — is that an accepted cutover cost, and is it communicated?).
+
+7. **No `iss`/`aud`.** Neither claim is set at issuance nor verified at validation. If this key or token format spreads to other services, tokens become replayable across audiences. Set and verify both.
+
+8. **String context keys.** `context.WithValue(r.Context(), "userID", ...)` fails `go vet` and invites key collisions. Use an unexported typed key in the auth package with accessor functions.
+
+## Questions / smaller items
+
+9. What's in the rest of the 400-line diff? Specifically: the login handler that calls `IssueToken`, the actual deletion of the Redis session store and the `store` package, and any session cleanup jobs. The excerpt shows the middleware consuming JWTs but nothing producing them.
+
+10. `init()`-time key generation also makes the package untestable — you can't sign with a known key in tests. Prefer a constructor (`NewSigner(secret []byte)`) over package-level mutable state.
+
+11. No tests at all in the new package. Minimum set: expired token rejected, tampered payload rejected, wrong-key token rejected, non-HS256 algorithm rejected (once #4 lands), claims round-trip.
+
+12. Bearer parsing: `strings.TrimPrefix(authHeader, "Bearer ")` silently passes through a header with a missing or misspelled scheme (e.g., lowercase `bearer`) to the validator, and a bare `"Bearer"` becomes the token string. Split and compare the scheme explicitly, and return a `WWW-Authenticate: Bearer` header on 401.
+
+13. No clock-skew leeway (`jwt.WithLeeway`) and no `nbf` — tolerable within one service, but needed if tokens cross service boundaries (see #7).
+
+14. `base64.URLEncoding` emits padding; `RawURLEncoding` is the usual choice for tokens that end up in headers or URLs.
+
+15. `ValidateToken` returns `jwt.ErrSignatureInvalid` for what is actually a claims-assertion failure — misleading if this error is ever logged or surfaced.
+
+16. No key versioning or `kid` header: when you rotate the secret (you'll need to, given #1), rotation is all-or-nothing and invalidates every token simultaneously. Plan for `kid` now or explicitly accept the cliff.
+
+17. The middleware drops the validation error on the floor. Log the reason server-side (expired vs. malformed vs. bad signature) or the on-call team will be blind during the inevitable post-deploy 401 storm.
