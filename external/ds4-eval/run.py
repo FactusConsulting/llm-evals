@@ -204,7 +204,7 @@ def request_body(model: str, messages: list, max_tokens: int, sampling: dict,
     return body
 
 
-class _KeepAliveConnection(http.client.HTTPConnection):
+class _KeepAlive:
     """Without keepalive a half-open connection is only noticed at --timeout,
     which has to outlast a whole generation."""
 
@@ -216,12 +216,27 @@ class _KeepAliveConnection(http.client.HTTPConnection):
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6)
 
 
+class _KeepAliveConnection(_KeepAlive, http.client.HTTPConnection):
+    pass
+
+
+class _KeepAliveHTTPSConnection(_KeepAlive, http.client.HTTPSConnection):
+    pass
+
+
 class _KeepAliveHandler(urllib.request.HTTPHandler):
     def http_open(self, req):
         return self.do_open(_KeepAliveConnection, req)
 
 
-OPENER = urllib.request.build_opener(_KeepAliveHandler)
+# The gx10 endpoints are https behind nginx; an http-only handler leaves those
+# sockets without keepalive, and a stream the server already closed hangs.
+class _KeepAliveHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_KeepAliveHTTPSConnection, req, context=self._context)
+
+
+OPENER = urllib.request.build_opener(_KeepAliveHandler, _KeepAliveHTTPSHandler)
 
 
 def _headers(key: str) -> dict:
