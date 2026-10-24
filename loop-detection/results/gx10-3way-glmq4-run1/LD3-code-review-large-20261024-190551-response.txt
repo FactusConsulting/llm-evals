@@ -1,0 +1,23 @@
+**Verdict: Request changes** 🛑
+
+This is a solid foundation — the locking is correct and the API is simple — but the package doesn't compile as written, and the background goroutine design has a leak. Must-fix items below.
+
+## Must-fix issues
+
+1. **`cache/cache.go:5` — unused import, package does not compile.** `"context"` is imported but never referenced. `go build` fails with `imported and not used: "context"`. This also hints at the missing piece in #2 — it looks like a context-based shutdown was intended but not implemented.
+
+2. **`cache/cache.go:26` / `cache/cache.go:52-64` — goroutine leak; `Cache` can never be garbage-collected.** `go c.evict()` starts an infinite loop with no stop channel, context, or `Close()` method. Every call to `New()` permanently leaks a goroutine that holds a reference to the cache, so the cache and all its values are unreachable-but-uncollectable for the life of the process. Add a `Close()` (or accept a `context.Context` in `New`) that terminates the evictor via a done channel, and have `evict` select on it.
+
+3. **`cache/cache.go:54` — hardcoded `time.Minute` eviction interval is wrong for short TTLs.** With `ttl = 100ms` (as in `TestSetGet`), expired entries — and the values they reference — are retained for up to a full minute after expiry, and the first sweep doesn't happen until a minute after `New()`. For high-churn keys with large values this is significant memory retention. Derive the interval from `ttl` (e.g., `ttl/2`, clamped to a sane minimum) or make it a parameter. Note this also makes the evictor effectively untestable as written.
+
+4. **`cache/cache.go:17` — unbounded map growth; memory-exhaustion DoS if keys are attacker-influenced.** There is no max size, no eviction policy (LRU/LFU), and expired entries are only removed by the (slow) sweeper — `Get` never lazily deletes them (`cache/cache.go:40-42`). If this cache fronts user-controlled keys, an attacker can grow it without limit. Either add a size bound with an eviction policy, or explicitly document that callers must guarantee a bounded key space.
+
+5. **`cache/cache.go:36-44` — `Get` returns shared mutable state.** Stored pointers, maps, and slices are handed out by reference; a caller that mutates a retrieved value corrupts the cached entry for all other readers, with no lock held during their use. At minimum, document that cached values must be treated as immutable; ideally deep-copy on `Set`/`Get` or document the constraint loudly.
+
+6. **`cache/cache.go:21-28` — no validation of `ttl`.** `New(0)` or a negative TTL produces a cache where every entry is born expired. Reject non-positive TTLs (panic or error) or document the behavior.
+
+## Nits
+
+1. `cache/cache.go:11,30,36` — use `any` instead of `interface{}` (Go 1.18+).
+2. `cache/cache.go:16` — consider `sync.RWMutex` so `Get` can take `RLock`; caches are typically read-heavy. Relatedly, `evict` holds the exclusive lock for the entire map scan (`cache/cache.go:56-62`), stalling all reads/writes on large caches.
+3. `cache/cache_test.go:16` — sleep-based expiry assertion is timing-sensitive on loaded CI; poll with a deadline instead. Also, neither test exercises concurrent `Get`/`Set` (run under `-race`), and there's no coverage of the evictor itself.

@@ -34,6 +34,7 @@ DGX Spark playground.
 | **GLM-5.3-Flash** | MoE | UD-Q2_K_XL | llama.cpp (GX10) | **98.69%** (range 0.13 pp) | 4/36 ⚠️ ᴸ | — | 2026-09-20 | [verdict](results/glm5.3-flash-q2kxl-mtp-2x128k-gx10/verdict.md) |
 | **Qwen3.6-35B-A3B** | MoE | Q5_K_M stock | llama.cpp (fleet) | **98.65%** ᵍ | 0/36 ✅ | 80% (8/10) | 2026-06-22 | [run](results/qwen36-35b-a3b-BF16-262k-gx10/) ᵍ |
 | **Gemma 4 26B-A4B** | MoE | Q6_K | llama.cpp | **98.56%** | 0/12 ✅ | 58.0% (174/300) | 2026-06-18 | [verdict](results/gemma4-26b-q6k-458k-turbo4-v2-ai-infer2/verdict.md) |
+| **GLM-5.3-Flash** 2×GB10 | MoE | UD-Q4_K_XL | llama.cpp RPC (2×GX10) | **98.38%** ʳ | 2/12 ⚠️ ʳ | — | 2026-10-24 | [verdict](results/gx10-3way-glmq4/verdict.md) |
 | **GLM-4.7-Flash** | MoE | BF16 | vLLM (GX10) | **96.80%** | not measured ⁿ | 65.0% (195/300) ᵃ | 2026-07-09 | [verdict](results/glm-4.7-flash-vllm-gx10/VERDICT.md) ᵛ |
 | **North-Mini-Code** | MoE | BF16 | vLLM (GX10) | ~96.6% ᶜ | not measured ⁿ | 70.0% (210/300) ᵃ | 2026-07-09 | [verdict](results/north-mini-code-1.0-vllm-gx10/VERDICT.md) ᵛ |
 | **Gemma 4 E4B** (4B) | dense | BF16 | llama.cpp | 96.67% (range 1.62 pp) | 0/12 ✅ | **86.0%** (86/100) | 2026-04-15 | [verdict](results/gemma4-4b-e4b-bf16-10slots-turbo4-ai-infer2/verdict.md) |
@@ -174,6 +175,13 @@ quants — both knowledge-strong, both unservable here.
   across five batches, so consecutive paragraphs must repeat the accumulated rows. The
   fourth (LD1, pass 3, paragraphs 8 and 12 share 93% bigrams) is unreviewed. No
   reasoning spirals, no task-expansion creep; it stops cleanly on LD4, LD9 and LD10.
+- **ʳ GLM-5.3-Flash UD-Q4_K_XL across both GB10 boxes** — one model served over ggml
+  RPC (gx10-59c7 head, gx10-1dd1 worker), one 262k slot, q8_0 KV. **One run**, not
+  three, judged under the current two-judge method; the −0.31 pp gap to the Q2 mean is
+  inside the single-run noise band. Loop: LD11 is the same false positive as ᴸ; LD2 is
+  an **empty response at the runner's 600 s cap** — at 13 tok/s with a 16384 reasoning
+  budget the cap measures decode speed, not stopping behaviour. Agentic and
+  narrow-delivery were not run (their runners' fixed timeouts do the same).
 - **No Qwen build is scored under the current method.** Every Qwen directory —
   including the deployed fleet model `qwen36-35b-a3b-q5km-STOCK-2x128k-ai-infer2` — has
   responses but no `judge.json`, so **no head-to-head between the Qwen fleet and

@@ -1,0 +1,253 @@
+# Networking
+
+**N1 — L2 vs L3 switch**
+A Layer 2 switch forwards frames based on MAC addresses learned in its CAM table; all ports share VLAN broadcast domains and it cannot route between subnets. A Layer 3 switch additionally has routing capability: it supports SVIs (switched virtual interfaces), static/dynamic routing, and hardware (ASIC) packet forwarding between VLANs/subnets. Use an L3 switch as a collapsed core/distribution router; an L2 switch is pure access/aggregation.
+
+**N2 — 10.0.5.37/20**
+/20 = mask 255.255.240.0. Third octet: 5 AND 240 = 0.
+- Network address: **10.0.0.0/20**
+- Broadcast address: **10.0.15.255**
+- Usable host range: 10.0.0.1 – 10.0.15.254 (4094 hosts)
+
+**N3 — TCP three-way handshake**
+1. Client → Server: SYN (seq=x)
+2. Server → Client: SYN-ACK (seq=y, ack=x+1)
+3. Client → Server: ACK (ack=y+1); both sides ESTABLISHED.
+
+If the final ACK is lost: the client is in ESTABLISHED, the server is stuck in SYN_RCVD and retransmits SYN-ACK with exponential backoff (typically retries, then gives up and discards the half-open connection). If the client sends data, the data segment carries an implicit ACK and the server completes the connection; if nothing is sent, the server's retransmission timer eventually cleans up the half-open state.
+
+**N4 — SNAT vs DNAT**
+- **SNAT** rewrites the *source* IP (POSTROUTING), typically many-to-one so internal hosts share a public IP. Example: `iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE` (outbound internet access for a private subnet).
+- **DNAT** rewrites the *destination* IP/port (PREROUTING), used to publish internal services. Example: `iptables -t nat -A PREROUTING -p tcp --dport 443 -j DNAT --to-destination 10.0.0.5:8443` (port-forward public 443 to an internal web server).
+
+**N5 — Certificate name mismatch: 3 causes**
+1. Accessing the host by an IP address or a name not listed in the certificate's SAN/CN (e.g., `server01` vs `server01.example.com`).
+2. Wildcard mismatch — `*.example.com` does not match deeper names like `a.b.example.com`, or the hostname was added after the cert was issued and lacks a SAN entry.
+3. Wrong backend serving the cert — DNS points to the wrong server, a shared load balancer/vhost serves its default cert, or the client doesn't send SNI so the server picks the wrong certificate.
+
+**N6 — VLAN vs VxLAN**
+- **VLAN**: L2 segmentation using an 802.1Q tag in the Ethernet frame; 12-bit ID → 4094 usable; requires L2 connectivity end-to-end; scaling limited by STP, MAC tables, and trunk bandwidth.
+- **VxLAN**: overlay technology encapsulating L2 frames in UDP (MAC-in-UDP) across an L3 underlay; 24-bit VNI → ~16M segments; VTEPs at the edges do encapsulation; underlay uses normal IP routing/ECMP.
+
+Choose VxLAN when you need L2 adjacency stretched across L3 boundaries (multi-DC, VM/container mobility), large multi-tenant scale (cloud), or to avoid STP and VLAN ID limits.
+
+**N7 — Asymmetric reply path / policy routing**
+Cause: Linux uses the *destination-based* routing table for replies. The reply to 192.168.1.x matches the default route via eth0 (10.0.0.1), so it egresses eth0 — asymmetric routing (often dropped by rp_filter or upstream firewalls).
+
+Fix with policy-based routing:
+```bash
+ip route add default via 192.168.1.1 dev eth1 table 100
+ip route add 192.168.1.0/24 dev eth1 src 192.168.1.5 table 100
+ip rule add from 192.168.1.5/32 table 100        # or: from 192.168.1.0/24
+ip rule add iif eth1 table 100                    # optional: match by ingress iface
+```
+Also ensure `rp_filter` is consistent (set to 2/loose on the relevant interfaces, or make routes symmetric per-table).
+
+**N8 — BGP best-path selection (in order)**
+1. Highest **Weight** (Cisco-local, not advertised)
+2. Highest **Local Preference** (iBGP)
+3. Prefer locally originated route (network/aggregate)
+4. Shortest **AS_PATH**
+5. Lowest **Origin** (IGP < EGP < Incomplete)
+6. Lowest **MED**
+7. eBGP over iBGP
+8. Lowest IGP metric to next hop
+9. Tiebreakers: oldest eBGP route, lowest router ID, lowest neighbor IP / minimum cluster-list.
+
+**N9 — VxLAN over IPsec MTU math (physical MTU 1500)**
+- VxLAN overhead: outer Ethernet 14 + outer IP 20 + UDP 8 + VxLAN 8 = **50 bytes** → VxLAN MTU alone: 1500 − 50 = **1450**.
+- IPsec ESP tunnel mode overhead: outer IP 20 + ESP header 8 + IV 8–16 + pad/trailer + ICV 12–16 ≈ **60–73 bytes** (cipher/auth dependent).
+
+Maximum inner payload ≈ 1500 − 50 − ~73 ≈ **1377 bytes** (use ~1370 to be safe with AES-CBC+SHA; AES-GCM is slightly leaner). Set the VxLAN interface MTU accordingly, ensure PMTUD works or clamp MSS, and beware DF-bit blackholes causing silent drops.
+
+**N10 — ARP and Gratuitous ARP**
+ARP resolves an IPv4 address to a MAC address on the local broadcast segment (broadcast "who has IP x?", unicast reply). A **gratuitous ARP** is an unsolicited announcement of an IP→MAC mapping. It solves the problem of stale ARP caches after a MAC address changes for the same IP — e.g., HA/VRRP failover, floating IP migration, or NIC replacement — letting other hosts and switches (and some load balancers) update their tables immediately.
+
+**N11 — Public vs private IP**
+A public IP is globally unique and routable on the internet (assigned by IANA/RIRs/ISPs). A private IP is only routable within an organization's network, can be reused everywhere, and requires NAT to reach the internet. RFC 1918 ranges:
+- **10.0.0.0/8**
+- **172.16.0.0/12**
+- **192.168.0.0/16**
+
+**N12 — DNS and record types**
+DNS is the hierarchical, distributed system that resolves human-readable names into IP addresses (and other data). Records:
+- **A**: hostname → IPv4 address.
+- **AAAA**: hostname → IPv6 address.
+- **CNAME**: alias pointing a name to *another name* (which is then resolved further); cannot coexist with other records at the same name and cannot be used at a zone apex.
+
+**N13 — DHCP DORA**
+1. **Discover**: client broadcasts a DHCPDISCOVER to find servers.
+2. **Offer**: server(s) respond with a DHCPOFFER proposing an IP/lease.
+3. **Request**: client broadcasts DHCPREQUEST accepting one offer.
+4. **Acknowledge**: server sends DHCPACK confirming the lease with options (mask, gateway, DNS, lease time).
+
+**N14 — Hub vs switch vs router**
+- **Hub** — Layer 1: repeats every bit to all ports; one collision domain; obsolete.
+- **Switch** — Layer 2: forwards frames per-port using a MAC address table; each port is its own collision domain; VLANs segment broadcast domains.
+- **Router** — Layer 3: forwards packets between IP networks using routing tables; separates broadcast domains.
+
+**N15 — Half vs full duplex**
+Half-duplex: a link can carry traffic in only one direction at a time (CSMA/CD collision handling, shared media). Full-duplex: simultaneous transmit and receive on separate pairs, no collisions. All modern switched Ethernet runs **full-duplex**.
+
+**N16 — TTL and traceroute**
+TTL is decremented by every router; at 0 the packet is dropped and the router returns ICMP "Time Exceeded" — this prevents routing loops. Traceroute exploits it: it sends probes with TTL=1, 2, 3…; each successive router drops the probe and replies with ICMP Time Exceeded, revealing its address. The final hop is identified by the destination's response (e.g., ICMP port unreachable for UDP probes, or echo reply).
+
+**N17 — NAT gateway types**
+A NAT gateway sits at a network edge and rewrites addresses between private and public realms.
+- **Static NAT**: fixed 1:1 mapping (one private IP ↔ one public IP) — e.g., exposing an internal server permanently.
+- **Dynamic NAT**: private IPs mapped on demand to a *pool* of public IPs, first-come-first-served.
+- **PAT (NAT overload)**: many private IPs share *one* public IP, distinguished by unique source port numbers — the typical home/office internet access mode.
+
+**N18 — ECMP**
+ECMP installs multiple equal-cost next hops for a prefix; traffic is distributed across them. Hashing is normally **flow-based** on a 5-tuple hash (src/dst IP, src/dst port, protocol), keeping all packets of a flow on one path (preserving order); some systems support per-packet hashing (causes reordering — generally avoided). Problem with stateful firewalls: if forward and return traffic hash to different paths, the firewall sees only one side of the conversation and drops the "unexpected" packets. Mitigations: symmetric hashing, session synchronization between firewalls, routing through a single firewall pair, or consistent hashing across the path.
+
+**N19 — TCP window too small vs BDP**
+Throughput is bounded by `window / RTT`. With a BDP of 10MB and a maximum window of 64KB (the hard limit of the 16-bit TCP window field without scaling), the connection can use only ~0.6% of the path capacity — the pipe can never be kept full, so latency is high relative to achieved throughput and bandwidth is wasted.
+
+**TCP window scaling (RFC 1323/7323)** solves this: both ends exchange a window-scale factor in their SYN/SYN-ACK, and the 16-bit window field is shifted left (up to 2^30). Ensure `net.ipv4.tcp_window_scaling=1` (default on Linux) and tune buffers (`net.core.rmem_max`, `net.ipv4.tcp_rmem`) so the OS can actually advertise windows ≥ BDP.
+
+**N20 — 802.1Q trunks and Linux sub-interfaces**
+A trunk port carries frames from multiple VLANs, each identified by a 4-byte 802.1Q tag inserted after the source MAC: **TPID 0x8100 + TCI** (3 bits PCP priority, 1 bit DEI, 12 bits VID). Untagged frames belong to the native VLAN. Frame on the wire:
+`| DA | SA | 0x8100 | PCP|DEI|VID | EtherType | Payload | FCS |` (MTU +4).
+
+Linux config for VLANs 10/20/30 on one NIC:
+```bash
+modprobe 8021q
+ip link add link eth0 name eth0.10 type vlan id 10
+ip link add link eth0 name eth0.20 type vlan id 20
+ip link add link eth0 name eth0.30 type vlan id 30
+ip addr add 10.0.10.5/24 dev eth0.10   # repeat per VLAN
+ip link set eth0.10 up                  # etc.
+```
+The switch port facing the server must be a trunk allowing VLANs 10, 20, 30. (Persistent config: `/etc/sysconfig/network-scripts/ifcfg-eth0.10` or netplan/systemd-networkd `VLAN=` entries.)
+
+---
+
+# Linux
+
+**L1 — Hard link vs symbolic link**
+A hard link is another directory entry referencing the *same inode* — identical file data, link count incremented; it cannot span filesystems or (normally) link directories, and the data survives until all names are removed. A symlink is a separate small file containing a *path*; it can cross filesystems, can point to directories, and can dangle if the target is removed.
+
+**L2 — Find files >100MB under /var/log**
+```bash
+find /var/log -type f -size +100M -exec ls -lh {} \;
+# or: find /var/log -type f -size +100M -printf '%s %p\n' | sort -n
+```
+
+**L3 — D state**
+State D is **uninterruptible sleep**: the process is blocked inside a kernel syscall (typically disk/NFS I/O, a driver, or a kernel lock) and the kernel will not deliver signals until the syscall completes. **No — `kill -9` cannot kill it**; the signal stays pending. Fix the underlying I/O problem (storage, NFS server, hung driver) or reboot. Many D-state processes usually indicate a storage problem.
+
+**L4 — cgroups v1 vs v2**
+v1: one hierarchy per controller (cpu, memory, blkio…), a process can live in different groups per controller — complex, inconsistent accounting. v2: a **single unified hierarchy**, no internal-process constraint, clean delegation to containers, better accounting plus PSI (pressure stall information). systemd prefers **v2** because one tree serves all controllers, delegation semantics are safe, and resource control across controllers is consistent.
+
+**L5 — nftables vs iptables**
+iptables is the legacy x_tables interface (separate IPv4/IPv6/arp/eb tables). nftables is the modern netfilter frontend: one unified tool, kernel bytecode VM, sets/maps, built-in dual-stack, atomic rule replacement. Both hook into the same netfilter hooks, so **both can process packets simultaneously** in the same hook/priority order — rules in one do not override the other, which is a common source of confusion. `iptables-nft` runs iptables syntax on the nftables backend.
+
+**L6 — df shows 100% but du totals less**
+Most likely: **deleted files still held open by a process** — `du` can't see them, but the space isn't freed until the fd closes. Find with `lsof +L1` (or `lsof | grep deleted`); fix by restarting the offending process or truncating via `/proc/<pid>/fd/<n>`. Other causes: files hidden under a mount point, or a different filesystem mounted over a directory du walked.
+
+**L7 — Boot process, UEFI → systemd**
+1. **UEFI firmware**: POST, initializes hardware, follows NVRAM boot entries, mounts the ESP (FAT32) and loads the `.efi` bootloader (GRUB, systemd-boot, or a kernel EFISTUB directly).
+2. **Bootloader**: loads `vmlinuz` and the **initramfs** into memory, passes the kernel command line, and jumps to the kernel.
+3. **Kernel**: decompresses, sets up memory/paging, detects CPU/bus, starts init, mounts the initramfs as temporary root.
+4. **initramfs**: loads storage drivers (NVMe/SCSI/RAID), runs udev, unlocks LUKS, activates LVM/RAID/device-mapper, locates the real root by UUID/LABEL, then `switch_root`s to it.
+5. **systemd (PID 1)**: reads `default.target` (usually `graphical.target` or `multi-user.target`), starts units in dependency order (`sysinit.target` → `basic.target` → services → target reached), launching services in parallel.
+
+**L8 — OOM despite buff/cache**
+`used` includes page cache, but only a fraction is truly reclaimable. Here buff/cache is only ~15GB; the other ~45GB is **anonymous memory** (heap/stack of running processes), which cannot be dropped — only swapped or OOM-killed. `available` estimates what can be reclaimed without heavy swapping, so with little cache and lots of anon memory it's low, and once reclaim + swap (only 2GB) are exhausted, the **OOM killer** fires.
+
+Key tunables: `vm.swappiness` (anon vs file reclaim balance), `vm.overcommit_memory` / `vm.overcommit_ratio` (0 heuristic, 1 always, 2 strict), `vm.min_free_kbytes`, `vm.watermark_scale_factor`, `vm.vfs_cache_pressure`, per-cgroup `memory.max`, and `oom_score_adj` to steer OOM victim selection. Real fix: find the memory hog, add swap/RAM, or cap the process.
+
+**L9 — ip netns**
+`ip netns` manages named **network namespaces**: `ip netns add`, `list`, `exec`, `del`. Each namespace has its own interfaces, routes, firewall rules, and socket table. Container runtimes use the same mechanism (via `clone(CLONE_NEWNET)`): each container gets its own netns, and a **veth pair** connects the container's interface (e.g., `eth0`) to a bridge or host-side peer, giving containers isolated networking with host-provided routing/NAT.
+
+**L10 — SIGTERM vs SIGKILL vs SIGQUIT**
+- **SIGTERM (15)**: "please terminate" — **catchable**, allows graceful cleanup (default for `kill`).
+- **SIGKILL (9)**: immediate kernel-level termination — **not catchable, blockable, or ignorable**; no cleanup, possible data loss.
+- **SIGQUIT (3)**: terminate with **core dump** — **catchable**; some servers use it to dump diagnostic state.
+
+Catchable: SIGTERM and SIGQUIT. Not SIGKILL.
+
+**L11 — stdin/stdout/stderr and redirection**
+stdin (fd 0) is input, stdout (fd 1) normal output, stderr (fd 2) errors — all default to the terminal. Redirect stderr to a file while stdout stays on screen:
+```bash
+command 2> errors.log
+```
+(Both to one file: `command > all.log 2>&1`.)
+
+**L12 — chmod 755**
+Each octal digit = user, group, other; each = read(4) + write(2) + execute(1).
+- 7 (owner): rwx
+- 5 (group): r-x
+- 5 (other): r-x
+
+Result: owner full access; group and others can read and execute (e.g., traverse directories / run scripts) but not write.
+
+**L13 — root vs sudo user**
+Root is UID 0 — the kernel bypasses all permission checks for it; it's an actual account with unrestricted power and no per-action audit trail beyond logs. A sudo user is a normal user authorized (via `/etc/sudoers`) to run commands as root (or others); access can be limited to specific commands, requires their own password, is time-limited, and every use is logged — better accountability and least privilege.
+
+**L14 — Package manager**
+A package manager installs, upgrades, removes, and resolves dependencies for software packages from repositories. Debian/Ubuntu: **apt** (dpkg/.deb backend). RHEL/Fedora: **dnf** (formerly yum; rpm/.rpm backend).
+
+**L15 — /etc/fstab**
+Static filesystem table read at boot and by `mount -a`: fields are device/UUID, mount point, fs type, options, dump flag, fsck pass. A misconfigured entry can **stall or fail the boot** — systemd drops to emergency mode; a bad fsck pass or missing device is worse. Mitigations: `nofail` and `x-systemd.device-timeout=` options for non-critical mounts; always test with `mount -a` (or `findmnt --verify`) before rebooting.
+
+**L16 — LVM**
+LVM abstracts physical storage into flexible volumes:
+- **PV** (physical volume): disk/partition initialized with `pvcreate`.
+- **VG** (volume group): pool aggregating PVs.
+- **LV** (logical volume): carved from the VG, formatted and mounted.
+
+Extend online:
+```bash
+pvcreate /dev/sdb            # if VG needs more space
+vgextend vg_data /dev/sdb
+lvextend -r -L +10G /dev/vg_data/lv_app   # -r grows the filesystem too
+```
+(For XFS mounted, `-r` invokes `xfs_growfs`; ext4 uses `resize2fs`.)
+
+**L17 — I/O schedulers**
+- **mq-deadline**: sorts requests by deadline, prioritizes reads, prevents starvation; low overhead, good default for HDDs and general-purpose/mostly-rotational storage.
+- **bfq**: budget fair queueing — per-process fairness and bandwidth guarantees; great for desktops/interactive and mixed workloads, but higher CPU cost.
+- **none**: pure pass-through; ideal for fast devices with internal scheduling (NVMe/SSDs) or when a lower layer (dm/device-mapper) already schedules.
+
+Change at runtime:
+```bash
+cat /sys/block/nvme0n1/queue/scheduler
+echo none > /sys/block/nvme0n1/queue/scheduler
+```
+Persist via udev rule (`ACTION=="add|change", KERNEL=="nvme0n1", ATTR{queue/scheduler}="none"`).
+
+**L18 — High load, low CPU**
+Load average = number of tasks in runnable (R) **or uninterruptible (D)** state, exponentially averaged over 1/5/15 min. D-state tasks (blocked on disk/NFS I/O or kernel locks) inflate load without consuming CPU — hence high load, low CPU%.
+
+Diagnosis:
+- `vmstat 1`: `wa` column high → I/O wait; `b` column = blocked tasks.
+- `iostat -x 1`: high `await`, `%util` near 100% → disk bottleneck; identify the device, then `iotop`/`pidstat -d` for the culprit process.
+- CPU-bound would show high `us`/`sy`, long run queue, low `wa`.
+- Network: `sar -n DEV`, `ss -s`, `nstat` (retransmits/drops), `ethtool -S`, packet captures — NFS hangs show as D-state with no local disk activity.
+
+**L19 — SELinux MAC**
+SELinux labels every process (domain) and object (type/file, port, etc.); policy rules explicitly allow domain→type interactions, and **everything not allowed is denied** — even if Unix DAC permissions permit it. Modes:
+- **Enforcing**: denials blocked and logged (AVC messages).
+- **Permissive**: violations only logged — useful for diagnosis.
+- **Disabled**: no labels or policy at all.
+
+Troubleshooting a port-bind denial:
+```bash
+ausearch -m avc -ts recent                 # confirm the denial
+semanage port -l | grep 8080               # check port labeling
+semanage port -a -t http_port_t -p tcp 8080   # assign the right type
+```
+Temporarily `setenforce 0` to confirm SELinux is the cause; `audit2allow` to generate a custom module if no standard type fits.
+
+**L20 — Page faults and THP**
+When a process touches a virtual address whose PTE isn't valid, the CPU raises a page fault:
+- **Minor fault**: the page is already in RAM (page cache, shared library, COW copy, demand-zero) — the kernel just updates page tables; cheap.
+- **Major fault**: the page must be fetched **from disk** (swap-in or uncached file-backed page) — the process blocks; expensive, visible in `ps`/`sar` as majflt.
+
+**THP**: the kernel transparently backs memory with 2MB huge pages, reducing TLB misses and page-table overhead — good for large, contiguous, long-lived allocations. Downsides: allocation/compaction stalls cause latency spikes, and sparse allocations waste memory (a 2MB page for a few used bytes). Disable for latency-sensitive applications (many databases, Redis, low-latency services) that show THP-related stalls:
+```bash
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+# or boot param: transparent_hugepage=never  (or madvise as a middle ground)
+```
