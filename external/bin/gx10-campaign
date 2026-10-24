@@ -34,7 +34,7 @@ PI_CONFIG="${PI_CONFIG:-$HOME/.pi/agent/models.json}"
 # (2026-09-23). The draft changes speed, not the answers; 262k per slot is what
 # GLM had, and enough for the 127k budget.
 MODELS=(
-  "glm|glm5.3-flash-q2kxl-128k-mtp-gb10|glm5.3-flash|"
+  "glm|glm5.3-flash-q2kxl-128k-mtp-gb10|glm5.3-flash||UD-Q2_K_XL"
   "dsv4|dsv4-flash-iq3xxs-1m-dspark-gb10|dsv4-flash|llama_cpp_context_size=262144 llama_cpp_parallel_slots=1 llama_cpp_spec_type= llama_cpp_spec_draft_model_id= llama_cpp_spec_draft_model="
   "qwen|qwen3.8-flash-next-q4kxl-512k-mtp-gb10|qwen3.8-flash-next|"
   # IQ2_M with the dSpark draft: the quant that leaves the draft a window.
@@ -42,10 +42,11 @@ MODELS=(
   # DeepSeek-V4.1-Flash-1017 UD-IQ1_S, the committed card: no swap to run it.
   "dsv41|dsv41-flash-iq1s-512k-gb10|dsv41-flash|"
   # GLM-5.3-Flash UD-Q4_K_XL across both boxes over RPC (homelab #1074). The
-  # head is gx10-59c7, so run with GX10_URL=https://gx10-59c7.lwa.dk; the alias
-  # is the Q2 card's, which is what the served-alias check compares, so this
-  # never swaps.
-  "glmq4|glm5.3-flash-q4kxl-mtp-rpc-gb10|glm5.3-flash|"
+  # head is gx10-59c7, so run with GX10_URL=https://gx10-59c7.lwa.dk. The alias
+  # is the Q2 card's, so the fifth field — a substring of the served model_path —
+  # is what tells the two apart; this entry never swaps, the two-box model is
+  # deployed by llama_cpp_rpc.yaml with both members, not from here.
+  "glmq4|glm5.3-flash-q4kxl-mtp-rpc-gb10|glm5.3-flash||UD-Q4_K_XL"
 )
 # The committed profile; the campaign ends by deploying it without an override.
 # Overridable: the two-box model is committed on gx10-59c7, not gx10-1dd1.
@@ -85,11 +86,33 @@ served_alias() {
     python3 -c "import json,sys; print(json.load(sys.stdin)['data'][0]['id'])" 2>/dev/null
 }
 
+# The GGUF llama-server has loaded, from /props. Two cards can share an alias
+# (the GLM Q2 and Q4 profiles both answer as glm5.3-flash), so a block whose
+# entry names a quant marker is accepted only when this path carries it.
+served_model_path() {
+  curl -s --max-time 15 -H @<(printf 'Authorization: Bearer %s\n' "$LLAMA_API_KEY") "$HOST/props" 2>/dev/null |
+    python3 -c "import json,sys; print(json.load(sys.stdin).get('model_path',''))" 2>/dev/null
+}
+
+# served <alias> [marker]: the endpoint answers as the alias and, where the
+# entry names a marker, serves a model_path containing it.
+serving() {
+  [[ "$(served_alias)" == "$1" ]] || return 1
+  [[ -z "${2:-}" || "$(served_model_path)" == *"$2"* ]]
+}
+
 # Load a model card on gx10. An extra-var overrides host_vars, so nothing is
 # committed per swap; the repo keeps describing the steady state.
-ensure_model() {  # <card> <alias> [extra ansible vars, space-separated]
-  local card="$1" alias="$2" vars="${3:-}" extra=() v
-  [[ "$(served_alias)" == "$alias" ]] && return 0
+ensure_model() {  # <card> <alias> [extra ansible vars, space-separated] [model_path marker]
+  local card="$1" alias="$2" vars="${3:-}" marker="${4:-}" extra=() v
+  serving "$alias" "$marker" && return 0
+  # Same alias, other quant: the swap below deploys one box, which cannot
+  # produce the two-box model and would break it where it is running. Refuse
+  # rather than record one quant's results under the other's key.
+  if [[ -n "$marker" && "$(served_alias)" == "$alias" ]]; then
+    note "REFUSED: $alias is served from '$(served_model_path)', not a $marker build — deploy $card first"
+    return 1
+  fi
   [[ -n "$card" ]] && extra=(-e "active_model_profile=$card")
   for v in $vars; do extra+=(-e "$v"); done
   note "swap -> ${card:-<committed profile>}${vars:+ with $vars} (rebuilds llama.cpp if the pin differs)"
@@ -98,10 +121,10 @@ ensure_model() {  # <card> <alias> [extra ansible vars, space-separated]
       > "$OUT/swap-$alias-$(date +%H%M).log" 2>&1
   local i
   for i in $(seq 1 40); do
-    [[ "$(served_alias)" == "$alias" ]] && { note "serving $alias"; return 0; }
+    serving "$alias" "$marker" && { note "serving $alias${marker:+ ($marker)}"; return 0; }
     sleep 30
   done
-  note "SWAP FAILED: expected $alias, server answers '$(served_alias)'"
+  note "SWAP FAILED: expected $alias${marker:+ ($marker)}, server answers '$(served_alias)' from '$(served_model_path)'"
   return 1
 }
 
@@ -164,9 +187,9 @@ knowledge() {  # <key> <alias> — one run; judged separately
 
 note "=== campaign start ($(git -C "$REPO" rev-parse --short HEAD)) ==="
 for entry in "${MODELS[@]}"; do
-  IFS='|' read -r key card alias vars <<< "$entry"
+  IFS='|' read -r key card alias vars marker <<< "$entry"
   if (( ${#ONLY[@]} )) && [[ " ${ONLY[*]} " != *" $key "* ]]; then continue; fi
-  if ! ensure_model "$card" "$alias" "$vars"; then
+  if ! ensure_model "$card" "$alias" "$vars" "$marker"; then
     note "$key: block skipped — the model could not be loaded"
     continue
   fi
