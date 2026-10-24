@@ -1,0 +1,298 @@
+# Cloud Infrastructure Architecture
+
+**CL1 — IaaS vs PaaS vs SaaS**
+- **IaaS (Infrastructure as a Service):** Provider supplies virtualized compute, storage, and networking; you manage the OS and everything above it. Example: **AWS EC2** (or Azure VMs).
+- **PaaS (Platform as a Service):** Provider manages runtime, OS, scaling, and patching; you deploy code/data. Example: **Azure App Service** (or Google App Engine, Heroku).
+- **SaaS (Software as a Service):** Complete application delivered over the internet; you only configure and use it. Example: **Microsoft 365** (or Salesforce).
+The trade-off across the stack: less control ↔ less operational burden.
+
+**CL2 — Shared Responsibility Model**
+The provider is responsible for "security *of* the cloud" (physical facilities, hardware, hypervisor, managed-service internals); you are responsible for "security *in* the cloud" (data, identities, configuration).
+- **IaaS VM:** Provider ends at the hypervisor. You own OS patching, guest firewall, IAM, encryption, application, and data.
+- **Managed Kubernetes (EKS/AKS/GKE):** Provider owns the control plane (API server, etcd). You own node OS patching (unless using serverless nodes), workload security, RBAC, network policies, and secrets.
+- **SaaS (M365):** Provider owns nearly all infrastructure and application security. You own tenant configuration, identity hygiene (MFA/Conditional Access), data governance, DLP, and backup of your data.
+Key point: **data and identity are always your responsibility**, in every model.
+
+**CL3 — VPC, Subnet, Security Group, NACL**
+- **VPC:** Your private, logically isolated network within a region (CIDR block you define).
+- **Subnet:** A subdivision of the VPC tied to one availability zone; typically "public" (route to IGW) or "private" (NAT-only egress).
+- **Security Group (SG):** **Stateful**, instance/ENI-level firewall. Allow rules only; return traffic is automatically permitted.
+- **NACL:** **Stateless**, subnet-level firewall. Supports allow *and* deny rules, evaluated in numbered order; return traffic must be explicitly allowed (e.g., ephemeral ports 1024–65535).
+**Layering:** Traffic enters the VPC → NACL filters at the subnet edge → SG filters at the instance. Defense in depth: NACLs for coarse subnet-level control (e.g., blanket deny of a bad IP), SGs for fine-grained workload rules. Stateful = connection tracking (reply auto-allowed); stateless = every packet evaluated independently in both directions.
+
+**CL4 — Multi-Account Strategy / Landing Zone**
+- **Landing zone:** A pre-built, codified multi-account foundation: OU hierarchy, identity federation, centralized logging, networking, and guardrails — deployed via IaC (AWS Control Tower, Azure Landing Zones/CAF).
+- **Organizational Units:** Hierarchical grouping of accounts (e.g., Security, Infrastructure, Sandbox, Dev, Prod) so policies attach at the right level.
+- **Guardrails:** Preventive controls — SCPs (AWS) / Azure Policy — that deny things like disallowed regions, disabling CloudTrail, or public buckets; plus detective controls (Config, Security Hub, Sentinel).
+- **Shared networking:** Hub-and-spoke — a central network account with **Transit Gateway** (AWS) or hub VNet with **Azure Firewall**; spokes peer to the hub; inspection and egress centralized. (VPC peering alone doesn't scale — O(n²) complexity, no transitive routing.)
+- **Centralized logging:** Org-wide CloudTrail to a central S3 bucket, centralized CloudWatch/Sentinel, immutable log archives in a security account even admins can't delete.
+- **Why not one account:** Single blast radius (one mistake/compromise hits everything), no environment isolation (dev can touch prod), IAM sprawl, no cost separation, shared quotas/limits, no clear ownership boundaries, and no way to enforce different compliance postures.
+
+**CL5 — Infrastructure as Code comparison**
+- **Terraform/OpenTofu:** Declarative HCL, cloud-agnostic, massive provider ecosystem, explicit state files. **Choose for:** multi-cloud or heterogeneous estates; the de facto standard.
+- **Pulumi:** IaC in general-purpose languages (TypeScript, Python, Go). **Choose for:** dev-heavy teams wanting unit tests, abstractions, and real logic; strong CI/CD integration.
+- **CloudFormation/Bicep:** Native AWS/Azure IaC, no state file to manage (CFN), deep first-party integration and drift detection. **Choose for:** single-cloud shops wanting zero third-party dependency.
+- **Crossplane:** Kubernetes CRDs as the infrastructure API, continuous reconciliation. **Choose for:** platform teams offering self-service infra ("a PostgreSQL XRD") to app teams inside a K8s-native operating model.
+Rule of thumb: single cloud + native tooling is fine; multi-cloud or mixed estates → Terraform; K8s-centric platform engineering → Crossplane.
+
+**CL6 — Autoscaling patterns**
+- **HPA:** Scales the *number of pod replicas* based on metrics (CPU/memory or custom/prometheus metrics).
+- **VPA:** Adjusts *resource requests/limits* per pod (right-sizing); mostly useful in recommendation mode; conflicts with HPA on the same CPU/memory metrics.
+- **Cluster Autoscaler/Node Autoscaler (Karpenter):** Adds nodes when pods are unschedulable, removes underutilized nodes.
+- **KEDA:** Event-driven autoscaling driven by *external event sources* — queue depth, Kafka lag, Redis length, cron — via scalers; supports **scale-to-zero**.
+**KEDA over HPA when:** the scaling signal lives outside the cluster (SQS depth, RabbitMQ, Azure Service Bus), you need scale-from-zero for spiky/event-driven workloads, or you want queue-lag-based concurrency rather than CPU proxies. They compose: KEDA feeds metrics into the HPA internally.
+
+**CL7 — Multi-region DR design**
+- **Define targets first:** e.g., RPO 5 min / RTO 30 min drives every choice.
+- **Pattern:** **Active-passive (warm standby)** fits most apps: full stack deployed via IaC in region B at reduced scale; async DB replication (Aurora Global Database / Cosmos DB multi-region); S3 CRR for objects; SQS/Kinesis replicated or dual-write; stateless frontends behind **Route 53 failover routing** with health checks (or Azure Traffic Manager/Front Door). On failover: promote DB, scale up via IaC/automation, DNS flips.
+- **Active-active:** Both regions serve traffic; requires multi-region data writes (DynamoDB global tables, Cosmos multi-master) and conflict resolution — significantly more complex.
+- **Sync vs async replication:** Sync → RPO 0 but adds write latency and is impractical beyond ~100 km; async → better latency but a data-loss window equal to replication lag.
+- **Cost tiers:**
+  - **Pilot light:** Only data stores replicated; compute provisioned on failover. Cheapest, RTO in hours.
+  - **Warm standby:** Scaled-down full stack always running; scale up on failover. RTO minutes.
+  - **Multi-site active-active:** Full capacity both regions. RTO ~0, highest cost (roughly 2× plus cross-region data transfer).
+Design example: RPO 5/RTO 30 → warm standby + async replication + Route53 failover + quarterly game days to validate.
+
+**CL8 — GitOps**
+Git is the single source of truth for desired state; an in-cluster controller continuously **pulls** and reconciles actual state to Git state. Benefits: auditability (PRs = changes), rollback = git revert, no CI system needs cluster credentials (pull, not push).
+- **ArgoCD:** Strong UI, app-of-apps and ApplicationSets for multi-tenancy, sync waves/hooks. **Flux:** Modular controller toolkit, OCI-artifact based, lighter footprint, GitOps Working Group reference. Both are excellent; ArgoCD wins on UX/multi-tenancy, Flux on simplicity/OCI.
+- **Secrets in GitOps:** Never plaintext. Options: **Sealed Secrets** (encrypt with cluster public key into a CR; decrypted in-cluster), **External Secrets Operator** (syncs from AWS Secrets Manager/Vault/ASM into K8s Secrets), **SOPS + age/KMS** (encrypted files decrypted by the controller), or Vault with the Vault Agent injector.
+- **Drift:** The controller detects divergence from Git. With **self-heal enabled**, manual changes are automatically reverted (kubectl edits vanish within seconds); otherwise it flags OutOfSync. Either way, Git wins — the correct process is to change Git, not the cluster.
+
+**CL9 — Stateful legacy app on Kubernetes**
+- **StatefulSet:** Stable pod identity (`app-0, app-1…`), **ordered** deployment/scaling/termination, stable PVCs per replica — matches the app's startup ordering requirement.
+- **Storage:** **StorageClass with `waitForFirstConsumer` binding + local PVs** (or `local-path-provisioner`/hostPath-based local PV) for low latency. Each pod gets its own PVC via volumeClaimTemplates. Caveat: local PVs pin pods to specific nodes — use node affinity and anti-affinity to spread replicas; accept that a node loss requires data resync.
+- **Headless Service** (`clusterIP: None`): gives each pod a stable DNS name (`app-0.app.ns.svc.cluster.local`) for peer discovery and client stickiness.
+- **Sticky sessions:** `sessionAffinity: ClientIP` on the Service, or cookie affinity at the ingress.
+- **Init containers:** Wait for dependencies (DB, license server), prepare directories, seed/validate config before the main container starts.
+- **ConfigMaps as volumes:** Mount with **`subPath`** to place individual files at exact required paths (e.g., `/etc/app/app.conf`) without shadowing the whole directory; reload strategy via re-mount + process reload.
+- **PodDisruptionBudget** (`minAvailable: 2` of 3): protects against voluntary disruptions (node drains/upgrades). Add `terminationGracePeriodSeconds` + preStop hooks for clean ordered shutdown.
+Honest note: this works, but an app this node-bound and path-bound is a candidate for "replatform, don't refactor" — keep it on VMs if the business case is weak.
+
+**CL10 — Service accounts, workload identity, IRSA**
+- **K8s ServiceAccount:** An identity for pods *within* the cluster (API access, RBAC).
+- **IRSA (AWS):** The cluster exposes an OIDC issuer; an IAM role trusts a specific SA (sub/aud claims); pods get short-lived STS credentials automatically via a projected service account token.
+- **Workload Identity (Azure Entra Workload ID / GKE Workload Identity):** Same federation pattern — the pod's SA token is exchanged for cloud credentials via OIDC federation.
+- **Why mounting static cloud credentials is bad:** Long-lived keys in env vars/Secrets leak easily (logs, images, `kubectl describe`), can't be scoped per-workload, are painful to rotate, and one leaked key = broad account compromise.
+- **Federation solves it:** No stored secrets at all; tokens are short-lived, audience-bound, tied to a specific SA/namespace, and auto-rotated. Blast radius of a pod compromise shrinks to that one role.
+
+**CL11 — Object vs block vs file storage**
+- **Object (S3/Blob):** Flat namespace, HTTP API, effectively unlimited scale, cheapest per GB, latency in tens of ms. **Use for:** static assets, backups, data lakes, logs. Durability: S3 standard = 99.999999999% (11 nines) across ≥3 AZs; Blob LRS/ZRS/GRS vary by redundancy choice.
+- **Block (EBS/Managed Disk):** Fixed-size volumes attached to VMs, low single-digit-ms latency, mounted like a disk. **Use for:** OS disks, databases, anything needing a filesystem/block device. Durability: replicated within an AZ (~99.8–99.9% annual failure rate per volume) — use snapshots and multi-AZ replication for HA.
+- **File (EFS/Azure Files):** Shared NFS/SMB with concurrent access from many clients, elastic capacity. **Use for:** shared content, home directories, lift-and-shift file shares, container RWX volumes. Durability: multi-AZ by design (regional).
+Rule of thumb: unstructured data at scale → object; per-instance performance → block; shared POSIX/SMB semantics → file.
+
+**CL12 — Zero-trust Kubernetes**
+- **Network policies:** Default-deny all ingress/egress; explicit allowlists per namespace/workload; egress restricted to approved destinations (DNS, specific APIs).
+- **Service mesh mTLS (Istio/Linkerd):** Every pod-to-pod call is mutually authenticated and encrypted using workload identities (SPIFFE/SPIRE), with authorization policies ("checkout may call payments, nothing else").
+- **Pod identity:** IRSA/Workload Identity — no static cloud credentials.
+- **Admission control (OPA Gatekeeper/Kyverno):** Enforce no `:latest`, required resource limits, non-root, no privileged pods, required labels.
+- **Image signing:** Sign with **cosign/Sigstore** at build; verify signatures at admission (Kyverno `verifyImages` / Connaisseur) — unsigned or tampered images never run.
+- **Runtime security (Falco):** Syscall-level detection of unexpected behavior (shell in container, reverse shell, config writes).
+- **Secrets:** External Secrets Operator/Vault, etcd encryption at rest, RBAC on secrets.
+- **vs perimeter model:** Traditional = trusted inside, untrusted outside; once in, lateral movement is easy. Zero trust = **no implicit trust based on network location**; every request is authenticated, authorized, and encrypted based on workload identity, assuming breach.
+
+**CL13 — CDN**
+A CDN is a geographically distributed set of edge locations (POPs) that cache content close to users. DNS/anycast routes users to the nearest POP; cached objects are served from the edge; misses go to origin (and are then cached per TTL rules). Benefits: lower latency, reduced origin load, DDoS absorption, TLS offload.
+Examples: **AWS CloudFront**, **Azure Front Door/CDN**, Cloudflare.
+**Use a CDN when:** global user base, static/media-heavy content, spiky traffic, or DDoS/WAF protection is needed. **Skip it when:** internal enterprise apps, tiny user base near the origin, or fully dynamic personalized content where cache-hit economics don't pay off (though even APIs can benefit from edge TLS/acceleration).
+
+**CL14 — Regions and Availability Zones**
+- **Region:** A geographic area (e.g., `eu-west-1`) containing multiple, independently powered/cooled datacenter clusters.
+- **AZ:** One of those isolated clusters within a region — separate power, networking, and flood/fire domains, connected by low-latency high-bandwidth links.
+Deploy across multiple AZs because a single-AZ deployment dies with one facility event (power, cooling, network, fire). Multi-AZ gives HA with single-digit-ms replication latency.
+- **Zonal resource:** Pinned to one AZ — EBS volumes, a single VM, a zonal static IP. Fails with the zone.
+- **Regional resource:** Automatically replicated across AZs — S3, managed disks with ZRS, RDS Multi-AZ, regional managed services. Prefer regional resources for HA; use zonal resources knowingly (cost, latency, or pinning requirements).
+
+**CL15 — Managed databases**
+A managed DB (RDS, Cloud SQL, Azure SQL) offloads the undifferentiated heavy lifting. Provider handles: provisioning, hardware failures, OS and DB-engine patching, automated backups + PITR, Multi-AZ failover/HA, monitoring/metrics, encryption at rest/in transit, read replicas. You handle: schema design, query/index tuning, user/permission management, parameter tuning for your workload, and application-side resilience. Self-managed on a VM means you own all of the above plus backups verification, failover scripting, and 3 a.m. disk-full pages — usually a bad trade unless you need exotic extensions, OS-level access, or extreme cost control.
+
+**CL16 — Cloud IAM primitives**
+- **User:** A discrete identity with long-term credentials (ideally only for humans who truly need them, or better, federated SSO).
+- **Group:** A collection of users; attach policies to groups, not users.
+- **Role:** An assumable identity granting **temporary** credentials — used by services, cross-account access, and federated humans. The preferred primitive.
+- **Policy:** A JSON document defining allow/deny on actions/resources/conditions; identity-based, resource-based, and permission-boundary variants.
+**Least privilege:** Grant only the permissions required for a task, nothing more. Apply it by: roles over users, group-based assignment, starting narrow and expanding on evidence, conditions (IP, MFA, VPC endpoints), permission boundaries, short session durations, and tooling like IAM Access Analyzer / Policy Simulator to right-size policies based on actual usage.
+
+**CL17 — Serverless**
+Functions run on demand in a provider-managed runtime: no server management, per-invocation billing, automatic scaling to demand.
+- **AWS Lambda:** Richest event-source ecosystem; 15-min max runtime.
+- **Azure Functions:** Durable Functions for stateful orchestration; strong .NET story; premium plans to reduce cold starts.
+- **Google Cloud Functions/Cloud Run:** Cloud Run (container-based) removes runtime constraints and reduces cold starts.
+**Cold starts:** First invocation on a fresh instance pays initialization cost (runtime + your code + VPC attachment) — hundreds of ms to seconds. Matters for latency-sensitive APIs and user-facing paths; mitigated by provisioned concurrency, smaller bundles, lighter runtimes.
+**Poor fit:** long-running/heavy compute, sustained high steady load (VMs/containers cheaper), strict low-latency requirements, stateful applications, GPU/specialized hardware, and workloads needing exotic runtimes or filesystem assumptions.
+
+**CL18 — Kubernetes ingress options**
+- **Ingress resource:** L7 HTTP(S) routing spec; requires a controller (NGINX, AWS Load Balancer Controller, Traefik). Mature but the spec is limited (no TCP/UDP, awkward multi-team ownership).
+- **Gateway API:** The successor standard — `GatewayClass`/`Gateway`/`HTTPRoute` (plus TCP/UDP/GRPC/TLS routes), role-separated (platform team owns Gateway, app teams own Routes), cross-namespace routing, conformance-tested portable implementations.
+- **Cloud LB via Service annotations:** `type: LoadBalancer` + annotations provision an NLB/ELB/Azure LB directly — good for L4/exposed TCP, less flexible for L7.
+- **Mesh ingress gateways (Istio/Linkerd):** Ingress pods that speak mesh semantics — mTLS to backends, rich traffic policy, consistent policy inside and at the edge.
+**TLS termination:** at the cloud LB (HTTPS→HTTP to cluster), at the ingress controller/Gateway (certs via cert-manager; optionally re-encrypt to pods), or **passthrough** (TLS route/SNI) all the way to the pod for end-to-end encryption.
+**Choose Gateway API over Ingress when:** you need TCP/UDP/gRPC, multi-team delegation, cross-namespace routing, header/canary-heavy traffic management, or a portable standard not tied to one controller's annotation soup.
+
+**CL19 — Cost optimization for $80k/month**
+1. **Visibility first:** Enforce tagging standards (owner, env, cost-center, app), enable AWS CUR/Azure cost exports, analyze spend by service/team. You can't optimize what you can't attribute.
+2. **Commitments:** Identify steady-state baseline (~60–70% of compute). Cover it with **Savings Plans** (flexible across instance families — preferred) or **RIs** (for stable, predictable DBs/instances). Target 70–80% coverage; don't commit the spiky remainder. ~30–60% savings on covered spend.
+3. **Spot/preemptible:** For CI runners, batch, stateless workers, and fault-tolerant jobs — 60–90% discounts with checkpointing.
+4. **Right-sizing:** Use CloudWatch/Azure Monitor utilization (P95 over 30 days) to downsize oversized instances; often 20–30% of compute spend.
+5. **Storage tiering:** S3 Intelligent-Tiering for unknown access patterns; lifecycle to Glacier/Archive for old backups/logs; delete orphaned snapshots; Azure blob access tiers.
+6. **Idle resources:** Unattached EBS volumes, idle load balancers, stopped-but-provisioned instances, dev/test environments scheduled off-hours (nights/weekends), old unassociated Elastic IPs.
+7. **FinOps process:** Monthly cost review per team, budgets + anomaly alerts (Cost Anomaly Detection), **Infracost** in PRs so engineers see cost before merge, unit economics (cost per customer/transaction).
+8. **Showback → chargeback:** Start with showback (visibility without billing friction), mature to chargeback once tagging is reliable. Tools: Cost Explorer, CUR + Athena/QuickSight, Kubecost (K8s allocation), CloudHealth/Vantage.
+Realistic outcome for $80k/month: 20–35% reduction in the first two quarters without architectural change.
+
+**CL20 — Multi-cloud strategy**
+- **Abstraction layers:** Kubernetes as the common compute/runtime; **Terraform/OpenTofu** for portable IaC; **OpenTelemetry** for portable observability; OIDC-based identity (Entra ID/Okta as central IdP federating into both AWS IAM and Azure); containerized stateless apps.
+- **Networking:** Site-to-site VPN for dev; **Direct Connect/ExpressRoute** for prod; inter-cloud transit via cloud routers or a third-party fabric (Equinix/Megaport). Keep inter-cloud traffic minimal — egress fees are brutal.
+- **Identity federation:** Central IdP → SAML/OIDC into each cloud; workload identity federation per cloud; avoid syncing long-lived keys.
+- **Real-world trade-offs:** Two of everything (networking, security, observability, on-call skills), duplicated platform teams, lowest-common-denominator designs that forgo each cloud's best services, egress costs, and slower incident response. The "avoid lock-in" benefit is often theoretical — data gravity and managed services (DynamoDB, Cosmos) re-create lock-in anyway.
+- **Justified when:** regulatory/data-residency demands, M&A consolidation timelines, a genuinely best-of-breed need (e.g., Azure OpenAI + AWS elsewhere), provider-negotiation leverage at scale, or a hard requirement to survive a provider-wide outage.
+- **Unnecessary complexity when:** it's driven by fear of lock-in alone, or the org can't staff two platform teams. For most companies: **single primary cloud + portable architecture** (containers, Terraform, OTel, OIDC) gives 90% of the optionality at 20% of the cost.
+
+---
+
+# OT Infrastructure Architecture
+
+**OT1 — Purdue Model (ISA-95)**
+A reference architecture layering industrial networks by function, with decreasing trust from top to bottom:
+- **Level 0 — Physical process:** Sensors, actuators, motors, valves — the actual field devices.
+- **Level 1 — Basic control:** PLCs and RTUs directly controlling the process in real time.
+- **Level 2 — Supervisory:** HMIs, SCADA servers, local alarm and control supervision.
+- **Level 3 — Site operations:** Historians, MES, engineering workstations, domain services, plant-wide applications.
+- **Level 3.5 — IDMZ:** Industrial DMZ buffering IT/OT.
+- **Level 4/5 — Business/Enterprise:** ERP, logistics, corporate IT (Level 4 = site business planning; Level 5 = enterprise network).
+Traffic should generally flow upward (data out) with tightly controlled flows downward (commands/patches in).
+
+**OT2 — IT vs OT networks**
+IT prioritizes **confidentiality** (CIA triad, with availability third); OT prioritizes **availability and safety** (AIC — a rebooted PLC can stop production or endanger people). OT differences: legacy/embedded OSes (Windows XP-era HMIs, VxWorks), 15–25 year asset lifecycles, vendor-certified configurations where patching voids support, real-time deterministic protocols, patch windows only during planned shutdowns (sometimes once a year), and devices that cannot be rebooted or scanned aggressively without process impact. Standard IT patching (monthly cycles, agent-based scanning, auto-reboots) can crash controllers or halt production — hence compensating controls (segmentation, monitoring, virtual patching) instead.
+
+**OT3 — IDMZ (Industrial DMZ)**
+A buffer zone (Purdue 3.5) between IT and OT so no direct L4↔L3 (and certainly no L4↔L1) traffic exists. Services brokered in the IDMZ: **historian-to-historian replication** (data pushed out), **patch/AV repositories** (data pushed in), **terminal services/RDS jump hosts** (sessions proxied, not routed), file transfer with AV scanning, and mirroring of domain services (read-only DCs).
+**Allowed traffic:** OT→IT data replication (historian exports, MQTT/OPC UA northbound); IT→OT only via controlled brokers (patch pulls, proxied remote sessions with MFA).
+**Why direct L4→L1 is dangerous:** A compromised corporate host gets a straight, uninspected path to controllers; malware propagates unimpeded; there's no choke point to enforce policy, no inspection point, and no delay — one phishing email away from manipulating physical processes.
+
+**OT4 — OT protocols and Purdue placement**
+1. **Modbus TCP:** Simple master/slave register read/write; no authentication or encryption. Levels 1–2 (and SCADA polling at 2–3). Ubiquitous, trivially abusable.
+2. **OPC UA:** Semantic, platform-independent industrial interoperability with real security (certs, signing, encryption). Levels 2–4; increasingly the standard northbound interface to MES/cloud.
+3. **EtherNet/IP (CIP):** Rockwell/ODVA protocol over standard Ethernet; real-time variants (CIP Motion/Safety). Levels 1–2.
+4. **PROFINET:** Siemens' industrial Ethernet; RT/IRT real-time classes. Levels 1–2.
+5. **MQTT:** Lightweight pub/sub; not a control protocol — used for telemetry from edge to enterprise/cloud. Levels 3.5–5 (edge gateway → cloud), with TLS and client certs.
+
+**OT5 — Data diode vs firewall**
+A **data diode** is a hardware device enforcing physically one-way data flow (separate TX/RX fiber paths) — it is cryptographically impossible for data to return. A **firewall** enforces policy on bidirectional flows.
+**Use a diode when:** regulations demand absolute assurance of no inbound path (nuclear, defense, critical export of data from a high-security zone), or you must move data out of a zone that must never be reachable.
+**Limitations:** TCP acknowledgments can't return, so diodes require **protocol breaking** (re-injection at the other side) — only specific protocols work; no interactive sessions; no management path (which is the point); higher cost; and any "reply" needed by the source application must be engineered around. Firewalls are flexible and bidirectional but are software/policy — they can be misconfigured or exploited.
+
+**OT6 — SCADA-to-cloud data flow**
+- **Path:** PLC/RTU (L1) → **OPC UA server** (in SCADA or a gateway, L2/L3) → **plant historian** (L3) → historian-to-historian replication into the **IDMZ** → **edge gateway** in the IDMZ (subscribes OPC UA / reads replicated historian) → publishes **MQTT over TLS** to a cloud **ingestion service** (AWS IoT Core / Azure IoT Hub / Event Hubs) → stream processing → analytics platform.
+- **Security boundaries:**
+  1. Firewall between L3 and IDMZ: only OPC UA/historian-replication from named hosts.
+  2. IDMZ hardened: gateway is the only device with outbound cloud connectivity; no inbound cloud-initiated sessions (outbound-only, persistent connection).
+  3. MQTT: mutual TLS, per-gateway client certificates, topic-level authorization.
+  4. Cloud: private connectivity (ExpressRoute/Direct Connect or IPsec), device identity per gateway, ingest-only permissions.
+- **Alternative for high assurance:** replace the L3→IDMZ link with a **data diode** for one-way export.
+Never allow cloud → control network connectivity; the cloud subscribes, it doesn't command (unless a separately secured, deliberately designed command path exists).
+
+**OT7 — IEC 62443 zones and conduits**
+- **Zone:** A group of assets sharing common security requirements and a defined security level (SL 1–4 per the threat/risk assessment). Assets in a zone trust each other more than they trust anything outside.
+- **Conduit:** A controlled communication channel connecting zones — modeled like a "pipe" with its own security requirements (firewall rules, inspection, unidirectional gateways).
+**Design for the plant:**
+- **Zone A — Corporate (L4/5):** ERP, business apps. SL per corporate policy.
+- **Zone B — IDMZ (L3.5):** Brokers, replication, jump hosts.
+- **Zone C — Site operations (L3):** SCADA servers, historian, domain services. Conduits: A↔B (business data), B↔C (brokered only).
+- **Zone D — Engineering workstations:** Separate zone (they hold programming credentials); conduit to control zones restricted to engineering protocols from EWS only.
+- **Zones E1–En — Per production line/cell (L1/2):** PLCs, HMIs, drives per line. Conduits: C↔E (SCADA polling, alarms) restricted to specific protocols/hosts.
+- **Zone S — SIS:** Fully separate zone, highest SL; conduit to BPCS: none, or strictly one-way/diodes for read-only data.
+Each conduit gets documented allowed protocols, source/destination, and monitoring.
+
+**OT8 — Segmentation for a flat plant network**
+- **Target architecture:**
+  - **VLANs:** Per production line: control VLAN (L1 PLCs) + supervisory VLAN (L2 HMIs); L3 ops VLANs (SCADA, historian, EWS, domain); IDMZ VLANs; management VLAN for switches.
+  - **Switch architecture:** Collapsed L3 core (stacked/redundant pair) + access switches per line; inter-VLAN routing only at the core, never line-to-line directly.
+  - **Firewalls:** HA pair at the L3↔IDMZ boundary (mandatory); firewalling between L3 and each line — either per-line firewall pairs or one HA pair with subinterfaces/contexts enforcing per-line policy. Default deny; allowlists of protocols (Modbus/PROFINET/EtherNet-IP) between named hosts only.
+  - **Vendor remote access:** No direct VPN into OT. Vendors land in the IDMZ jump/terminal server with MFA, per-vendor accounts, session recording, and time-limited approvals mapped to specific cells.
+- **Transition without stopping production:**
+  1. **Passive discovery first:** SPAN/mirror ports + OT-aware IDS (Claroty/Nozomi/Dragos) to build the real asset and flow inventory — no active scanning.
+  2. Model actual traffic flows; draft firewall rules from observed behavior.
+  3. Deploy firewalls in **monitor-only/permit mode**, validate rules against reality for weeks.
+  4. Cut over **line by line** during planned maintenance windows; keep rollback plans; temporary trunking with VLAN ACLs where full firewalling must wait.
+  5. Validate each line with engineering before moving to the next.
+
+**OT9 — SIS vs BPCS**
+- **BPCS (Basic Process Control System):** The PLC/DCS layer that runs the process day-to-day to meet production targets.
+- **SIS (Safety Instrumented System):** An **independent** protective layer — dedicated sensors, a safety-rated logic solver (safety PLC), and final elements (shutdown valves) — that acts only to bring the process to a safe state when limits are exceeded. It must be independent so a BPCS failure/misoperation doesn't disable the protection.
+- **IEC 61511:** The functional-safety lifecycle standard for process-industry SIS: hazard/risk analysis, required **SIL (Safety Integrity Level)** targets, design, validation, and ongoing proof-testing of safety functions.
+- **Why isolate SIS:** Network connectivity creates common-cause failure paths — a compromise or fault in shared infrastructure could disable or corrupt the safety function exactly when it's needed. Independence is a core 61511 principle.
+- **If ransomware reaches the SIS:** The safety function may be inhibited (trips blocked → escalation to catastrophic release/explosion) or spuriously triggered (unnecessary shutdowns, or worse, operators conditioned to bypass it). You can no longer trust the last line of defense, E-stops, or shutdown valves — the plant must be operated as if unprotected, typically requiring manual safe-state procedures or shutdown. This is why SIS is air-gapped or, at minimum, diode-isolated with no writable path.
+
+**OT10 — PLC vs DCS vs SCADA**
+- **PLC:** Local, high-speed controller for discrete/machine control (packaging lines, robotics, one machine). Fast scan cycles, ladder logic, standalone or small networks.
+- **DCS:** Plant-wide, integrated control of **continuous processes** (refineries, chemical, power) — distributed controllers, integrated historian/alarms/HMI/engineering environment, high availability, hot replacement.
+- **SCADA:** **Supervisory** telemetry over geographically distributed assets (pipelines, water networks, substations) — polls RTUs/PLCs over WAN links, focuses on monitoring, alarms, and limited supervisory control.
+**Coexist?** Absolutely — it's the norm: DCS for the main process unit, PLCs for packaging/utilities, SCADA tying remote sites into the control room. Boundaries should still be segmented per IEC 62443.
+
+**OT11 — Remote access architecture for OT**
+- **Never** RDP directly from corporate to an HMI: it bypasses all zoning, exposes credentials to the endpoint, has no session oversight, and gives a compromised corporate machine a direct control-network session.
+- **Correct pattern:** Vendor/remote users authenticate (MFA, per-user accounts, no shared logins) into a **PAM-gated jump host / terminal server in the IDMZ**; from there they reach *only* the specific systems approved for that session. Controls: **session recording** (video + keystroke), **time-limited access** (expires automatically; requires work-order-linked approval), source IP allowlisting, protocol brokering (no raw network routing), least-privilege mapping per vendor/system, and automatic disconnect on idle. All sessions monitored by the OT SOC; access revoked immediately when the work order closes.
+
+**OT12 — Water facility: nation-state actor on Level 3**
+- **Assumptions:** Adversary is sophisticated, patient, and may have persistence; the goal is public-health protection first, forensics second.
+- **Detection:** Passive OT IDS/anomaly detection (Dragos/Claroty/Nozomi) watching for unauthorized PLC writes, new devices, unusual Modbus/function codes, and protocol violations vs baseline; honeypot devices on L3; correlation of VPN appliance logs; watch for reconnaissance patterns (discovery scans, credential access).
+- **Asset inventory:** Use the passive-monitoring baseline as ground truth — know every device, firmware, and normal communication pair before acting.
+- **Response steps:**
+  1. **Declare incident; activate the ICS-specific IR plan** with an incident commander and a standing bridge with the control room.
+  2. **Contain without disrupting treatment:** Block the vendor VPN path; enforce conduit firewalls between L3 and L1/2 (deny all but known-good SCADA flows); isolate compromised L3 hosts at the switch port. Do **not** unplug controllers.
+  3. **Safe operations:** Shift operators to **manual monitoring** of critical parameters (chlorine residual, tank levels, pressure, flow) with local reads and increased lab sampling; pre-staged manual procedures take precedence over automation.
+  4. **Preserve evidence:** SPAN captures, firewall logs, memory/disk images of compromised hosts before rebuild.
+  5. **Eradicate/recover:** Rebuild compromised systems from known-good media, rotate all credentials, verify PLC logic against golden backups before restoring automation, hunt for persistence across all sites sharing the vendor VPN.
+  6. **Notify:** Regulators (EPA/state), law enforcement (CISA), and leadership per policy.
+- **Operator's role:** The operator is the process authority — they execute manual fallback procedures, physically verify critical values, report anomalies, and decide (with engineering) when it's safe to change automation state. IT/security never unilaterally disconnects or reboots control equipment; every containment action is coordinated with the control room against process-safety impact.
+
+**OT13 — HMI**
+An HMI is the operator's window into the process: graphical mimics of the plant, live values, alarms, setpoints, and start/stop commands, running at Level 2. It's a **runtime** operator tool — operators monitor and control, but don't program. An **engineering workstation (EWS)** is where engineers program PLCs, configure HMIs, tune loops, and manage firmware — it holds programming software, project files, and credentials, making it the crown-jewel asset of the OT network (whoever controls the EWS can rewrite the process). HMIs are numerous and operator-facing; EWSs are few, tightly controlled, and change-managed.
+
+**OT14 — Historian**
+A historian is a time-series database purpose-built for process data: high-ingestion tag storage, aggressive compression, interpolation, and years of retention at millisecond-to-second resolution. It's essential for troubleshooting, process optimization, compliance reporting, and ML/analytics.
+- **Plant historian (Level 3):** High-resolution, site-scoped, feeds operators and process engineers; collects directly from PLCs/SCADA/OPC UA.
+- **Enterprise historian (Level 4):** Aggregates from multiple plant historians (via historian-to-historian replication through the IDMZ), lower resolution, serves KPIs, benchmarking, and business analytics. The replication boundary is also a security boundary — no direct IT-to-L3 queries.
+
+**OT15 — Ladder logic**
+A graphical PLC programming language (IEC 61131-3) that visually resembles relay-logic wiring diagrams: power rails, rungs, contacts (inputs), and coils (outputs), executed in a deterministic left-to-right, top-to-bottom scan cycle. Still dominant because: plant electricians and techs can read and troubleshoot it without CS training; it maps directly to the relay panels it replaced (decades of institutional knowledge); the deterministic scan cycle suits real-time control; vendors certify and support it; safety and audit practices are built around it; and the installed base creates massive inertia. Alternatives (function block, structured text) exist, but ladder remains the lingua franca of the plant floor.
+
+**OT16 — RTU**
+A Remote Terminal Unit is a rugged telemetry device deployed at remote/unattended sites: it reads sensors, reports via long-distance/low-bandwidth links (serial, radio, cellular, satellite), performs local control, and is optimized for low power and wide temperature ranges. **vs PLC:** PLCs prioritize fast, complex local control with rich I/O and local HMI; RTUs prioritize remote communication, low bandwidth, and autonomous operation with intermittent connectivity. **Deploy RTUs when:** assets are geographically dispersed and unattended — pipelines, water distribution/wastewater lift stations, power substations, oil/gas wellheads — typically supervised by SCADA over DNP3/Modbus.
+
+**OT17 — Analog vs digital I/O**
+- **Digital (discrete):** Two states — on/off, open/closed (limit switches, motor run status, valve end-switches).
+- **Analog:** A continuous range representing a process variable — 4–20 mA or 0–10 V for temperature, pressure, level, flow.
+**Why 4–20 mA over 0–20 mA:** The **live zero**. At 0% process value the loop still carries 4 mA, so **0 mA unambiguously indicates a fault** (broken wire, dead transmitter, open loop) — with 0–20 mA, zero signal is indistinguishable from a valid zero reading. Current loops are also immune to voltage drop over long cable runs (current is identical at every point in the loop) and more noise-resistant than voltage signals.
+
+**OT18 — OT asset inventory**
+You cannot segment, monitor, patch, or defend assets you don't know exist — inventory is the foundation of every 62443 and OT security program: it drives zone design, risk ranking, vulnerability management, and incident response.
+- **Passive monitoring (preferred):** SPAN/TAP ports feeding OT-aware IDS platforms (Claroty, Nozomi, Dragos, Armis) that deep-packet-inspect industrial protocols to fingerprint devices, firmware versions, and communication maps — zero process impact.
+- **Other techniques:** Switch CAM/ARP table analysis, read-only SNMP, rack-and-stack audits, vendor documentation, CMDB reconciliation.
+- **Active scanning is dangerous:** Nmap-style scans can crash or reboot fragile/embedded devices, disrupt deterministic scan cycles, consume controller CPU, or trigger failovers — a scan has taken plants offline. If active verification is needed, it's done in maintenance windows, with engineering approval, using OT-safe tools at minimal rates.
+
+**OT19 — MITRE ATT&CK for ICS**
+An adversary-behavior knowledge base specific to industrial environments, organized into tactics (the "why") and techniques (the "how"), focused on physical-world consequences.
+Tactics with example techniques:
+1. **Initial Access** — e.g., *Remote Services (T0886)*: compromising a vendor VPN or RDP into the OT network.
+2. **Lateral Movement** — e.g., *Program Download (T0843)*: moving between controllers by uploading logic.
+3. **Impair Process Control** — e.g., *Unauthorized Command Message (T0855)*: sending rogue commands to a PLC.
+4. **Inhibit Response Function** — e.g., *Device Restart/Shutdown (T0816)*: stopping a safety controller or HMI so protection can't respond.
+5. **Discovery** — e.g., *Network Service Scanning (T0842)*: enumerating OT hosts/protocols.
+(Also: Execution, Persistence, Evasion, Collection, C2, and **Impact** — e.g., manipulating process setpoints to damage equipment.)
+**Differences from Enterprise ATT&CK:** ICS-specific tactics (*Inhibit Response Function*, *Impair Process Control*) and techniques tied to control protocols and physical consequences (PLC stop, logic alteration, setpoint change) rather than data theft.
+**Using it for gap assessment:** Map your detection coverage and controls against each tactic — can you detect remote-service abuse? Unauthorized program downloads? Command anomalies? Run purple-team exercises emulating key techniques, prioritize telemetry (passive IDS, PLC change detection) for the tactics with physical-impact potential, and feed gaps into the security roadmap.
+
+**OT20 — Converged IT/OT SOC (3 sites)**
+- **Log collection without impacting operations:** **Passive network sensors** (SPAN/TAP) at each site for protocol-aware OT telemetry — no agents on controllers, no active polling of PLCs. Add syslog from firewalls, historians, HMIs (where safe), domain controllers, and the remote-access/PAM platform. Forward via local collectors to the central SIEM over the WAN.
+- **SIEM integration:** Splunk/Sentinel with OT content (Dragos/Claroty/Nozomi integrations); normalize OT events alongside IT; enrich with the asset inventory so alerts carry process context ("PLC on Line 2, packaging filler").
+- **OT-specific detection rules:** Unauthorized PLC program/firmware writes, PLC stop/change-of-mode commands, new devices on control VLANs, protocol violations (malformed Modbus function codes), HMI credential failures, vendor sessions outside approved windows, safety-system communication anomalies.
+- **Triage workflow:** OT alerts route to a joint queue with OT context attached; severity weighted by **physical impact**, not just IT severity; runbooks co-authored with plant engineers; escalation path to on-call OT engineer per site.
+- **Staffing:** Hybrid model — IT security analysts trained on OT fundamentals + embedded OT engineers (one per region or shared) who understand the process; 24/7 coverage via follow-the-sun across sites; clear RACI so IT never touches control equipment without operations concurrence.
+- **False positives:** Baseline each site independently (every plant differs); feed **management-of-change (MOC)** data into the SIEM so planned maintenance suppresses alerts; tune continuously with engineers; treat "unknown but benign" findings as inventory updates, not noise to ignore.
+- **Unauthorized PLC firmware change alert:**
+  1. **Triage immediately** — check MOC/change-management records and the maintenance calendar; call the plant engineer.
+  2. **If authorized:** document and close; verify the change matches the record.
+  3. **If unauthorized:** do **not** power-cycle the PLC (may be deliberate sabotage with destructive logic). Isolate the source host at the conduit firewall; capture traffic and preserve evidence; compare current logic against the golden backup; have operators increase manual oversight of the affected process; forensic-image the source; hunt for lateral movement; restore known-good logic if integrity is in doubt; escalate per the ICS IR plan and notify regulators if process integrity was affected. Post-incident: review how the change bypassed change management and close that gap.

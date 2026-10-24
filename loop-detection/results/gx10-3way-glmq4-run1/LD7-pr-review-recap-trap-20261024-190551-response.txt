@@ -1,0 +1,39 @@
+## Blocking
+
+1. **`jwtSecret` is generated in `init()` and never persisted** (`auth/jwt.go`). Every process start mints a fresh secret, which means: (a) every restart/deploy silently invalidates all outstanding tokens; (b) any multi-instance deployment issues tokens that sibling instances reject — horizontal scaling is broken; (c) there is no rotation path. The secret must come from config/env/secret manager, with a hard startup failure if absent. Also, the `rand.Read` error in `init()` is discarded — on failure you'd sign tokens with a zero-filled or partial key with no signal.
+
+2. **No revocation story.** With 24-hour access tokens and fully stateless validation: logout doesn't log anyone out, a banned or demoted user keeps their `role` claim until expiry, and a stolen token lives a full day. Any denylist mechanism reintroduces exactly the stateful store this change removes, so this needs an explicit answer. Note there's also no `jti` claim, so even adding per-token revocation later isn't possible without reworking the claims.
+
+3. **The refresh token flow is incomplete.** `GenerateRefreshToken` returns an opaque string that is never persisted, bound to a user, given a TTL, or exchanged anywhere in the diff. If refresh tokens are stored in Redis, the dependency removal doesn't actually hold; if they're not stored, this is dead code and the 24h access token has no renewal path. Which is it?
+
+4. **Compile error:** `auth/middleware.go` calls `auth.ValidateToken`, but the file lives in the `auth` package itself (same directory as `auth/jwt.go`, which declares `package auth`). A package cannot qualify its own identifiers — this won't build as shown. Please confirm the excerpt reflects the real tree.
+
+## Security
+
+5. **Algorithm is not pinned in `ValidateToken`.** The keyfunc hands the HMAC secret to whatever `alg` the token declares. Pass `jwt.WithValidMethods([]string{"HS256"})` so unexpected algorithms are rejected before key selection.
+
+6. **Client-side token storage is unaddressed.** Moving from httpOnly cookies to an `Authorization` header forces the browser to hold the token somewhere. If that's localStorage, XSS now yields full 24-hour credential theft with no server-side kill switch (see #2). What's the storage mechanism, and does CORS config need updating to send the header cross-origin?
+
+7. **HS256 means every verifier holds the signing key.** If any other service will validate these tokens, each one can also *forge* them. If multi-service verification is planned, use asymmetric signing (RS256/EdDSA); if not, say so explicitly so the choice is deliberate.
+
+8. **No `iss`/`aud` claims.** Tokens are bearer-valid anywhere the secret is known, so if the key is ever shared across services or environments (see #7), tokens replay freely between them. Set and validate issuer/audience.
+
+9. 401 responses lack `WWW-Authenticate: Bearer` (RFC 6750). Minor, but clients and interceptors commonly key off it.
+
+## Correctness
+
+10. **Header parsing is sloppy:** `strings.TrimPrefix(authHeader, "Bearer ")` is case-sensitive and happily passes arbitrary header content through as a "token." Split the header and check the scheme explicitly (case-insensitive per RFC 6750) rather than relying on `ValidateToken` to fail on garbage.
+
+11. **String context keys** (`"userID"`, `"role"`) are collision-prone across middleware and flagged by staticcheck (SA1029). Use an unexported key type with accessor functions — otherwise downstream code has no type-safe way to read these values.
+
+12. **No clock-skew leeway** in the parser; strict `exp` checking across hosts with minor drift produces intermittent 401s. Consider `jwt.WithLeeway`.
+
+13. **Misleading error:** when the claims type assertion fails, `ValidateToken` returns `jwt.ErrSignatureInvalid`, which is not a signature failure. Return a distinct error or wrap.
+
+## Migration & hygiene
+
+14. **Existing sessions get hard-dropped.** Users holding valid `session_id` cookies at deploy time are logged out with no transition. Is a dual-accept grace window planned?
+
+15. **Is the old path actually gone?** The excerpt drops `store.GetSession`, but across the remaining ~315 lines: are the session store, Redis client wiring, related config/env vars, and go.mod entries deleted? Given #3, some stateful store may be creeping back in under a different name.
+
+16. **No tests visible for a 400-line auth rewrite.** Minimum bar: issue/validate round-trip, expired token, tampered signature, wrong-algorithm token, middleware 401 paths (missing header, wrong scheme, bad token), and context propagation to handlers.

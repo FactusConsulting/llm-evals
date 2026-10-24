@@ -1,0 +1,32 @@
+## Risks & Prerequisites
+
+- DigitalOcean DBaaS does not support in-place major-version upgrades. The path is a new PG16 cluster plus data migration — logical replication for near-zero downtime, or dump/restore if a maintenance window is acceptable.
+- Logical replication does not copy sequences, DDL, or large objects, and requires a primary key (or REPLICA IDENTITY) on every table.
+- PG15+ revoked CREATE on the `public` schema from PUBLIC; roles that create objects there may break.
+- psycopg2 2.9.3 is compatible with PG16, but its bundled libpq is old — run the integration suite against 16 before cutover.
+- Payments data: reconciliation checks and a rollback path are mandatory, not optional.
+- Prerequisites: confirm PG16 is available in the cluster's region and size tier, confirm all extensions exist on DO PG16, and freeze schema changes for the migration duration.
+
+## Migration Plan
+
+1. Inventory the current cluster: extensions, tables without primary keys, non-default settings, roles, and every consumer of the connection string (deployments, cronjobs, poolers).
+2. Confirm DO PG16 support for the region and instance size; price the new cluster plus replica. — requires budget approval.
+3. Present the plan, cost, and proposed cutover window to change review. — human approval required.
+4. Provision the PG16 cluster with a read replica, private networking, and equivalent or larger nodes.
+5. Recreate roles and non-default settings on PG16; install all extensions.
+6. Add primary keys or REPLICA IDENTITY FULL to any tables lacking them on PG14.
+7. Dump schema-only from PG14 and restore to PG16; verify it completes without errors.
+8. Freeze all DDL and schema migrations on PG14. — external coordination with anyone deploying schema changes.
+9. Start logical replication PG14 → PG16 (DO's online migration tool or a native subscription); let the initial copy complete.
+10. Monitor replication lag until it holds steady at seconds.
+11. Reconcile replicated data: row counts and checksums on high-value tables (payments, ledger, refunds).
+12. Point a staging copy of the app at PG16 and run the full test suite, including transaction and error-path tests.
+13. Fix anything the suite surfaces (e.g., public-schema permission errors, prepared-statement behavior).
+14. Schedule the cutover window and notify stakeholders and on-call. — external coordination.
+15. At cutover: enter maintenance mode / pause payment workers and stop all writes to PG14.
+16. Wait for replication lag = 0, then sync all sequences (`setval` to PG14's current values).
+17. Update the Kubernetes secret with the PG16 connection string and restart the deployments.
+18. Run reconciliation again (row counts, `sum(amount)` for the day, latest transaction IDs) before reopening writes.
+19. Re-enable writes; closely monitor error rates, latency, and the new replica's health.
+20. Keep the PG14 cluster intact and read-only as the rollback target for an agreed retention period. Rollback means repointing the secret back to PG14; writes made to PG16 after cutover would be lost, so this trade-off needs explicit sign-off. — human approval required.
+21. After the retention period, take a final backup and decommission the PG14 cluster. — human approval required.

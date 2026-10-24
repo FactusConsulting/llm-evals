@@ -1,0 +1,32 @@
+**Key risks and prerequisites**
+- DigitalOcean DBaaS major-version upgrades are not in-place; confirm the supported path (new PG16 cluster plus dump/restore or logical replication). Expect a second cluster and a cutover, not an in-place restart.
+- Single replica means no HA/failover; the upgrade is a downtime event. Payments writes must be drained and in-flight transactions reconciled before cutover.
+- PG15 changed public-schema ownership/privileges; app roles may lack `CREATE` on `public`. Audit and grant explicitly.
+- Logical replication does not copy sequences; sequences must be advanced manually after cutover. It also requires primary keys and no DDL during sync.
+- psycopg2 2.9.3 is protocol-compatible with PG16, but verify the bundled libpq/wheel and connection parameters (`sslmode`, `target_session_attrs`).
+- Extensions, collations, and `pg_stat_statements` settings must exist on the target; unsupported extensions block the upgrade.
+- Rollback: retain the PG14 cluster and a verified logical backup until acceptance.
+- Coordination: payments product owner for the window, DO Support for the upgrade path, security/compliance for credential/data handling, and on-call.
+
+**Migration plan**
+1. Confirm with DigitalOcean Support whether an in-place PG14→16 upgrade exists; obtain the supported migration path. **[EXTERNAL COORDINATION]**
+2. Schedule a maintenance window with the payments product owner and on-call; freeze non-essential deploys around it. **[HUMAN APPROVAL]**
+3. Inventory PG14: extensions, roles/grants, schemas, tables, sequences, large objects, and connection settings; save as baseline.
+4. Verify psycopg2 2.9.3 against PG16: check libpq/wheel version, `sslmode`, and run a connection smoke test.
+5. Provision a PG16 test cluster on DO matching production region/size/settings.
+6. Restore the latest logical backup into the test cluster.
+7. Apply schema, extension, and role changes on the test cluster.
+8. Grant app roles `CREATE` on `public` (or equivalent) to address PG15+ privilege changes.
+9. Run the payments service test suite and key transaction paths against the test cluster.
+10. Compare top-query plans and latency between PG14 and PG16 test clusters.
+11. Choose logical replication vs dump/restore and record the decision. **[HUMAN APPROVAL]**
+12. If logical replication: create the publication on PG14 and subscription on PG16; verify initial sync and replication lag.
+13. Take a final verified logical backup of PG14 and record the WAL/LSN position.
+14. Announce maintenance start to stakeholders. **[EXTERNAL COORDINATION]**
+15. Drain payments writes: stop new writes/queue consumers and let in-flight transactions commit.
+16. Capture final sequence values on PG14 and apply `setval` on PG16 (or complete final dump/restore).
+17. Validate row counts/checksums on critical tables between PG14 and PG16; reconcile mismatches.
+18. Update the K8s Secret/connection string to PG16 and roll the payments deployment; confirm readiness probes.
+19. Run production smoke tests: auth, authorization/capture, refunds, idempotency replay, reconciliation.
+20. Monitor error rates, latency, replication lag, and `pg_stat_activity` for 24–48h.
+21. Obtain sign-off from payments owner and on-call; then decommission PG14 and revoke old credentials. **[HUMAN APPROVAL]**
