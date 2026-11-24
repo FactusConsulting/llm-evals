@@ -42,6 +42,7 @@ DGX Spark playground.
 | **Hermes4-14B** | dense | Q8 / q4kv | llama.cpp | 92.75% ʰ (range 0.95 pp) | 1/12 ⚠️ | 67.0% (67/100) | 2026-04-30 | [runs](results/hermes4-14b-q8-q4kv-2slot-65k-ai-infer2/) |
 | **Qwen3.5-35B-A3B** | MoE | Q5_K_M | llama.cpp | 90.3% ˣ | — | — | 2026-03-21 | archived ˣ |
 | **Gemma 4 12B** | dense | Q4 | llama.cpp | 89.9% ᑫ | 0/12 ✅ | 65.0% (195/300) | 2026-06-09 | [verdict](results/gemma4-12b-q4-ai-infer3/verdict.md) |
+| **Inkling 2 Mini** | MoE (looped) | UD-Q8_K_XL | llama.cpp (Unsloth build) | — ᵏ | 1/12 ⚠️ ᵏ | — | 2026-11-23 | [verdict](external/results/inkling2-mini-q8kxl-unsloth/verdict.md) |
 
 **Loop legend:** ✅ no flags · ⚠️ 1 flag or a known false positive · ❌ multiple real
 spirals. Denominator = scenarios × passes (12, 24, 36 or 9-partial).
@@ -182,6 +183,11 @@ quants — both knowledge-strong, both unservable here.
   an **empty response at the runner's 600 s cap** — at 13 tok/s with a 16384 reasoning
   budget the cap measures decode speed, not stopping behaviour. Agentic and
   narrow-delivery were not run (their runners' fixed timeouts do the same).
+- **ᵏ Inkling 2 Mini** — not judged on the knowledge suite. In the ds4-core gate it
+  scored 73/92 against Gemma 4 26B's 71/92 on the same host and day, and on AI
+  Regelkompas's Danish extraction it matched Gemma (precision 92 % / recall 96 %
+  against 93 / 95) — while reasoning on every request, which Gemma did not, at five
+  times the wait. Loop: no spirals; the flag is one empty response (LD7). One run each.
 - **No Qwen build is scored under the current method.** Every Qwen directory —
   including the deployed fleet model `qwen36-35b-a3b-q5km-STOCK-2x128k-ai-infer2` — has
   responses but no `judge.json`, so **no head-to-head between the Qwen fleet and

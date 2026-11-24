@@ -504,6 +504,24 @@ def execute(cases, args, sampling, blob, snapshot, outdir) -> tuple:
     return records, summary
 
 
+
+def redacted_argv(argv):
+    """argv with the API key's value replaced: run-config.txt is a record of the
+    run, not a place for a credential, whatever .gitignore says about it."""
+    out, hide = [], False
+    for arg in argv:
+        if hide:
+            out.append("***")
+            hide = False
+        elif arg == "--api-key":
+            out.append(arg)
+            hide = True
+        elif arg.startswith("--api-key="):
+            out.append("--api-key=***")
+        else:
+            out.append(arg)
+    return out
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -577,7 +595,7 @@ def main() -> int:
         f"endpoint={args.url} model={args.model} mode={sampling['mode']}\n"
         f"nonce={sampling['nonce']} temperature={sampling['temperature']} "
         f"top_p={sampling['top_p']} min_p={sampling['min_p']} seed={sampling['seed']}\n"
-        f"command={' '.join(sys.argv)}\n"
+        f"command={' '.join(redacted_argv(sys.argv))}\n"
         f"date={summary['started']}\n")
 
     print(f"\n{correct}/{len(records)} = {summary['percentage']}%"
